@@ -1,0 +1,15 @@
+linters:
+  enable-all: true
+  disable:
+    - dupl
+    - wrapcheck
+    - forbidigo
+    - funlen
+    - gocognit
+    - varnamelen
+    - cyclop
+    - gochecknoglobals
+    - exhaustivestruct
+    - exhaustruct
+    - lll
+    - wsl

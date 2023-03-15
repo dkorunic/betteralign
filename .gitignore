@@ -1,0 +1,45 @@
+### Go ###
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+dist/
+vendor/
+cmd/betteralign/betteralign
+
+# Test binary, build with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+### Intellij ###
+# User-specific stuff:
+.idea/
+
+# CMake
+cmake-build-debug/
+
+## File-based project format:
+*.iws
+
+# IntelliJ
+/out/
+
+### VisualStudioCode ###
+.vscode/
+
+### Tokens ###
+credentials.json
+token.json
+
+### Shell wrappers ###
+*.sh
+
+## Usual macOS cruft ###
+.DS_Store
+
+## Configuratio
+.config.yml
