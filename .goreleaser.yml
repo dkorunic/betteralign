@@ -1,5 +1,7 @@
 builds:
-  - flags:
+  - main: ./cmd/betteralign
+    binary: betteralign
+    flags:
       - -trimpath
     env:
       - CGO_ENABLED=0
@@ -8,7 +10,6 @@ builds:
     goos:
       - linux
       - darwin
-      - windows
       - freebsd
     goarch:
       - amd64
