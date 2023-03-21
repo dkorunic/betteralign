@@ -3,6 +3,8 @@
 [![GitHub license](https://img.shields.io/github/license/dkorunic/betteralign)](https://github.com/dkorunic/betteralign/blob/master/LICENSE)
 [![GitHub release](https://img.shields.io/github/release/dkorunic/betteralign)](https://github.com/dkorunic/betteralign/releases/latest)
 
+![](gopher.png)
+
 ## About
 
 **betteralign** is a tool to detect structs that would use less memory if their fields were sorted and optionally sort such fields.
@@ -19,6 +21,8 @@ This is a fork of an official Go [fieldalignment](https://pkg.go.dev/golang.org/
 Retaining comments has been done with using [DST](https://github.com/dave/dst) (Decorated Syntax Tree) with decorating regular AST. Sadly when using DST we cannot use "fix" mode with SuggestedFixes, but we have to print whole DST to retain decorations.
 
 In case you are wondering why DST and not AST, in general sense AST does not [associate comments to nodes](https://github.com/golang/go/issues/20744), but it holds fixed offsets. Original fieldalignment tool just erases all struct/field/floating comments due to this issue and while there is a CL with [a possible fix](https://go-review.googlesource.com/c/go/+/429639), it's still a work in progress as of this time.
+
+Note, this is a single-pass analysis tool and sorting all structs optimally might require **more than one pass**.
 
 Let us also mention original projects handling this task and without which this derivative work wouldn't exist in the first place:
 
