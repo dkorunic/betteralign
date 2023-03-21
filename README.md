@@ -15,9 +15,9 @@ This is a fork of an official Go [fieldalignment](https://pkg.go.dev/golang.org/
 - skips over test files (files with `_test.go` suffix),
 - skips over structs marked with comment `betteralign:ignore`,
 - doesn't lose comments (field comments, doc comments, floating comments or otherwise) but the comment position heuristics is still work in progress,
-- does very reliable atomic file I/O with strong promise not to currupt and/or lose contents upon rewrite,
+- does very reliable atomic file I/O with strong promise not to corrupt and/or lose contents upon rewrite,
 - has more thorough testing in regards to expected optimised vs golden results,
-- integrates better with environments with restricted CPU or memory resources (Docker containers, K8s containers, LXC, LXD etc.).
+- integrates better with environments with restricted CPU and/or memory resources (Docker containers, K8s containers, LXC, LXD etc).
 
 Retaining comments has been done with using [DST](https://github.com/dave/dst) (Decorated Syntax Tree) with decorating regular AST. Sadly when using DST we cannot use "fix" mode with SuggestedFixes, but we have to print whole DST to retain decorations.
 
