@@ -126,14 +126,15 @@ func run(pass *analysis.Pass) (interface{}, error) {
 		}
 
 		if !generatedFiles {
-			for _, s := range generatedSuffixes {
-				if strings.HasSuffix(fn, s) {
-					return
-				}
-			}
-
 			if _, ok := generatedFset[fn]; ok {
 				return
+			}
+
+			for _, s := range generatedSuffixes {
+				if strings.HasSuffix(fn, s) {
+					generatedFset[fn] = struct{}{}
+					return
+				}
 			}
 		}
 
