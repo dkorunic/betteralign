@@ -41,7 +41,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/google/renameio/v2"
+	"github.com/google/renameio/v2/maybe"
 	"github.com/sirkon/dst"
 	"github.com/sirkon/dst/decorator"
 	"golang.org/x/tools/go/analysis"
@@ -516,7 +516,7 @@ func applyToFile(fn string, buf []byte) error {
 		return fmt.Errorf("%v", ErrNotRegularFile)
 	}
 
-	if err := renameio.WriteFile(fn, buf, st.Mode(), renameio.IgnoreUmask()); err != nil {
+	if err := maybe.WriteFile(fn, buf, st.Mode()); err != nil {
 		return fmt.Errorf("%v: %w", ErrWriteFile, err)
 	}
 
