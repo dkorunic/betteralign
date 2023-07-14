@@ -256,7 +256,7 @@ func optimalOrder(str *types.Struct, sizes *gcSizes) (*types.Struct, []int) {
 		}
 	}
 
-	sort.Slice(elems, func(i, j int) bool {
+	sort.SliceStable(elems, func(i, j int) bool {
 		ei := &elems[i]
 		ej := &elems[j]
 
