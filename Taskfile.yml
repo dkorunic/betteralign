@@ -30,6 +30,7 @@ tasks:
   update:
     cmds:
       - go get -u
+      - go get -u -d ./cmd/betteralign
       - go mod tidy
 
   check:
