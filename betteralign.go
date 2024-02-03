@@ -177,9 +177,9 @@ func betteralign(pass *analysis.Pass, aNode *ast.StructType, typ *types.Struct, 
 
 	var message string
 	if sz := s.Sizeof(typ); sz != optsz {
-		message = fmt.Sprintf("struct of size %d could be %d", sz, optsz)
+		message = fmt.Sprintf("%d bytes saved: struct of size %d could be %d", sz-optsz, sz, optsz)
 	} else if ptrs := s.ptrdata(typ); ptrs != optptrs {
-		message = fmt.Sprintf("struct with %d pointer bytes could be %d", ptrs, optptrs)
+		message = fmt.Sprintf("%d bytes saved: struct with %d pointer bytes could be %d", ptrs-optptrs, ptrs, optptrs)
 	} else {
 		// Already optimal order.
 		return
