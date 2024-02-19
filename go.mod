@@ -7,7 +7,7 @@ require (
 	github.com/google/renameio/v2 v2.0.0
 	github.com/sirkon/dst v0.26.4
 	go.uber.org/automaxprocs v1.5.3
-	golang.org/x/tools v0.17.0
+	golang.org/x/tools v0.18.0
 	gotest.tools/v3 v3.5.1
 )
 
