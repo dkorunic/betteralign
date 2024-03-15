@@ -9,7 +9,7 @@ require (
 	github.com/google/renameio/v2 v2.0.0
 	github.com/sirkon/dst v0.26.4
 	go.uber.org/automaxprocs v1.5.3
-	golang.org/x/tools v0.18.0
+	golang.org/x/tools v0.19.0
 	gotest.tools/v3 v3.5.1
 )
 
@@ -23,8 +23,8 @@ require (
 	github.com/opencontainers/runtime-spec v1.2.0 // indirect
 	github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58 // indirect
 	github.com/sirupsen/logrus v1.9.3 // indirect
-	golang.org/x/exp v0.0.0-20240222234643-814bf88cf225 // indirect
-	golang.org/x/mod v0.15.0 // indirect
-	golang.org/x/sys v0.17.0 // indirect
-	google.golang.org/protobuf v1.32.0 // indirect
+	golang.org/x/exp v0.0.0-20240314144324-c7f7c6466f7f // indirect
+	golang.org/x/mod v0.16.0 // indirect
+	golang.org/x/sys v0.18.0 // indirect
+	google.golang.org/protobuf v1.33.0 // indirect
 )
