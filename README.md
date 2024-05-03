@@ -73,3 +73,7 @@ betteralign -apply ./...
 ```
 
 It is possible to include generated files and test files by enabling `generated_files` and/or `test_files` flags.
+
+## Star history
+
+[![Star History Chart](https://api.star-history.com/svg?repos=dkorunic/betteralign&type=Date)](https://star-history.com/#dkorunic/betteralign&Date)

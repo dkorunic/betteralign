@@ -2,7 +2,6 @@
 
 package betteralign
 
-
 import (
 	"unicode/utf8"
 )
@@ -17,200 +16,574 @@ func reGeneratedBy(s string) bool {
 	_ = r1
 	_ = width1
 	lastRestartPos := -1
-	step := func(pos int) (rune, int) { if pos < len(s) { c := s[pos]; if c < utf8.RuneSelf { return rune(c), 1 }; return utf8.DecodeRuneInString(s[pos:]) }; return endOfText, 0 }
+	step := func(pos int) (rune, int) {
+		if pos < len(s) {
+			c := s[pos]
+			if c < utf8.RuneSelf {
+				return rune(c), 1
+			}
+			return utf8.DecodeRuneInString(s[pos:])
+		}
+		return endOfText, 0
+	}
 restart:
 	r, r1 = endOfText, endOfText
 	width, width1 = 0, 0
-	r, width = step(pos);	if r != endOfText {
-		r1, width1 = step(pos+width); }
-	if pos == lastRestartPos { return false }; lastRestartPos = pos
-	if pos != 0 { return false }
-	pos0 = pos; width0 = width
+	r, width = step(pos)
+	if r != endOfText {
+		r1, width1 = step(pos + width)
+	}
+	if pos == lastRestartPos {
+		return false
+	}
+	lastRestartPos = pos
+	if pos != 0 {
+		return false
+	}
+	pos0 = pos
+	width0 = width
 
-;
-	if pos != pos0 { return false }
+	if pos != pos0 {
+		return false
+	}
 	goto l3
-;
-	pos = pos0 + width0; goto restart
-; l3:
-	if r == '/' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l6; }
-;
-	pos = pos0 + width0; goto restart
-; l6:
-	if r == '/' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l9; }
-;
-	pos = pos0 + width0; goto restart
-; l9:
-	if r == 'C' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l14; }
-;
-	if r < '\t' { goto l11out }
-	if r <= '\n' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l123; }
-	if r < '\f' { goto l11out }
-	if r <= '\r' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l123; }
-	if r == ' ' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l123; }
-l11out:;
-	pos = pos0 + width0; goto restart
-; l14:
-	if r == 'o' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l17; }
-;
-	pos = pos0 + width0; goto restart
-; l17:
-	if r == 'd' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l20; }
-;
-	pos = pos0 + width0; goto restart
-; l20:
-	if r == 'e' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l23; }
-;
-	pos = pos0 + width0; goto restart
-; l23:
-	if r == ' ' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l26; }
-;
-	pos = pos0 + width0; goto restart
-; l26:
-	if r == 'g' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l29; }
-;
-	pos = pos0 + width0; goto restart
-; l29:
-	if r == 'e' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l32; }
-;
-	pos = pos0 + width0; goto restart
-; l32:
-	if r == 'n' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l35; }
-;
-	pos = pos0 + width0; goto restart
-; l35:
-	if r == 'e' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l38; }
-;
-	pos = pos0 + width0; goto restart
-; l38:
-	if r == 'r' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l41; }
-;
-	pos = pos0 + width0; goto restart
-; l41:
-	if r == 'a' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l44; }
-;
-	pos = pos0 + width0; goto restart
-; l44:
-	if r == 't' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l47; }
-;
-	pos = pos0 + width0; goto restart
-; l47:
-	if r == 'e' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l50; }
-;
-	pos = pos0 + width0; goto restart
-; l50:
-	if r == 'd' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l53; }
-;
-	pos = pos0 + width0; goto restart
-; l53:
-	if r == ' ' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l56; }
-;
-	pos = pos0 + width0; goto restart
-; l56:
-	if r == 'b' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l59; }
-;
-	pos = pos0 + width0; goto restart
-; l59:
-	if r == 'y' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l62; }
-;
-	pos = pos0 + width0; goto restart
-; l62:
-	if r == ' ' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l65; }
-;
-	pos = pos0 + width0; goto restart
-; l65:
-	if r == ' ' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l70; }
-;
-	if r < '\x00' { goto l67out }
-	if r <= '\t' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l118; }
-	if r < '\v' { goto l67out }
-	if r <= '\U0010ffff' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l118; }
-l67out:;
-	pos = pos0 + width0; goto restart
-; l70:
-	if r == ' ' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l70; }
-;
-	if r == 'D' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l77; }
-;
-	if r < '\x00' { goto l74out }
-	if r <= '\t' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l118; }
-	if r < '\v' { goto l74out }
-	if r <= '\U0010ffff' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l118; }
-l74out:;
-	pos = pos0 + width0; goto restart
-; l77:
-	if r == 'O' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l80; }
-;
-	pos = pos0 + width0; goto restart
-; l80:
-	if r == ' ' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l83; }
-;
-	pos = pos0 + width0; goto restart
-; l83:
-	if r == 'N' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l86; }
-;
-	pos = pos0 + width0; goto restart
-; l86:
-	if r == 'O' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l89; }
-;
-	pos = pos0 + width0; goto restart
-; l89:
-	if r == 'T' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l92; }
-;
-	pos = pos0 + width0; goto restart
-; l92:
-	if r == ' ' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l95; }
-;
-	pos = pos0 + width0; goto restart
-; l95:
-	if r == 'E' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l98; }
-;
-	pos = pos0 + width0; goto restart
-; l98:
-	if r == 'D' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l101; }
-;
-	pos = pos0 + width0; goto restart
-; l101:
-	if r == 'I' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l104; }
-;
-	pos = pos0 + width0; goto restart
-; l104:
-	if r == 'T' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l107; }
-;
-	pos = pos0 + width0; goto restart
-; l107:
-	if r == '.' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l110; }
-;
-	pos = pos0 + width0; goto restart
-; l110:
-	if r == endOfText { goto l113 }
-;
-	pos = pos0 + width0; goto restart
-; l113:
-	if r == endOfText { return true }
-;
-	pos = pos0 + width0; goto restart
-;
+
+	pos = pos0 + width0
+	goto restart
+l3:
+	if r == '/' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l6
+	}
+
+	pos = pos0 + width0
+	goto restart
+l6:
+	if r == '/' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l9
+	}
+
+	pos = pos0 + width0
+	goto restart
+l9:
+	if r == 'C' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l14
+	}
+
+	if r < '\t' {
+		goto l11out
+	}
+	if r <= '\n' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l123
+	}
+	if r < '\f' {
+		goto l11out
+	}
+	if r <= '\r' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l123
+	}
+	if r == ' ' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l123
+	}
+l11out:
+	;
+	pos = pos0 + width0
+	goto restart
+l14:
+	if r == 'o' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l17
+	}
+
+	pos = pos0 + width0
+	goto restart
+l17:
+	if r == 'd' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l20
+	}
+
+	pos = pos0 + width0
+	goto restart
+l20:
+	if r == 'e' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l23
+	}
+
+	pos = pos0 + width0
+	goto restart
+l23:
+	if r == ' ' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l26
+	}
+
+	pos = pos0 + width0
+	goto restart
+l26:
+	if r == 'g' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l29
+	}
+
+	pos = pos0 + width0
+	goto restart
+l29:
+	if r == 'e' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l32
+	}
+
+	pos = pos0 + width0
+	goto restart
+l32:
+	if r == 'n' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l35
+	}
+
+	pos = pos0 + width0
+	goto restart
+l35:
+	if r == 'e' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l38
+	}
+
+	pos = pos0 + width0
+	goto restart
+l38:
+	if r == 'r' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l41
+	}
+
+	pos = pos0 + width0
+	goto restart
+l41:
+	if r == 'a' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l44
+	}
+
+	pos = pos0 + width0
+	goto restart
+l44:
+	if r == 't' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l47
+	}
+
+	pos = pos0 + width0
+	goto restart
+l47:
+	if r == 'e' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l50
+	}
+
+	pos = pos0 + width0
+	goto restart
+l50:
+	if r == 'd' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l53
+	}
+
+	pos = pos0 + width0
+	goto restart
+l53:
+	if r == ' ' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l56
+	}
+
+	pos = pos0 + width0
+	goto restart
+l56:
+	if r == 'b' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l59
+	}
+
+	pos = pos0 + width0
+	goto restart
+l59:
+	if r == 'y' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l62
+	}
+
+	pos = pos0 + width0
+	goto restart
+l62:
+	if r == ' ' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l65
+	}
+
+	pos = pos0 + width0
+	goto restart
+l65:
+	if r == ' ' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l70
+	}
+
+	if r < '\x00' {
+		goto l67out
+	}
+	if r <= '\t' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l118
+	}
+	if r < '\v' {
+		goto l67out
+	}
+	if r <= '\U0010ffff' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l118
+	}
+l67out:
+	;
+	pos = pos0 + width0
+	goto restart
+l70:
+	if r == ' ' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l70
+	}
+
+	if r == 'D' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l77
+	}
+
+	if r < '\x00' {
+		goto l74out
+	}
+	if r <= '\t' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l118
+	}
+	if r < '\v' {
+		goto l74out
+	}
+	if r <= '\U0010ffff' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l118
+	}
+l74out:
+	;
+	pos = pos0 + width0
+	goto restart
+l77:
+	if r == 'O' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l80
+	}
+
+	pos = pos0 + width0
+	goto restart
+l80:
+	if r == ' ' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l83
+	}
+
+	pos = pos0 + width0
+	goto restart
+l83:
+	if r == 'N' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l86
+	}
+
+	pos = pos0 + width0
+	goto restart
+l86:
+	if r == 'O' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l89
+	}
+
+	pos = pos0 + width0
+	goto restart
+l89:
+	if r == 'T' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l92
+	}
+
+	pos = pos0 + width0
+	goto restart
+l92:
+	if r == ' ' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l95
+	}
+
+	pos = pos0 + width0
+	goto restart
+l95:
+	if r == 'E' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l98
+	}
+
+	pos = pos0 + width0
+	goto restart
+l98:
+	if r == 'D' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l101
+	}
+
+	pos = pos0 + width0
+	goto restart
+l101:
+	if r == 'I' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l104
+	}
+
+	pos = pos0 + width0
+	goto restart
+l104:
+	if r == 'T' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l107
+	}
+
+	pos = pos0 + width0
+	goto restart
+l107:
+	if r == '.' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l110
+	}
+
+	pos = pos0 + width0
+	goto restart
+l110:
+	if r == endOfText {
+		goto l113
+	}
+
+	pos = pos0 + width0
+	goto restart
+l113:
+	if r == endOfText {
+		return true
+	}
+
+	pos = pos0 + width0
+	goto restart
+
 	return true
-;
-	pos = pos0 + width0; goto restart
-; l118:
-	if r == ' ' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l70; }
-;
-	if r < '\x00' { goto l120out }
-	if r <= '\t' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l118; }
-	if r < '\v' { goto l120out }
-	if r <= '\U0010ffff' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l118; }
-l120out:;
-	pos = pos0 + width0; goto restart
-; l123:
-	if r == 'C' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l14; }
-;
-	if r < '\t' { goto l125out }
-	if r <= '\n' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l123; }
-	if r < '\f' { goto l125out }
-	if r <= '\r' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l123; }
-	if r == ' ' { pos += width; if r, width = r1, width1; r != endOfText { 	r1, width1 = step(pos+width); }; goto l123; }
-l125out:;
-	pos = pos0 + width0; goto restart
+
+	pos = pos0 + width0
+	goto restart
+l118:
+	if r == ' ' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l70
+	}
+
+	if r < '\x00' {
+		goto l120out
+	}
+	if r <= '\t' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l118
+	}
+	if r < '\v' {
+		goto l120out
+	}
+	if r <= '\U0010ffff' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l118
+	}
+l120out:
+	;
+	pos = pos0 + width0
+	goto restart
+l123:
+	if r == 'C' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l14
+	}
+
+	if r < '\t' {
+		goto l125out
+	}
+	if r <= '\n' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l123
+	}
+	if r < '\f' {
+		goto l125out
+	}
+	if r <= '\r' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l123
+	}
+	if r == ' ' {
+		pos += width
+		if r, width = r1, width1; r != endOfText {
+			r1, width1 = step(pos + width)
+		}
+		goto l123
+	}
+l125out:
+	;
+	pos = pos0 + width0
+	goto restart
 }
