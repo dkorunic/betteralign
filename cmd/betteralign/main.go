@@ -7,13 +7,25 @@
 package main
 
 import (
-	_ "github.com/KimMachineGun/automemlimit"
+	"github.com/KimMachineGun/automemlimit/memlimit"
 	"github.com/dkorunic/betteralign"
 	"go.uber.org/automaxprocs/maxprocs"
 	"golang.org/x/tools/go/analysis/singlechecker"
 )
 
+const maxMemRatio = 0.9
+
 func main() {
+	_, _ = memlimit.SetGoMemLimitWithOpts(
+		memlimit.WithRatio(maxMemRatio),
+		memlimit.WithProvider(
+			memlimit.ApplyFallback(
+				memlimit.FromCgroup,
+				memlimit.FromSystem,
+			),
+		),
+	)
+
 	undo, _ := maxprocs.Set()
 	defer undo()
 
