@@ -109,10 +109,12 @@ func run(pass *analysis.Pass) (interface{}, error) {
 	nodeFilter := []ast.Node{
 		(*ast.File)(nil),
 		(*ast.StructType)(nil),
+		(*ast.GenDecl)(nil),
 	}
 
 	var aFile *ast.File
 	var dFile *dst.File
+	var strName string
 
 	applyFixesFset := make(map[string][]byte)
 	testFset := make(map[string]bool)
@@ -142,8 +144,23 @@ func run(pass *analysis.Pass) (interface{}, error) {
 
 		var ok bool
 		var s *ast.StructType
+		var g *ast.GenDecl
+
+		if g, ok = node.(*ast.GenDecl); ok {
+			if g.Tok == token.TYPE {
+				decl := g.Specs[0].(*ast.TypeSpec)
+				strName = decl.Name.Name
+			}
+
+			return
+		}
 
 		if s, ok = node.(*ast.StructType); !ok {
+			return
+		}
+
+		// ignore structs with anonymous fields
+		if strName == "" {
 			return
 		}
 
