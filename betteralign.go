@@ -161,35 +161,37 @@ func run(pass *analysis.Pass) (interface{}, error) {
 			return
 		}
 
-		wd, err := os.Getwd()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "%v %s: %v", ErrPreFilterFiles, fn, err)
-			return
-		}
-		relfn, err := filepath.Rel(wd, fn)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "%v %s: %v", ErrPreFilterFiles, fn, err)
-			return
-		}
-		dir := filepath.Dir(relfn)
-		for _, excludeDir := range excludeDirs {
-			rel, err := filepath.Rel(excludeDir, dir)
+		if len(excludeDirs) > 0 || len(excludeFiles) > 0 {
+			wd, err := os.Getwd()
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%v %s: %v", ErrPreFilterFiles, fn, err)
 				return
 			}
-			if !strings.HasPrefix(rel, "..") {
-				return
-			}
-		}
-		for _, excludeFile := range excludeFiles {
-			match, err := filepath.Match(excludeFile, relfn)
+			relfn, err := filepath.Rel(wd, fn)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%v %s: %v", ErrPreFilterFiles, fn, err)
 				return
 			}
-			if match {
-				return
+			dir := filepath.Dir(relfn)
+			for _, excludeDir := range excludeDirs {
+				rel, err := filepath.Rel(excludeDir, dir)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "%v %s: %v", ErrPreFilterFiles, fn, err)
+					return
+				}
+				if !strings.HasPrefix(rel, "..") {
+					return
+				}
+			}
+			for _, excludeFile := range excludeFiles {
+				match, err := filepath.Match(excludeFile, relfn)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "%v %s: %v", ErrPreFilterFiles, fn, err)
+					return
+				}
+				if match {
+					return
+				}
 			}
 		}
 
