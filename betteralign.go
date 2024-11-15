@@ -37,6 +37,7 @@ import (
 	"go/token"
 	"go/types"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -92,12 +93,26 @@ var (
 	apply             bool
 	testFiles         bool
 	generatedFiles    bool
+	excludeFiles      StringArrayFlag
+	excludeDirs       StringArrayFlag
 	testSuffixes      = []string{"_test.go"}
 	generatedSuffixes = []string{"_generated.go", "_gen.go", ".gen.go", ".pb.go", ".pb.gw.go"}
 	ErrStatFile       = errors.New("unable to stat the file")
 	ErrNotRegularFile = errors.New("not a regular file, skipping")
 	ErrWriteFile      = errors.New("unable to write to file")
+	ErrPreFilterFiles = errors.New("failed to pre-filter files")
 )
+
+type StringArrayFlag []string
+
+func (f *StringArrayFlag) String() string {
+	return fmt.Sprintf("%v", *f)
+}
+
+func (f *StringArrayFlag) Set(value string) error {
+	*f = append(*f, strings.Split(value, ",")...)
+	return nil
+}
 
 var Analyzer = &analysis.Analyzer{
 	Name:     "betteralign",
@@ -106,10 +121,16 @@ var Analyzer = &analysis.Analyzer{
 	Run:      run,
 }
 
+func InitAnalyzer(analyzer *analysis.Analyzer) {
+	analyzer.Flags.BoolVar(&apply, "apply", false, "apply suggested fixes")
+	analyzer.Flags.BoolVar(&testFiles, "test_files", false, "also check and fix test files")
+	analyzer.Flags.BoolVar(&generatedFiles, "generated_files", false, "also check and fix generated files")
+	analyzer.Flags.Var(&excludeFiles, "exclude_files", "exclude files matching a pattern")
+	analyzer.Flags.Var(&excludeDirs, "exclude_dirs", "exclude directories matching a pattern")
+}
+
 func init() {
-	Analyzer.Flags.BoolVar(&apply, "apply", false, "apply suggested fixes")
-	Analyzer.Flags.BoolVar(&testFiles, "test_files", false, "also check and fix test files")
-	Analyzer.Flags.BoolVar(&generatedFiles, "generated_files", false, "also check and fix generated files")
+	InitAnalyzer(Analyzer)
 }
 
 func run(pass *analysis.Pass) (interface{}, error) {
@@ -138,6 +159,40 @@ func run(pass *analysis.Pass) (interface{}, error) {
 
 		if !generatedFiles && hasSuffixes(generatedFset, fn, generatedSuffixes) {
 			return
+		}
+
+		if len(excludeDirs) > 0 || len(excludeFiles) > 0 {
+			wd, err := os.Getwd()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%v %s: %v", ErrPreFilterFiles, fn, err)
+				return
+			}
+			relfn, err := filepath.Rel(wd, fn)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%v %s: %v", ErrPreFilterFiles, fn, err)
+				return
+			}
+			dir := filepath.Dir(relfn)
+			for _, excludeDir := range excludeDirs {
+				rel, err := filepath.Rel(excludeDir, dir)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "%v %s: %v", ErrPreFilterFiles, fn, err)
+					return
+				}
+				if !strings.HasPrefix(rel, "..") {
+					return
+				}
+			}
+			for _, excludeFile := range excludeFiles {
+				match, err := filepath.Match(excludeFile, relfn)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "%v %s: %v", ErrPreFilterFiles, fn, err)
+					return
+				}
+				if match {
+					return
+				}
+			}
 		}
 
 		if f, ok := node.(*ast.File); ok {

@@ -58,6 +58,10 @@ Flags:
     	also check and fix generated files
   -test_files
     	also check and fix test files
+  -exclude_dirs value
+    	exclude directories matching a pattern
+  -exclude_files value
+    	exclude files matching a pattern
 ```
 
 To get all recommendations on your project:
@@ -72,7 +76,7 @@ To automatically fix your project files, while ignoring test and generated files
 betteralign -apply ./...
 ```
 
-It is possible to include generated files and test files by enabling `generated_files` and/or `test_files` flags.
+It is possible to include generated files and test files by enabling `generated_files` and/or `test_files` flags, or exclude certain files or directories with the `exclude_dirs` and/or `exclude_files` flags.
 
 ## Star history
 

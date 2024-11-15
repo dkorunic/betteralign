@@ -7,13 +7,26 @@ import (
 	"testing"
 
 	"github.com/dkorunic/betteralign"
+	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/analysistest"
 	"gotest.tools/v3/golden"
 )
 
+func NewTestAnalyzer() *analysis.Analyzer {
+	analyzer := &analysis.Analyzer{
+		Name:     betteralign.Analyzer.Name,
+		Doc:      betteralign.Analyzer.Doc,
+		Requires: betteralign.Analyzer.Requires,
+		Run:      betteralign.Analyzer.Run,
+	}
+	betteralign.InitAnalyzer(analyzer)
+	return analyzer
+}
+
 func TestSuggestions(t *testing.T) {
 	testdata := analysistest.TestData()
-	analysistest.Run(t, testdata, betteralign.Analyzer, "a")
+	analyzer := NewTestAnalyzer()
+	analysistest.Run(t, testdata, analyzer, "a")
 }
 
 func TestApply(t *testing.T) {
@@ -53,10 +66,10 @@ func TestApply(t *testing.T) {
 
 	testdata := analysistest.TestData()
 
-	betteralign.Analyzer.Flags.Set("apply", "true")
-	defer betteralign.Analyzer.Flags.Set("apply", "false")
+	analyzer := NewTestAnalyzer()
+	analyzer.Flags.Set("apply", "true")
 
-	analysistest.Run(t, testdata, betteralign.Analyzer, filepath.Join(filepath.Base(tmpDir), "a"))
+	analysistest.Run(t, testdata, analyzer, filepath.Join(filepath.Base(tmpDir), "a"))
 
 	for _, path := range paths {
 		testBasename := filepath.Base(path)
@@ -70,4 +83,39 @@ func TestApply(t *testing.T) {
 		goldenFilename := filepath.Join("src", "a", strings.Join([]string{testBasename, ".golden"}, ""))
 		golden.Assert(t, string(testResult), goldenFilename)
 	}
+}
+
+func TestFlagExcludeDirs(t *testing.T) {
+	t.Run("exclude none", func(t *testing.T) {
+		testdata := analysistest.TestData()
+		analyzer := NewTestAnalyzer()
+		analyzer.Flags.Set("apply", "false")
+		analysistest.Run(t, testdata, analyzer, "exclude/none/...")
+	})
+
+	t.Run("exclude all", func(t *testing.T) {
+		testdata := analysistest.TestData()
+		analyzer := NewTestAnalyzer()
+		analyzer.Flags.Set("apply", "false")
+		analyzer.Flags.Set("exclude_dirs", "testdata/src/exclude/all/")
+		analysistest.Run(t, testdata, analyzer, "exclude/all/...")
+	})
+
+	t.Run("exclude a", func(t *testing.T) {
+		testdata := analysistest.TestData()
+		analyzer := NewTestAnalyzer()
+		analyzer.Flags.Set("apply", "false")
+		analyzer.Flags.Set("exclude_dirs", "testdata/src/exclude/a/a")
+		analysistest.Run(t, testdata, analyzer, "exclude/a/...")
+	})
+}
+
+func TestFlagExcludeFiles(t *testing.T) {
+	t.Run("exclude b", func(t *testing.T) {
+		testdata := analysistest.TestData()
+		analyzer := NewTestAnalyzer()
+		analyzer.Flags.Set("apply", "false")
+		analyzer.Flags.Set("exclude_files", "testdata/src/exclude/b/b/*.go")
+		analysistest.Run(t, testdata, analyzer, "exclude/b/...")
+	})
 }
