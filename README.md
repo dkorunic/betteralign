@@ -51,17 +51,78 @@ betteralign: find structs that would use less memory if their fields were sorted
 
 Usage: betteralign [-flag] [package]
 
+This analyzer find structs that can be rearranged to use less memory, and provides
+a suggested edit with the most compact order.
+
+Note that there are two different diagnostics reported. One checks struct size,
+and the other reports "pointer bytes" used. Pointer bytes is how many bytes of the
+object that the garbage collector has to potentially scan for pointers, for example:
+
+	struct { uint32; string }
+
+have 16 pointer bytes because the garbage collector has to scan up through the string's
+inner pointer.
+
+	struct { string; *uint32 }
+
+has 24 pointer bytes because it has to scan further through the *uint32.
+
+	struct { string; uint32 }
+
+has 8 because it can stop immediately after the string pointer.
+
+Be aware that the most compact order is not always the most efficient.
+In rare cases it may cause two variables each updated by its own goroutine
+to occupy the same CPU cache line, inducing a form of memory contention
+known as "false sharing" that slows down both goroutines.
+
+Unlike most analyzers, which report likely mistakes, the diagnostics
+produced by betteralign very rarely indicate a significant problem,
+so the analyzer is not included in typical suites such as vet or
+gopls. Use this standalone command to run it on your code:
+
+   $ go install github.com/dkorunic/betteralign/cmd/betteralign@latest
+   $ betteralign [packages]
+
+
+
 Flags:
+  -V	print version and exit
+  -all
+    	no effect (deprecated)
   -apply
     	apply suggested fixes
-  -generated_files
-    	also check and fix generated files
-  -test_files
-    	also check and fix test files
+  -c int
+    	display offending line with this many lines of context (default -1)
+  -cpuprofile string
+    	write CPU profile to this file
+  -debug string
+    	debug flags, any subset of "fpstv"
   -exclude_dirs value
     	exclude directories matching a pattern
   -exclude_files value
     	exclude files matching a pattern
+  -fix
+    	apply all suggested fixes
+  -flags
+    	print analyzer flags in JSON
+  -generated_files
+    	also check and fix generated files
+  -json
+    	emit JSON output
+  -memprofile string
+    	write memory profile to this file
+  -source
+    	no effect (deprecated)
+  -tags string
+    	no effect (deprecated)
+  -test
+    	indicates whether test files should be analyzed, too (default true)
+  -test_files
+    	also check and fix test files
+  -trace string
+    	write trace log to this file
+  -v	no effect (deprecated)
 ```
 
 To get all recommendations on your project:
