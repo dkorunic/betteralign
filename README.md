@@ -2,6 +2,7 @@
 
 [![GitHub license](https://img.shields.io/github/license/dkorunic/betteralign)](https://github.com/dkorunic/betteralign/blob/master/LICENSE)
 [![GitHub release](https://img.shields.io/github/release/dkorunic/betteralign)](https://github.com/dkorunic/betteralign/releases/latest)
+[![go-recipes](https://raw.githubusercontent.com/nikolaydubina/go-recipes/main/badge.svg?raw=true)](https://github.com/nikolaydubina/go-recipes)
 
 ![](gopher.png)
 
