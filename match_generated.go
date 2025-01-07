@@ -16,7 +16,7 @@ func reGeneratedBy(s string) bool {
 	_ = r1
 	_ = width1
 	lastRestartPos := -1
-	step := func(pos int) (rune, int) {
+	step := func(pos int) (r rune, n int) {
 		if pos < len(s) {
 			c := s[pos]
 			if c < utf8.RuneSelf {
