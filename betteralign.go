@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 //
-// Forked and modified by Dinko Korunic, 2022
+// Forked and modified by Dinko Korunic, 2022-2025
 
 // Package betteralign defines an Analyzer that detects structs that would use less
 // memory if their fields were sorted.
@@ -254,11 +254,11 @@ func run(pass *analysis.Pass) (interface{}, error) {
 	return nil, nil
 }
 
+var unsafePointerTyp = types.Unsafe.Scope().Lookup("Pointer").(*types.TypeName).Type()
+
 func betteralign(pass *analysis.Pass, aNode *ast.StructType, typ *types.Struct, dec *decorator.Decorator,
 	dFile *dst.File, fixOps map[string][]byte, fn string,
 ) {
-	unsafePointerTyp := types.Unsafe.Scope().Lookup("Pointer").(*types.TypeName).Type()
-
 	wordSize := pass.TypesSizes.Sizeof(unsafePointerTyp)
 	maxAlign := pass.TypesSizes.Alignof(unsafePointerTyp)
 
