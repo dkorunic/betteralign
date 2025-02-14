@@ -134,6 +134,10 @@ func init() {
 }
 
 func run(pass *analysis.Pass) (interface{}, error) {
+	if a := pass.Analyzer.Flags.Lookup("fix"); a != nil && a.Value.String() == "true" {
+		apply = true
+	}
+
 	inspect := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 	dec := decorator.NewDecorator(pass.Fset)
 	nodeFilter := []ast.Node{

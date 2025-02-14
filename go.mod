@@ -2,8 +2,6 @@ module github.com/dkorunic/betteralign
 
 go 1.24
 
-toolchain go1.24rc3
-
 require (
 	github.com/KimMachineGun/automemlimit v0.7.0
 	github.com/google/renameio/v2 v2.0.0
