@@ -89,14 +89,18 @@ gopls. Use this standalone command to run it on your code:
 const ignoreStruct = "betteralign:ignore"
 
 var (
-	unsafePointerTyp  = types.Unsafe.Scope().Lookup("Pointer").(*types.TypeName).Type()
-	apply             bool
-	testFiles         bool
-	generatedFiles    bool
-	excludeFiles      StringArrayFlag
-	excludeDirs       StringArrayFlag
+	// flags
+	fApply          bool
+	fTestFiles      bool
+	fGeneratedFiles bool
+	fExcludeFiles   StringArrayFlag
+	fExcludeDirs    StringArrayFlag
+
+	// default test and generated suffixes
 	testSuffixes      = []string{"_test.go"}
 	generatedSuffixes = []string{"_generated.go", "_gen.go", ".gen.go", ".pb.go", ".pb.gw.go"}
+
+	// errors
 	ErrStatFile       = errors.New("unable to stat the file")
 	ErrNotRegularFile = errors.New("not a regular file, skipping")
 	ErrWriteFile      = errors.New("unable to write to file")
@@ -122,11 +126,11 @@ var Analyzer = &analysis.Analyzer{
 }
 
 func InitAnalyzer(analyzer *analysis.Analyzer) {
-	analyzer.Flags.BoolVar(&apply, "apply", false, "apply suggested fixes")
-	analyzer.Flags.BoolVar(&testFiles, "test_files", false, "also check and fix test files")
-	analyzer.Flags.BoolVar(&generatedFiles, "generated_files", false, "also check and fix generated files")
-	analyzer.Flags.Var(&excludeFiles, "exclude_files", "exclude files matching a pattern")
-	analyzer.Flags.Var(&excludeDirs, "exclude_dirs", "exclude directories matching a pattern")
+	analyzer.Flags.BoolVar(&fApply, "apply", false, "apply suggested fixes")
+	analyzer.Flags.BoolVar(&fTestFiles, "test_files", false, "also check and fix test files")
+	analyzer.Flags.BoolVar(&fGeneratedFiles, "generated_files", false, "also check and fix generated files")
+	analyzer.Flags.Var(&fExcludeFiles, "exclude_files", "exclude files matching a pattern")
+	analyzer.Flags.Var(&fExcludeDirs, "exclude_dirs", "exclude directories matching a pattern")
 }
 
 func init() {
@@ -135,7 +139,7 @@ func init() {
 
 func run(pass *analysis.Pass) (interface{}, error) {
 	if a := pass.Analyzer.Flags.Lookup("fix"); a != nil && a.Value.String() == "true" {
-		apply = true
+		fApply = true
 	}
 
 	inspect := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
@@ -157,15 +161,15 @@ func run(pass *analysis.Pass) (interface{}, error) {
 	inspect.Preorder(nodeFilter, func(node ast.Node) {
 		fn := pass.Fset.File(node.Pos()).Name()
 
-		if !testFiles && hasSuffixes(testFset, fn, testSuffixes) {
+		if !fTestFiles && hasSuffixes(testFset, fn, testSuffixes) {
 			return
 		}
 
-		if !generatedFiles && hasSuffixes(generatedFset, fn, generatedSuffixes) {
+		if !fGeneratedFiles && hasSuffixes(generatedFset, fn, generatedSuffixes) {
 			return
 		}
 
-		if len(excludeDirs) > 0 || len(excludeFiles) > 0 {
+		if len(fExcludeDirs) > 0 || len(fExcludeFiles) > 0 {
 			wd, err := os.Getwd()
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%v %s: %v", ErrPreFilterFiles, fn, err)
@@ -177,7 +181,7 @@ func run(pass *analysis.Pass) (interface{}, error) {
 				return
 			}
 			dir := filepath.Dir(relfn)
-			for _, excludeDir := range excludeDirs {
+			for _, excludeDir := range fExcludeDirs {
 				rel, err := filepath.Rel(excludeDir, dir)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "%v %s: %v", ErrPreFilterFiles, fn, err)
@@ -187,7 +191,7 @@ func run(pass *analysis.Pass) (interface{}, error) {
 					return
 				}
 			}
-			for _, excludeFile := range excludeFiles {
+			for _, excludeFile := range fExcludeFiles {
 				match, err := filepath.Match(excludeFile, relfn)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "%v %s: %v", ErrPreFilterFiles, fn, err)
@@ -203,7 +207,7 @@ func run(pass *analysis.Pass) (interface{}, error) {
 			aFile = f
 			dFile, _ = dec.DecorateFile(aFile)
 
-			if !generatedFiles && hasGeneratedComment(generatedFset, fn, aFile) {
+			if !fGeneratedFiles && hasGeneratedComment(generatedFset, fn, aFile) {
 				return
 			}
 
@@ -237,7 +241,7 @@ func run(pass *analysis.Pass) (interface{}, error) {
 		}
 	})
 
-	if !apply {
+	if !fApply {
 		return nil, nil
 	}
 
@@ -253,6 +257,8 @@ func run(pass *analysis.Pass) (interface{}, error) {
 func betteralign(pass *analysis.Pass, aNode *ast.StructType, typ *types.Struct, dec *decorator.Decorator,
 	dFile *dst.File, fixOps map[string][]byte, fn string,
 ) {
+	unsafePointerTyp := types.Unsafe.Scope().Lookup("Pointer").(*types.TypeName).Type()
+
 	wordSize := pass.TypesSizes.Sizeof(unsafePointerTyp)
 	maxAlign := pass.TypesSizes.Alignof(unsafePointerTyp)
 
