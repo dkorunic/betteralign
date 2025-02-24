@@ -137,7 +137,7 @@ func init() {
 	InitAnalyzer(Analyzer)
 }
 
-func run(pass *analysis.Pass) (interface{}, error) {
+func run(pass *analysis.Pass) (any, error) {
 	if a := pass.Analyzer.Flags.Lookup("fix"); a != nil && a.Value.String() == "true" {
 		fApply = true
 	}
@@ -336,7 +336,7 @@ func optimalOrder(str *types.Struct, sizes *gcSizes) (*types.Struct, []int) {
 	}
 
 	elems := make([]elem, nf)
-	for i := 0; i < nf; i++ {
+	for i := range nf {
 		field := str.Field(i)
 		ft := field.Type()
 		elems[i] = elem{
@@ -480,7 +480,7 @@ func (s *gcSizes) Sizeof(T types.Type) int64 {
 
 		var o int64
 		max := int64(1)
-		for i := 0; i < nf; i++ {
+		for i := range nf {
 			ft := t.Field(i).Type()
 			a, sz := s.Alignof(ft), s.Sizeof(ft)
 			if a > max {
@@ -534,7 +534,7 @@ func (s *gcSizes) ptrdata(T types.Type) int64 {
 		}
 
 		var o, p int64
-		for i := 0; i < nf; i++ {
+		for i := range nf {
 			ft := t.Field(i).Type()
 			a, sz := s.Alignof(ft), s.Sizeof(ft)
 			fp := s.ptrdata(ft)
