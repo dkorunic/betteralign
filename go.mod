@@ -1,9 +1,11 @@
 module github.com/dkorunic/betteralign
 
-go 1.24
+go 1.23
+
+toolchain go1.24.0
 
 require (
-	github.com/KimMachineGun/automemlimit v0.7.0
+	github.com/KimMachineGun/automemlimit v0.7.1
 	github.com/google/renameio/v2 v2.0.0
 	github.com/sirkon/dst v0.26.4
 	go.uber.org/automaxprocs v1.6.0
