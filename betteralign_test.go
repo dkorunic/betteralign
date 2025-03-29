@@ -119,3 +119,13 @@ func TestFlagExcludeFiles(t *testing.T) {
 		analysistest.Run(t, testdata, analyzer, "exclude/b/...")
 	})
 }
+
+func TestFlagOptInMode(t *testing.T) {
+	t.Run("opt-in enabled, one bad struct opted in and another bad struct not opted in", func(t *testing.T) {
+		testdata := analysistest.TestData()
+		analyzer := NewTestAnalyzer()
+		analyzer.Flags.Set("apply", "false")
+		analyzer.Flags.Set("opt_in", "true")
+		analysistest.Run(t, testdata, analyzer, "optin/...")
+	})
+}

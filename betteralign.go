@@ -87,12 +87,14 @@ gopls. Use this standalone command to run it on your code:
 `
 
 const ignoreStruct = "betteralign:ignore"
+const optInStruct = "betteralign:check"
 
 var (
 	// flags
 	fApply          bool
 	fTestFiles      bool
 	fGeneratedFiles bool
+	fOptInMode      bool
 	fExcludeFiles   StringArrayFlag
 	fExcludeDirs    StringArrayFlag
 
@@ -129,6 +131,7 @@ func InitAnalyzer(analyzer *analysis.Analyzer) {
 	analyzer.Flags.BoolVar(&fApply, "apply", false, "apply suggested fixes")
 	analyzer.Flags.BoolVar(&fTestFiles, "test_files", false, "also check and fix test files")
 	analyzer.Flags.BoolVar(&fGeneratedFiles, "generated_files", false, "also check and fix generated files")
+	analyzer.Flags.BoolVar(&fOptInMode, "opt_in", false, fmt.Sprintf("opt-in mode on per-struct basis with '%s' in comment", optInStruct))
 	analyzer.Flags.Var(&fExcludeFiles, "exclude_files", "exclude files matching a pattern")
 	analyzer.Flags.Var(&fExcludeDirs, "exclude_dirs", "exclude directories matching a pattern")
 }
@@ -153,6 +156,7 @@ func run(pass *analysis.Pass) (any, error) {
 	var aFile *ast.File
 	var dFile *dst.File
 	var strName string
+	var strOptedIn bool
 
 	applyFixesFset := make(map[string][]byte)
 	testFset := make(map[string]bool)
@@ -222,6 +226,7 @@ func run(pass *analysis.Pass) (any, error) {
 			if g.Tok == token.TYPE {
 				decl := g.Specs[0].(*ast.TypeSpec)
 				strName = decl.Name.Name
+				strOptedIn = declaredWithOptInComment(g)
 			}
 
 			return
@@ -233,6 +238,11 @@ func run(pass *analysis.Pass) (any, error) {
 
 		// ignore structs with anonymous fields
 		if strName == "" {
+			return
+		}
+
+		// if in opt-in mode, ignore structs that lack the opt-in comment magic substring
+		if fOptInMode && !strOptedIn {
 			return
 		}
 
@@ -278,6 +288,7 @@ func betteralign(pass *analysis.Pass, aNode *ast.StructType, typ *types.Struct, 
 
 	dNode := dec.Dst.Nodes[aNode].(*dst.StructType)
 
+	// Skip if explicitly ignored with magic comment substring.
 	if hasIgnoreComment(dNode.Fields) {
 		return
 	}
@@ -592,6 +603,18 @@ func hasIgnoreComment(node *dst.FieldList) bool {
 		}
 	}
 
+	return false
+}
+
+func declaredWithOptInComment(decl *ast.GenDecl) bool {
+	if decl.Doc == nil {
+		return false
+	}
+	for _, dc := range decl.Doc.List {
+		if strings.Contains(dc.Text, optInStruct) {
+			return true
+		}
+	}
 	return false
 }
 
