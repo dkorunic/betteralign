@@ -86,8 +86,10 @@ gopls. Use this standalone command to run it on your code:
 
 `
 
-const ignoreStruct = "betteralign:ignore"
-const optInStruct = "betteralign:check"
+const (
+	ignoreStruct = "betteralign:ignore"
+	optInStruct  = "betteralign:check"
+)
 
 var (
 	// flags
