@@ -1,15 +1,37 @@
+version: "2"
 linters:
-  enable-all: true
   disable:
+    - cyclop
+    - depguard
     - dupl
-    - wrapcheck
+    - exhaustruct
     - forbidigo
     - funlen
-    - gocognit
-    - varnamelen
-    - cyclop
     - gochecknoglobals
-    - exhaustivestruct
-    - exhaustruct
+    - gocognit
     - lll
-    - depguard
+    - varnamelen
+    - wrapcheck
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  enable:
+    - gci
+    - gofmt
+    - gofumpt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
