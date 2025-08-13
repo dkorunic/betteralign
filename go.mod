@@ -2,7 +2,7 @@ module github.com/dkorunic/betteralign
 
 go 1.23.0
 
-toolchain go1.24.1
+toolchain go1.25
 
 require (
 	github.com/KimMachineGun/automemlimit v0.7.4
