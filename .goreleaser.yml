@@ -9,8 +9,12 @@ builds:
       - -pgo=auto
     env:
       - CGO_ENABLED=0
-    ldflags: |
-      -s -w -extldflags '-static'
+    ldflags:
+      - -s -w -extldflags '-static'
+      - -X main.Version={{.Version}}
+      - -X main.Commit={{.Commit}}
+      - -X main.Date={{.Date}}
+      - -X main.Timestamp={{.Timestamp}}
     goos:
       - linux
       - darwin

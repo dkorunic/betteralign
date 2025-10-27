@@ -90,7 +90,7 @@ gopls. Use this standalone command to run it on your code:
 
 
 Flags:
-  -V	print version and exit
+  -V	print version and exit (or --version)
   -all
     	no effect (deprecated)
   -apply
