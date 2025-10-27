@@ -7,6 +7,9 @@
 package main
 
 import (
+	"fmt"
+	"os"
+
 	"github.com/KimMachineGun/automemlimit/memlimit"
 	"github.com/dkorunic/betteralign"
 	"go.uber.org/automaxprocs/maxprocs"
@@ -28,6 +31,16 @@ func main() {
 
 	undo, _ := maxprocs.Set()
 	defer undo()
+
+	args := os.Args[1:]
+
+	// check for version flags
+	for _, arg := range args {
+		if arg == "-V" || arg == "--version" {
+			fmt.Println(getVersionString())
+			os.Exit(0)
+		}
+	}
 
 	singlechecker.Main(betteralign.Analyzer)
 }
