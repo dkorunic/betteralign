@@ -13,7 +13,7 @@ import (
 	"gotest.tools/v3/golden"
 )
 
-func removeotherArches(paths []string) []string {
+func removeOtherArches(paths []string) []string {
 	var filtered []string
 	arches := map[string]struct{}{
 		"386":     {},
@@ -86,7 +86,7 @@ func TestApply(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	paths = removeotherArches(paths)
+	paths = removeOtherArches(paths)
 
 	for _, path := range paths {
 		testBasename := filepath.Base(path)
