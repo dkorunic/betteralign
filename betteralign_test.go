@@ -3,6 +3,7 @@ package betteralign_test
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -11,6 +12,41 @@ import (
 	"golang.org/x/tools/go/analysis/analysistest"
 	"gotest.tools/v3/golden"
 )
+
+func removeotherArches(paths []string) []string {
+	var filtered []string
+	arches := map[string]struct{}{
+		"386":     {},
+		"amd64":   {},
+		"arm":     {},
+		"arm64":   {},
+		"ppc64":   {},
+		"ppc64le": {},
+		"riscv64": {},
+		"s390x":   {},
+		"wasm":    {},
+	}
+
+	delete(arches, runtime.GOARCH)
+
+	var blacklist bool
+	for _, path := range paths {
+		blacklist = false
+
+		for arch := range arches {
+			if strings.Contains(path, strings.Join([]string{"_", arch, ".go"}, "")) {
+				blacklist = true
+				break
+			}
+		}
+
+		if !blacklist {
+			filtered = append(filtered, path)
+		}
+	}
+
+	return filtered
+}
 
 func NewTestAnalyzer() *analysis.Analyzer {
 	analyzer := &analysis.Analyzer{
@@ -49,6 +85,8 @@ func TestApply(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	paths = removeotherArches(paths)
 
 	for _, path := range paths {
 		testBasename := filepath.Base(path)
