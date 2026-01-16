@@ -33,6 +33,34 @@ Let us also mention original projects handling this task and without which this 
 - [maligned](https://github.com/mdempsky/maligned) from **Matthew Dempsky**
 - [structslop](https://github.com/orijtech/structslop) from **orijtech**
 
+## Deep dive
+
+There are two main tasks that `betteralign` does:
+
+1. Create a candidate layout order by sorting fields by **descending alignment** required (reducing holes/padding between struct fields),
+2. Reduce **pointer bytes scanned** by GC ([GC will stop scanning values](https://go.dev/doc/gc-guide) at the last pointer in the value).
+
+So having in mind those two tasks, field sort is performed the following way:
+
+1. **Zero sized** objects are placed before non-zero sized objects,
+2. More **tightly aligned** objects are placed before less tightly aligned objects,
+3. **Pointerful objects** are placed before pointer-free objects,
+4. If both objects have pointers, objects with less **trailing non-pointer objects** are placed earlier,
+5. Lastly, order by **size**.
+
+In case of the following:
+
+```golang
+package foo
+
+type IPAddr struct {
+	Zone string // 16 bytes, 8-byte aligned
+	IP   []byte // 24 bytes, 8-byte aligned
+}
+```
+
+Reason why `Zone` gets to be the first field is because trailing data comparison: `Sizeof(string) - ptrdata(string) = 8` vs `Sizeof([]byte) - ptrdata([]byte) = 16`, causing `string` field type to go first in struct `IPAddr` having less trailing non-pointer data.
+
 ## Installation
 
 There are two ways of installing betteralign:
