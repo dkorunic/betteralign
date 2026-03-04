@@ -167,6 +167,14 @@ func TestFlagOptInMode(t *testing.T) {
 		analyzer.Flags.Set("opt_in", "true")
 		analysistest.Run(t, testdata, analyzer, "optin/...")
 	})
+
+	t.Run("per-spec opt-in comment inside a grouped type declaration", func(t *testing.T) {
+		testdata := analysistest.TestData()
+		analyzer := NewTestAnalyzer()
+		analyzer.Flags.Set("apply", "false")
+		analyzer.Flags.Set("opt_in", "true")
+		analysistest.Run(t, testdata, analyzer, "optin/grouped")
+	})
 }
 
 func TestFlagTestFiles(t *testing.T) {

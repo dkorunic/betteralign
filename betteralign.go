@@ -157,8 +157,11 @@ func ResetFlags() {
 }
 
 func run(pass *analysis.Pass) (any, error) {
+	// snapshot flag into a local variable to avoid a data race when run() is invoked concurrently for multiple packages
+	// by the analysis
+	apply := fApply
 	if a := pass.Analyzer.Flags.Lookup("fix"); a != nil && a.Value.String() == "true" {
-		fApply = true
+		apply = true
 	}
 
 	inspect := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
@@ -169,14 +172,19 @@ func run(pass *analysis.Pass) (any, error) {
 		(*ast.GenDecl)(nil),
 	}
 
-	var aFile *ast.File
+	// map from each *ast.StructType position to its name and opt-in status, populated when the enclosing *ast.GenDecl
+	// is visited
+	type structMeta struct {
+		name    string
+		optedIn bool
+	}
+
 	var dFile *dst.File
-	var strName string
-	var strOptedIn bool
 
 	applyFixesFset := make(map[string][]byte)
 	testFset := make(map[string]bool)
 	generatedFset := make(map[string]bool)
+	structMetaMap := make(map[token.Pos]structMeta)
 
 	inspect.Preorder(nodeFilter, func(node ast.Node) {
 		fn := pass.Fset.File(node.Pos()).Name()
@@ -224,41 +232,58 @@ func run(pass *analysis.Pass) (any, error) {
 		}
 
 		if f, ok := node.(*ast.File); ok {
-			aFile = f
-			dFile, _ = dec.DecorateFile(aFile)
+			var decErr error
+			dFile, decErr = dec.DecorateFile(f)
+			if decErr != nil {
+				fmt.Fprintf(os.Stderr, "failed to decorate %s: %v\n", fn, decErr)
+				dFile = nil
+			}
 
-			if !fGeneratedFiles && hasGeneratedComment(generatedFset, fn, aFile) {
+			if !fGeneratedFiles && hasGeneratedComment(generatedFset, fn, f) {
 				return
 			}
 
 			return
 		}
 
-		var ok bool
-		var s *ast.StructType
-		var g *ast.GenDecl
-
-		if g, ok = node.(*ast.GenDecl); ok {
+		if g, ok := node.(*ast.GenDecl); ok {
 			if g.Tok == token.TYPE {
-				decl := g.Specs[0].(*ast.TypeSpec)
-				strName = decl.Name.Name
-				strOptedIn = declaredWithOptInComment(g)
+				groupOptedIn := declaredWithOptInComment(g)
+				for _, spec := range g.Specs {
+					ts, ok := spec.(*ast.TypeSpec)
+					if !ok {
+						continue
+					}
+					if st, ok := ts.Type.(*ast.StructType); ok {
+						structMetaMap[st.Pos()] = structMeta{
+							name:    ts.Name.Name,
+							optedIn: groupOptedIn || commentGroupHasOptIn(ts.Doc),
+						}
+					}
+				}
 			}
 
 			return
 		}
 
-		if s, ok = node.(*ast.StructType); !ok {
+		s, ok := node.(*ast.StructType)
+		if !ok {
 			return
 		}
 
-		// ignore structs with anonymous fields
-		if strName == "" {
+		// Only process structs that are named type declarations.
+		meta, found := structMetaMap[s.Pos()]
+		if !found {
 			return
 		}
 
 		// if in opt-in mode, ignore structs that lack the opt-in comment magic substring
-		if fOptInMode && !strOptedIn {
+		if fOptInMode && !meta.optedIn {
+			return
+		}
+
+		// skip if decoration of this file failed.
+		if dFile == nil {
 			return
 		}
 
@@ -267,7 +292,7 @@ func run(pass *analysis.Pass) (any, error) {
 		}
 	})
 
-	if !fApply {
+	if !apply {
 		return nil, nil
 	}
 
@@ -622,16 +647,20 @@ func hasIgnoreComment(node *dst.FieldList) bool {
 	return false
 }
 
-func declaredWithOptInComment(decl *ast.GenDecl) bool {
-	if decl.Doc == nil {
+func commentGroupHasOptIn(cg *ast.CommentGroup) bool {
+	if cg == nil {
 		return false
 	}
-	for _, dc := range decl.Doc.List {
+	for _, dc := range cg.List {
 		if strings.Contains(dc.Text, optInStruct) {
 			return true
 		}
 	}
 	return false
+}
+
+func declaredWithOptInComment(decl *ast.GenDecl) bool {
+	return commentGroupHasOptIn(decl.Doc)
 }
 
 func applyToFile(fn string, buf []byte) error {
