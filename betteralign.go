@@ -181,10 +181,19 @@ func run(pass *analysis.Pass) (any, error) {
 
 	var dFile *dst.File
 
-	applyFixesFset := make(map[string][]byte)
+	dirtyFiles := make(map[string]*dst.File)
 	testFset := make(map[string]bool)
 	generatedFset := make(map[string]bool)
 	structMetaMap := make(map[token.Pos]structMeta)
+
+	var wd string
+	if len(fExcludeDirs) > 0 || len(fExcludeFiles) > 0 {
+		var err error
+		wd, err = os.Getwd()
+		if err != nil {
+			return nil, fmt.Errorf("%v: %w", ErrPreFilterFiles, err)
+		}
+	}
 
 	inspect.Preorder(nodeFilter, func(node ast.Node) {
 		fn := pass.Fset.File(node.Pos()).Name()
@@ -198,11 +207,6 @@ func run(pass *analysis.Pass) (any, error) {
 		}
 
 		if len(fExcludeDirs) > 0 || len(fExcludeFiles) > 0 {
-			wd, err := os.Getwd()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "%v %s: %v", ErrPreFilterFiles, fn, err)
-				return
-			}
 			relfn, err := filepath.Rel(wd, fn)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%v %s: %v", ErrPreFilterFiles, fn, err)
@@ -288,17 +292,20 @@ func run(pass *analysis.Pass) (any, error) {
 		}
 
 		if tv, ok := pass.TypesInfo.Types[s]; ok {
-			betteralign(pass, s, tv.Type.(*types.Struct), dec, dFile, applyFixesFset, fn)
+			betteralign(pass, s, tv.Type.(*types.Struct), dec, dFile, dirtyFiles, fn)
 		}
 	})
 
-	if !apply {
-		return nil, nil
-	}
-
-	for fn, buf := range applyFixesFset {
-		if err := applyToFile(fn, buf); err != nil {
-			fmt.Fprintf(os.Stderr, "error applying fixes to %v: %v\n", fn, err)
+	if apply {
+		for fn, df := range dirtyFiles {
+			var buf bytes.Buffer
+			if err := decorator.Fprint(&buf, df); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to print %s: %v\n", fn, err)
+				continue
+			}
+			if err := applyToFile(fn, buf.Bytes()); err != nil {
+				fmt.Fprintf(os.Stderr, "error applying fixes to %v: %v\n", fn, err)
+			}
 		}
 	}
 
@@ -308,8 +315,15 @@ func run(pass *analysis.Pass) (any, error) {
 var unsafePointerTyp = types.Unsafe.Scope().Lookup("Pointer").(*types.TypeName).Type()
 
 func betteralign(pass *analysis.Pass, aNode *ast.StructType, typ *types.Struct, dec *decorator.Decorator,
-	dFile *dst.File, fixOps map[string][]byte, fn string,
+	dFile *dst.File, dirtyFiles map[string]*dst.File, fn string,
 ) {
+	dNode := dec.Dst.Nodes[aNode].(*dst.StructType)
+
+	// Skip if explicitly ignored with magic comment substring.
+	if hasIgnoreComment(dNode.Fields) {
+		return
+	}
+
 	wordSize := pass.TypesSizes.Sizeof(unsafePointerTyp)
 	maxAlign := pass.TypesSizes.Alignof(unsafePointerTyp)
 
@@ -324,13 +338,6 @@ func betteralign(pass *analysis.Pass, aNode *ast.StructType, typ *types.Struct, 
 		message = fmt.Sprintf("%d bytes saved: struct with %d pointer bytes could be %d", ptrs-optptrs, ptrs, optptrs)
 	} else {
 		// Already optimal order.
-		return
-	}
-
-	dNode := dec.Dst.Nodes[aNode].(*dst.StructType)
-
-	// Skip if explicitly ignored with magic comment substring.
-	if hasIgnoreComment(dNode.Fields) {
 		return
 	}
 
@@ -362,11 +369,6 @@ func betteralign(pass *analysis.Pass, aNode *ast.StructType, typ *types.Struct, 
 
 	dNode.Fields.List = reordered
 
-	var buf bytes.Buffer
-	if err := decorator.Fprint(&buf, dFile); err != nil {
-		return
-	}
-
 	pass.Report(analysis.Diagnostic{
 		Pos:            aNode.Pos(),
 		End:            aNode.Pos() + token.Pos(len("struct")),
@@ -374,7 +376,7 @@ func betteralign(pass *analysis.Pass, aNode *ast.StructType, typ *types.Struct, 
 		SuggestedFixes: nil,
 	})
 
-	fixOps[fn] = buf.Bytes()
+	dirtyFiles[fn] = dFile
 }
 
 func optimalOrder(str *types.Struct, sizes *gcSizes) (*types.Struct, []int) {

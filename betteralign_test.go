@@ -29,12 +29,17 @@ func removeOtherArches(paths []string) []string {
 
 	delete(arches, runtime.GOARCH)
 
+	suffixes := make([]string, 0, len(arches))
+	for arch := range arches {
+		suffixes = append(suffixes, "_"+arch+".go")
+	}
+
 	var blacklist bool
 	for _, path := range paths {
 		blacklist = false
 
-		for arch := range arches {
-			if strings.Contains(path, strings.Join([]string{"_", arch, ".go"}, "")) {
+		for _, suffix := range suffixes {
+			if strings.Contains(path, suffix) {
 				blacklist = true
 				break
 			}
