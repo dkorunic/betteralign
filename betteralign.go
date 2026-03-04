@@ -142,6 +142,20 @@ func init() {
 	InitAnalyzer(Analyzer)
 }
 
+// ResetFlags resets all package-level flag variables to their zero values.
+// This function is intended for use in tests only. It must be called (via
+// NewTestAnalyzer in betteralign_test.go) before each analyzer construction
+// to prevent StringArrayFlag.Set from accumulating values across test
+// functions. It has no effect on the behaviour of the analyzer in production.
+func ResetFlags() {
+	fApply = false
+	fTestFiles = false
+	fGeneratedFiles = false
+	fOptInMode = false
+	fExcludeFiles = nil
+	fExcludeDirs = nil
+}
+
 func run(pass *analysis.Pass) (any, error) {
 	if a := pass.Analyzer.Flags.Lookup("fix"); a != nil && a.Value.String() == "true" {
 		fApply = true

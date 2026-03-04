@@ -49,6 +49,7 @@ func removeOtherArches(paths []string) []string {
 }
 
 func NewTestAnalyzer() *analysis.Analyzer {
+	betteralign.ResetFlags()
 	analyzer := &analysis.Analyzer{
 		Name:     betteralign.Analyzer.Name,
 		Doc:      betteralign.Analyzer.Doc,
@@ -165,5 +166,35 @@ func TestFlagOptInMode(t *testing.T) {
 		analyzer.Flags.Set("apply", "false")
 		analyzer.Flags.Set("opt_in", "true")
 		analysistest.Run(t, testdata, analyzer, "optin/...")
+	})
+}
+
+func TestFlagTestFiles(t *testing.T) {
+	t.Run("test files excluded by default", func(t *testing.T) {
+		testdata := analysistest.TestData()
+		analyzer := NewTestAnalyzer()
+		analysistest.Run(t, testdata, analyzer, "testfiles/a")
+	})
+
+	t.Run("test files included with flag", func(t *testing.T) {
+		testdata := analysistest.TestData()
+		analyzer := NewTestAnalyzer()
+		analyzer.Flags.Set("test_files", "true")
+		analysistest.Run(t, testdata, analyzer, "testfiles/b")
+	})
+}
+
+func TestFlagGeneratedFiles(t *testing.T) {
+	t.Run("generated files excluded by default", func(t *testing.T) {
+		testdata := analysistest.TestData()
+		analyzer := NewTestAnalyzer()
+		analysistest.Run(t, testdata, analyzer, "generated/a")
+	})
+
+	t.Run("generated files included with flag", func(t *testing.T) {
+		testdata := analysistest.TestData()
+		analyzer := NewTestAnalyzer()
+		analyzer.Flags.Set("generated_files", "true")
+		analysistest.Run(t, testdata, analyzer, "generated/b")
 	})
 }

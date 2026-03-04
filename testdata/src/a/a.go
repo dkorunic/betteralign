@@ -44,3 +44,22 @@ type WithComments struct { // want "struct of size 8 could be 4"
 
 	// and a last comment
 }
+
+type IgnoredBad struct { // betteralign:ignore
+	x byte
+	y int32
+	z byte
+}
+
+type (
+	GroupedBad1 struct { // want "struct of size 12 could be 8"
+		x byte
+		y int32
+		z byte
+	}
+	GroupedBad2 struct { // want "struct of size 12 could be 8"
+		x byte
+		y int32
+		z byte
+	}
+)
