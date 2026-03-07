@@ -1,0 +1,97 @@
+{
+  "name": "vscode-betteralign",
+  "displayName": "Better Align for VS Code",
+  "description": "VS Code extension for betteralign, a tool by dkorunic to optimize Go struct alignment",
+  "version": "0.1.0",
+  "publisher": "the_aceix",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Linters",
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:go"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "betteralign.run",
+        "title": "Betteralign: Run on current file"
+      },
+      {
+        "command": "betteralign.apply",
+        "title": "Betteralign: Apply fixes to current file"
+      },
+      {
+        "command": "betteralign.installBinary",
+        "title": "Betteralign: Install Binary"
+      }
+    ],
+    "configuration": {
+      "title": "betteralign",
+      "properties": {
+        "betteralign.enable": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable betteralign extension"
+        },
+        "betteralign.runOnSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run betteralign on save"
+        },
+        "betteralign.applyPrompt": {
+          "type": "string",
+          "enum": [
+            "always",
+            "never",
+            "onDiagnostics"
+          ],
+          "default": "onDiagnostics",
+          "description": "When to prompt to apply fixes after running betteralign"
+        },
+        "betteralign.severity": {
+          "type": "string",
+          "enum": [
+            "information",
+            "warning",
+            "hint",
+            "error"
+          ],
+          "default": "hint",
+          "description": "Diagnostic severity for betteralign optimizations (color of squiggly line)"
+        },
+        "betteralign.binPath": {
+          "type": "string",
+          "default": "",
+          "description": "Custom path to betteralign binary. If empty, the extension will try to find it in PATH, GOPATH, or GOBIN."
+        },
+        "betteralign.extraArgs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Additional CLI flags to pass to betteralign (e.g. ['-test_files', '-generated_files'])"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile",
+    "test": "node ./out/test/runTest.js",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/vscode": "^1.80.0",
+    "@vscode/vsce": "^3.7.1",
+    "typescript": "^5.0.0"
+  }
+}
