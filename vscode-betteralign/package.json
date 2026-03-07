@@ -86,12 +86,14 @@
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile",
     "test": "node ./out/test/runTest.js",
-    "package": "vsce package"
+    "vscode:package": "vsce package",
+    "openvsx:package": "ovsx package"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
     "@types/vscode": "^1.80.0",
     "@vscode/vsce": "^3.7.1",
+    "ovsx": "^0.10.9",
     "typescript": "^5.0.0"
   }
 }
