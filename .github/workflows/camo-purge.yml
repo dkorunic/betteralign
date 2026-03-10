@@ -1,0 +1,14 @@
+name: Purge camo cache
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "*"
+  schedule:
+    - cron: "0 7 * * *"
+jobs:
+  purge-camo-cache:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Purge camo cache
+        uses: kevincobain2000/action-camo-purge@v1
