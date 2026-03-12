@@ -172,4 +172,8 @@ Generated and test files can be included with the `-generated_files` and `-test_
 
 ## Star history
 
-[![Star History Chart](https://api.star-history.com/svg?repos=dkorunic/betteralign&type=Date)](https://star-history.com/#dkorunic/betteralign&Date)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/image?repos=dkorunic/betteralign&type=date&theme=dark" />
+  <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/image?repos=dkorunic/betteralign&type=date" />
+  <img alt="Star History Chart" src="https://api.star-history.com/image?repos=dkorunic/betteralign&type=date" />
+</picture>
