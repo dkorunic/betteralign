@@ -4,14 +4,16 @@
   "description": "VS Code extension for betteralign, a tool by dkorunic to optimize Go struct alignment",
   "version": "0.1.0",
   "publisher": "aceix",
-  "repository": "https://github.com/Aceix/betteralign#",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dkorunic/betteralign.git",
+    "directory": "vscode-betteralign"
+  },
   "license": "BSD-3-Clause",
   "icon": "./logo.png",
-    "scripts": {
+  "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "pretest": "npm run compile",
-    "test": "node ./out/test/runTest.js",
     "vscode:prepublish": "npm run compile",
     "vscode:package": "vsce package",
     "openvsx:package": "ovsx package"
@@ -31,24 +33,56 @@
     "Linters",
     "Programming Languages"
   ],
-  "activationEvents": [
-    "onLanguage:go"
+  "keywords": [
+    "go",
+    "golang",
+    "alignment",
+    "struct",
+    "linter",
+    "memory"
   ],
+  "extensionKind": [
+    "workspace"
+  ],
+  "activationEvents": [
+    "onLanguage:go",
+    "workspaceContains:**/*.go"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "In untrusted workspaces, workspace-scoped betteralign.extraArgs is ignored; only user- and machine-scoped settings apply."
+    }
+  },
   "contributes": {
     "commands": [
       {
         "command": "betteralign.run",
-        "title": "Betteralign: Run on current file"
+        "title": "Betteralign: Run on current file",
+        "enablement": "editorLangId == go"
       },
       {
         "command": "betteralign.apply",
-        "title": "Betteralign: Apply fixes to current file"
+        "title": "Betteralign: Apply fixes to current file",
+        "enablement": "editorLangId == go"
       },
       {
         "command": "betteralign.installBinary",
         "title": "Betteralign: Install Binary"
       }
     ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "betteralign.run",
+          "when": "editorLangId == go"
+        },
+        {
+          "command": "betteralign.apply",
+          "when": "editorLangId == go"
+        }
+      ]
+    },
     "configuration": {
       "title": "betteralign",
       "properties": {
@@ -65,9 +99,8 @@
         "betteralign.applyPrompt": {
           "type": "string",
           "enum": [
-            "always",
-            "never",
-            "onDiagnostics"
+            "onDiagnostics",
+            "never"
           ],
           "default": "onDiagnostics",
           "description": "When to prompt to apply fixes after running betteralign"
@@ -83,10 +116,18 @@
           "default": "hint",
           "description": "Diagnostic severity for betteralign optimizations (color of squiggly line)"
         },
+        "betteralign.debounceMs": {
+          "type": "number",
+          "default": 300,
+          "minimum": 0,
+          "maximum": 5000,
+          "description": "Debounce delay (milliseconds) between a file save and the betteralign run. Rapid consecutive saves collapse into a single invocation."
+        },
         "betteralign.binPath": {
           "type": "string",
           "default": "",
-          "description": "Custom path to betteralign binary. If empty, the extension will try to find it in PATH, GOPATH, or GOBIN."
+          "scope": "machine",
+          "description": "Custom path to betteralign binary. If empty, the extension will try to find it in PATH or GOPATH/bin. Machine-scoped: cannot be overridden from workspace settings for safety."
         },
         "betteralign.extraArgs": {
           "type": "array",
@@ -94,7 +135,7 @@
             "type": "string"
           },
           "default": [],
-          "description": "Additional CLI flags to pass to betteralign (e.g. ['-test_files', '-generated_files'])"
+          "description": "Additional CLI flags forwarded to betteralign. Only these are accepted: -test_files, -generated_files, -opt_in (boolean); -exclude_dirs=..., -exclude_files=... (use -flag=value form). Anything else is ignored."
         }
       }
     }

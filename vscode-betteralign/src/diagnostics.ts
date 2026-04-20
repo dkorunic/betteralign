@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { BetteralignResult, BetteralignDiagnostic } from './runner';
 
-export class DiagnosticManager {
+export class DiagnosticManager implements vscode.Disposable {
     private collection: vscode.DiagnosticCollection;
 
     constructor() {
@@ -10,25 +10,24 @@ export class DiagnosticManager {
 
     public update(document: vscode.TextDocument, result: BetteralignResult | null): boolean {
         this.collection.delete(document.uri);
-        
+
         if (!result) {
             return false;
         }
 
         const diagnostics: vscode.Diagnostic[] = [];
-        let hasIssues = false;
-
-        const severity = this.getConfiguredSeverity();
+        // Resolve per-URI so multi-root folder overrides are honoured.
+        const severity = this.getConfiguredSeverity(document.uri);
 
         for (const pkgName of Object.keys(result)) {
             const pkg = result[pkgName];
-            if (pkg.betteralign && pkg.betteralign.length > 0) {
-                for (const item of pkg.betteralign) {
-                    const diag = this.parseDiagnostic(item, severity, document);
-                    if (diag) {
-                        diagnostics.push(diag);
-                        hasIssues = true;
-                    }
+            if (!pkg.betteralign || pkg.betteralign.length === 0) {
+                continue;
+            }
+            for (const item of pkg.betteralign) {
+                const diag = this.parseDiagnostic(item, severity, document);
+                if (diag) {
+                    diagnostics.push(diag);
                 }
             }
         }
@@ -37,7 +36,7 @@ export class DiagnosticManager {
             this.collection.set(document.uri, diagnostics);
         }
 
-        return hasIssues;
+        return diagnostics.length > 0;
     }
 
     public clear(document: vscode.TextDocument) {
@@ -48,42 +47,52 @@ export class DiagnosticManager {
         this.collection.dispose();
     }
 
-    private getConfiguredSeverity(): vscode.DiagnosticSeverity {
-        const config = vscode.workspace.getConfiguration('betteralign');
-        const severityStr = config.get<string>('severity', 'information');
-        
+    private getConfiguredSeverity(resource: vscode.Uri): vscode.DiagnosticSeverity {
+        const config = vscode.workspace.getConfiguration('betteralign', resource);
+        const severityStr = config.get<string>('severity', 'hint');
+
         switch (severityStr) {
             case 'error': return vscode.DiagnosticSeverity.Error;
             case 'warning': return vscode.DiagnosticSeverity.Warning;
-            case 'hint': return vscode.DiagnosticSeverity.Hint;
-            case 'information':
+            case 'information': return vscode.DiagnosticSeverity.Information;
+            case 'hint':
             default:
-                return vscode.DiagnosticSeverity.Information;
+                return vscode.DiagnosticSeverity.Hint;
         }
     }
 
     private parseDiagnostic(item: BetteralignDiagnostic, severity: vscode.DiagnosticSeverity, doc: vscode.TextDocument): vscode.Diagnostic | null {
-        // format is "file.go:line:col"
-        const parts = item.posn.split(':');
-        if (parts.length < 3) return null;
+        // posn is "file:line:col"; take last two parts so Windows drive letters don't break it.
+        // try/catch guards lineAt racing a disposed doc during -apply reload.
+        try {
+            const parts = item.posn.split(':');
+            if (parts.length < 3) {
+                return null;
+            }
 
-        const line = parseInt(parts[parts.length - 2], 10) - 1; // VS Code is 0-indexed
-        const col = parseInt(parts[parts.length - 1], 10) - 1;
+            const line = parseInt(parts[parts.length - 2], 10) - 1;
+            const col = parseInt(parts[parts.length - 1], 10) - 1;
 
-        if (isNaN(line) || isNaN(col)) return null;
+            if (isNaN(line) || isNaN(col) || line < 0 || col < 0) {
+                return null;
+            }
+            // Stale position after -apply rewrote the file.
+            if (line >= doc.lineCount) {
+                return null;
+            }
 
-        // Try to get word boundary based on where the error points (it usually points to `type X struct`)
-        // A minimal range is fine
-        const lineText = doc.lineAt(line).text;
-        
-        // Give a little range of the line or word
-        const start = new vscode.Position(line, col);
-        const end = new vscode.Position(line, lineText.length);
-        const range = new vscode.Range(start, end);
+            const lineText = doc.lineAt(line).text;
+            const startCol = Math.min(col, lineText.length);
+            const start = new vscode.Position(line, startCol);
+            const end = new vscode.Position(line, lineText.length);
+            const range = new vscode.Range(start, end);
 
-        const diagnostic = new vscode.Diagnostic(range, item.message, severity);
-        diagnostic.source = 'betteralign';
-        diagnostic.code = 'struct-alignment';
-        return diagnostic;
+            const diagnostic = new vscode.Diagnostic(range, item.message, severity);
+            diagnostic.source = 'betteralign';
+            diagnostic.code = 'struct-alignment';
+            return diagnostic;
+        } catch {
+            return null;
+        }
     }
 }
