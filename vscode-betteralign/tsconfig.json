@@ -6,6 +6,10 @@
     "lib": [
       "es2020"
     ],
+    "types": [
+      "node",
+      "vscode"
+    ],
     "sourceMap": true,
     "rootDir": "src",
     "strict": true,
