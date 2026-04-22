@@ -19,11 +19,11 @@
     "openvsx:package": "ovsx package"
   },
   "devDependencies": {
-    "@types/node": "^24.0.0",
-    "@types/vscode": "^1.80.0",
-    "@vscode/vsce": "^3.7.1",
-    "ovsx": "^0.10.9",
-    "typescript": "^5.0.0"
+    "@types/node": "^25.6.0",
+    "@types/vscode": "^1.116.0",
+    "@vscode/vsce": "^3.9.1",
+    "ovsx": "^0.10.11",
+    "typescript": "^6.0.3"
   },
   "engines": {
     "vscode": "^1.80.0"
