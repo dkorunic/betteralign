@@ -216,3 +216,17 @@ func TestFlagGeneratedFiles(t *testing.T) {
 		analysistest.Run(t, testdata, analyzer, "generated/b")
 	})
 }
+
+// TestAnonymousStructsSkipped pins the documented contract that only struct
+// types declared via `type T struct { ... }` are analysed. Anonymous struct
+// types — appearing as var types, function parameter or return types,
+// composite literal element types, map values, and as inline field types of
+// a named struct — must never produce diagnostics. The testdata file
+// contains intentionally misaligned anonymous structs whose field order
+// would otherwise trigger a "struct of size 12 could be 8" diagnostic;
+// the absence of any `// want` annotations is the assertion.
+func TestAnonymousStructsSkipped(t *testing.T) {
+	testdata := analysistest.TestData()
+	analyzer := NewTestAnalyzer()
+	analysistest.Run(t, testdata, analyzer, "anonymous")
+}

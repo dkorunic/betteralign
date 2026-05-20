@@ -912,3 +912,596 @@ func TestStringArrayFlagSetAccumulates(t *testing.T) {
 		}
 	}
 }
+
+// ─── Layer 13: gcSizes.Alignof additional branches ───────────────────────────
+
+// TestGcSizesAlignofPointer verifies pointer alignment is one word.
+func TestGcSizesAlignofPointer(t *testing.T) {
+	if got := testSizes64.Alignof(types.NewPointer(types.Typ[types.Int])); got != 8 {
+		t.Errorf("Alignof(*int) = %d, want 8", got)
+	}
+}
+
+// TestGcSizesAlignofSlice verifies a slice header aligns at MaxAlign (the
+// 24-byte sizeof is capped down).
+func TestGcSizesAlignofSlice(t *testing.T) {
+	if got := testSizes64.Alignof(types.NewSlice(types.Typ[types.Int])); got != 8 {
+		t.Errorf("Alignof([]int) = %d, want 8 (capped by MaxAlign)", got)
+	}
+}
+
+// TestGcSizesAlignofInterface verifies the MaxAlign cap also applies to
+// interfaces (sizeof=16 > MaxAlign=8).
+func TestGcSizesAlignofInterface(t *testing.T) {
+	if got := testSizes64.Alignof(types.NewInterfaceType(nil, nil)); got != 8 {
+		t.Errorf("Alignof(interface{}) = %d, want 8 (capped by MaxAlign)", got)
+	}
+}
+
+// TestGcSizesAlignofMap verifies map alignment is one word.
+func TestGcSizesAlignofMap(t *testing.T) {
+	m := types.NewMap(types.Typ[types.String], types.Typ[types.Int])
+	if got := testSizes64.Alignof(m); got != 8 {
+		t.Errorf("Alignof(map[string]int) = %d, want 8", got)
+	}
+}
+
+// TestGcSizesAlignofChan verifies channel alignment is one word.
+func TestGcSizesAlignofChan(t *testing.T) {
+	c := types.NewChan(types.SendRecv, types.Typ[types.Int])
+	if got := testSizes64.Alignof(c); got != 8 {
+		t.Errorf("Alignof(chan int) = %d, want 8", got)
+	}
+}
+
+// TestGcSizesAlignofSignature verifies function-value alignment is one word.
+func TestGcSizesAlignofSignature(t *testing.T) {
+	sig := types.NewSignatureType(nil, nil, nil, nil, nil, false)
+	if got := testSizes64.Alignof(sig); got != 8 {
+		t.Errorf("Alignof(func()) = %d, want 8", got)
+	}
+}
+
+// TestGcSizesAlignofMaxAlignCap verifies the cap fires when Sizeof exceeds
+// MaxAlign. A deliberately tiny MaxAlign (2) reveals the cap on a uint64
+// (sizeof=8): without the cap the result would be 8.
+func TestGcSizesAlignofMaxAlignCap(t *testing.T) {
+	sizes := newGCSizes(8, 2)
+	if got := sizes.Alignof(types.Typ[types.Uint64]); got != 2 {
+		t.Errorf("Alignof(uint64) with MaxAlign=2 = %d, want 2 (cap)", got)
+	}
+}
+
+// TestGcSizesAlignofNestedArrayOfStruct verifies Alignof recurses into array
+// element types: [3]struct{uint64} aligns to 8 because its element struct
+// aligns to 8.
+func TestGcSizesAlignofNestedArrayOfStruct(t *testing.T) {
+	innerFields := []*types.Var{
+		types.NewVar(token.NoPos, nil, "x", types.Typ[types.Uint64]),
+	}
+	inner := types.NewStruct(innerFields, nil)
+	arr := types.NewArray(inner, 3)
+	if got := testSizes64.Alignof(arr); got != 8 {
+		t.Errorf("Alignof([3]struct{uint64}) = %d, want 8", got)
+	}
+}
+
+// ─── Layer 14: gcSizes.Sizeof additional branches ────────────────────────────
+
+// TestGcSizesSizeofBasicKinds covers all *types.Basic kinds, both the ones
+// looked up in the basicSizes table and the ones (Int/Uint/Uintptr) that hit
+// the catch-all WordSize return.
+func TestGcSizesSizeofBasicKinds(t *testing.T) {
+	tests := []struct {
+		name string
+		kind types.BasicKind
+		want int64
+	}{
+		{"bool", types.Bool, 1},
+		{"int8", types.Int8, 1},
+		{"int16", types.Int16, 2},
+		{"int32", types.Int32, 4},
+		{"int64", types.Int64, 8},
+		{"uint8", types.Uint8, 1},
+		{"uint16", types.Uint16, 2},
+		{"uint32", types.Uint32, 4},
+		{"uint64", types.Uint64, 8},
+		{"float32", types.Float32, 4},
+		{"float64", types.Float64, 8},
+		{"complex64", types.Complex64, 8},
+		{"complex128", types.Complex128, 16},
+		{"int", types.Int, 8},         // catch-all WordSize
+		{"uint", types.Uint, 8},       // catch-all WordSize
+		{"uintptr", types.Uintptr, 8}, // catch-all WordSize
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := testSizes64.Sizeof(types.Typ[tc.kind])
+			if got != tc.want {
+				t.Errorf("Sizeof(%s) = %d, want %d", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestGcSizesSizeofInterface verifies the interface special case (2 words).
+func TestGcSizesSizeofInterface(t *testing.T) {
+	if got := testSizes64.Sizeof(types.NewInterfaceType(nil, nil)); got != 16 {
+		t.Errorf("Sizeof(interface{}) = %d, want 16", got)
+	}
+}
+
+// TestGcSizesSizeofPointerShapedTypes verifies that pointer, channel, map,
+// and signature types fall into the catch-all WordSize arm.
+func TestGcSizesSizeofPointerShapedTypes(t *testing.T) {
+	tests := []struct {
+		name string
+		typ  types.Type
+	}{
+		{"*int", types.NewPointer(types.Typ[types.Int])},
+		{"chan int", types.NewChan(types.SendRecv, types.Typ[types.Int])},
+		{"map[string]int", types.NewMap(types.Typ[types.String], types.Typ[types.Int])},
+		{"func()", types.NewSignatureType(nil, nil, nil, nil, nil, false)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := testSizes64.Sizeof(tc.typ); got != 8 {
+				t.Errorf("Sizeof(%s) = %d, want 8 (WordSize)", tc.name, got)
+			}
+		})
+	}
+}
+
+// TestGcSizesSizeofTrailingZeroSizedBumps verifies the trailing zero-sized
+// field gets one byte of padding when preceded by non-zero-sized fields. The
+// runtime needs this so &struct.lastField is unique per instance.
+func TestGcSizesSizeofTrailingZeroSizedBumps(t *testing.T) {
+	emptyStruct := types.NewStruct(nil, nil)
+
+	bumped := types.NewStruct([]*types.Var{
+		types.NewVar(token.NoPos, nil, "x", types.Typ[types.Uint32]),
+		types.NewVar(token.NoPos, nil, "z", emptyStruct),
+	}, nil)
+	if got := testSizes64.Sizeof(bumped); got != 8 {
+		t.Errorf("Sizeof(struct{uint32;struct{}}) = %d, want 8 (trailing zero-sized must bump)", got)
+	}
+
+	leading := types.NewStruct([]*types.Var{
+		types.NewVar(token.NoPos, nil, "z", emptyStruct),
+		types.NewVar(token.NoPos, nil, "x", types.Typ[types.Uint32]),
+	}, nil)
+	if got := testSizes64.Sizeof(leading); got != 4 {
+		t.Errorf("Sizeof(struct{struct{};uint32}) = %d, want 4 (leading zero-sized must NOT bump)", got)
+	}
+
+	allEmpty := types.NewStruct([]*types.Var{
+		types.NewVar(token.NoPos, nil, "a", emptyStruct),
+		types.NewVar(token.NoPos, nil, "b", emptyStruct),
+	}, nil)
+	if got := testSizes64.Sizeof(allEmpty); got != 0 {
+		t.Errorf("Sizeof(struct{struct{};struct{}}) = %d, want 0 (no field with offset!=0)", got)
+	}
+}
+
+// TestGcSizesSizeofNestedStruct verifies a struct field that is itself a
+// struct contributes its own sizeof, including trailing padding.
+func TestGcSizesSizeofNestedStruct(t *testing.T) {
+	inner := types.NewStruct([]*types.Var{
+		types.NewVar(token.NoPos, nil, "x", types.Typ[types.Uint32]),
+		types.NewVar(token.NoPos, nil, "y", types.Typ[types.Bool]),
+	}, nil)
+	outer := types.NewStruct([]*types.Var{
+		types.NewVar(token.NoPos, nil, "i", inner),
+		types.NewVar(token.NoPos, nil, "u", types.Typ[types.Uint64]),
+	}, nil)
+	if got := testSizes64.Sizeof(outer); got != 16 {
+		t.Errorf("Sizeof(struct{inner;uint64}) = %d, want 16", got)
+	}
+}
+
+// ─── Layer 15: gcSizes.ptrdata additional branches ───────────────────────────
+
+// TestGcSizesPtrdataNonPointerBasic verifies that all non-pointer basic types
+// (including uintptr, which is NOT scanned by the garbage collector) return
+// zero pointer bytes.
+func TestGcSizesPtrdataNonPointerBasic(t *testing.T) {
+	tests := []struct {
+		name string
+		kind types.BasicKind
+	}{
+		{"bool", types.Bool},
+		{"int", types.Int},
+		{"int32", types.Int32},
+		{"uint64", types.Uint64},
+		{"float64", types.Float64},
+		{"complex128", types.Complex128},
+		{"uintptr", types.Uintptr},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := testSizes64.ptrdata(types.Typ[tc.kind]); got != 0 {
+				t.Errorf("ptrdata(%s) = %d, want 0", tc.name, got)
+			}
+		})
+	}
+}
+
+// TestGcSizesPtrdataUnsafePointer verifies that unsafe.Pointer (the only
+// pointer-bearing *types.Basic besides string) returns one word.
+func TestGcSizesPtrdataUnsafePointer(t *testing.T) {
+	if got := testSizes64.ptrdata(types.Typ[types.UnsafePointer]); got != 8 {
+		t.Errorf("ptrdata(unsafe.Pointer) = %d, want 8", got)
+	}
+}
+
+// TestGcSizesPtrdataPointerShapedTypes verifies every pointer-shaped
+// *types.Type kind in the explicit ptrdata case (Chan, Map, Pointer,
+// Signature, Slice) returns one word.
+func TestGcSizesPtrdataPointerShapedTypes(t *testing.T) {
+	tests := []struct {
+		name string
+		typ  types.Type
+	}{
+		{"*int", types.NewPointer(types.Typ[types.Int])},
+		{"chan int", types.NewChan(types.SendRecv, types.Typ[types.Int])},
+		{"map[string]int", types.NewMap(types.Typ[types.String], types.Typ[types.Int])},
+		{"func()", types.NewSignatureType(nil, nil, nil, nil, nil, false)},
+		{"[]int", types.NewSlice(types.Typ[types.Int])},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := testSizes64.ptrdata(tc.typ); got != 8 {
+				t.Errorf("ptrdata(%s) = %d, want 8", tc.name, got)
+			}
+		})
+	}
+}
+
+// TestGcSizesPtrdataZeroLengthArray verifies a [0]*T array has zero ptrdata,
+// guarding the early-exit before the (n-1)*z + a formula (which would yield
+// a negative value for n==0).
+func TestGcSizesPtrdataZeroLengthArray(t *testing.T) {
+	arr := types.NewArray(types.NewPointer(types.Typ[types.Int]), 0)
+	if got := testSizes64.ptrdata(arr); got != 0 {
+		t.Errorf("ptrdata([0]*int) = %d, want 0", got)
+	}
+}
+
+// TestGcSizesPtrdataArrayOfNonPointerElem verifies the elem-ptrdata==0
+// early-exit: even a long array of int contributes nothing.
+func TestGcSizesPtrdataArrayOfNonPointerElem(t *testing.T) {
+	arr := types.NewArray(types.Typ[types.Int], 1024)
+	if got := testSizes64.ptrdata(arr); got != 0 {
+		t.Errorf("ptrdata([1024]int) = %d, want 0", got)
+	}
+}
+
+// TestGcSizesPtrdataEmptyStruct verifies an empty struct has zero ptrdata.
+func TestGcSizesPtrdataEmptyStruct(t *testing.T) {
+	if got := testSizes64.ptrdata(types.NewStruct(nil, nil)); got != 0 {
+		t.Errorf("ptrdata(struct{}) = %d, want 0", got)
+	}
+}
+
+// TestGcSizesPtrdataStructNoPointers verifies a struct of non-pointer fields
+// has zero ptrdata regardless of size.
+func TestGcSizesPtrdataStructNoPointers(t *testing.T) {
+	strType := types.NewStruct([]*types.Var{
+		types.NewVar(token.NoPos, nil, "x", types.Typ[types.Int32]),
+		types.NewVar(token.NoPos, nil, "y", types.Typ[types.Uint64]),
+		types.NewVar(token.NoPos, nil, "z", types.Typ[types.Float64]),
+	}, nil)
+	if got := testSizes64.ptrdata(strType); got != 0 {
+		t.Errorf("ptrdata(struct{int32;uint64;float64}) = %d, want 0", got)
+	}
+}
+
+// TestGcSizesPtrdataMidStructPointer verifies a struct with a pointer in the
+// middle reports the pointer extent up to and including that pointer, never
+// past it: trailing non-pointer fields advance offset but must not shift p.
+func TestGcSizesPtrdataMidStructPointer(t *testing.T) {
+	strType := types.NewStruct([]*types.Var{
+		types.NewVar(token.NoPos, nil, "a", types.Typ[types.Uint64]),
+		types.NewVar(token.NoPos, nil, "p", types.NewPointer(types.Typ[types.Int])),
+		types.NewVar(token.NoPos, nil, "b", types.Typ[types.Uint64]),
+	}, nil)
+	if got := testSizes64.ptrdata(strType); got != 16 {
+		t.Errorf("ptrdata(struct{uint64;*int;uint64}) = %d, want 16", got)
+	}
+}
+
+// ─── Layer 16: gcSizes caches and newGCSizes ─────────────────────────────────
+
+// TestNewGCSizesInitializesCaches verifies the constructor allocates all
+// three memoisation maps. Callers that build a *gcSizes via newGCSizes rely
+// on the maps being non-nil; the cacheless struct literal path is exercised
+// by other tests in this file (testSizes64 is constructed that way).
+func TestNewGCSizesInitializesCaches(t *testing.T) {
+	sizes := newGCSizes(8, 8)
+	if sizes.sizeCache == nil {
+		t.Error("sizeCache is nil after newGCSizes")
+	}
+	if sizes.alignCache == nil {
+		t.Error("alignCache is nil after newGCSizes")
+	}
+	if sizes.ptrCache == nil {
+		t.Error("ptrCache is nil after newGCSizes")
+	}
+	if sizes.WordSize != 8 || sizes.MaxAlign != 8 {
+		t.Errorf("WordSize=%d MaxAlign=%d, want 8/8", sizes.WordSize, sizes.MaxAlign)
+	}
+}
+
+// TestGcSizesCachesPopulate verifies that Sizeof / Alignof / ptrdata each
+// populate their respective cache after a single call, and that successive
+// calls return identical values.
+func TestGcSizesCachesPopulate(t *testing.T) {
+	sizes := newGCSizes(8, 8)
+	str := types.NewStruct([]*types.Var{
+		types.NewVar(token.NoPos, nil, "p", types.NewPointer(types.Typ[types.Int])),
+	}, nil)
+
+	first := sizes.Sizeof(str)
+	if _, ok := sizes.sizeCache[str]; !ok {
+		t.Error("sizeCache not populated after Sizeof")
+	}
+	if second := sizes.Sizeof(str); second != first {
+		t.Errorf("Sizeof returned %d then %d for same type (cache must be stable)", first, second)
+	}
+
+	firstAlign := sizes.Alignof(str)
+	if _, ok := sizes.alignCache[str]; !ok {
+		t.Error("alignCache not populated after Alignof")
+	}
+	if second := sizes.Alignof(str); second != firstAlign {
+		t.Errorf("Alignof returned %d then %d for same type", firstAlign, second)
+	}
+
+	firstPtr := sizes.ptrdata(str)
+	if _, ok := sizes.ptrCache[str]; !ok {
+		t.Error("ptrCache not populated after ptrdata")
+	}
+	if second := sizes.ptrdata(str); second != firstPtr {
+		t.Errorf("ptrdata returned %d then %d for same type", firstPtr, second)
+	}
+}
+
+// TestGcSizesNilCachesAllowed verifies that a *gcSizes built with a struct
+// literal (no cache maps) still computes correctly. testSizes64, used by
+// every other test in this file, is constructed this way.
+func TestGcSizesNilCachesAllowed(t *testing.T) {
+	bare := &gcSizes{WordSize: 8, MaxAlign: 8}
+	if got := bare.Sizeof(types.Typ[types.Int32]); got != 4 {
+		t.Errorf("Sizeof on cacheless gcSizes = %d, want 4", got)
+	}
+	if got := bare.Alignof(types.Typ[types.Int32]); got != 4 {
+		t.Errorf("Alignof on cacheless gcSizes = %d, want 4", got)
+	}
+	if got := bare.ptrdata(types.NewPointer(types.Typ[types.Int])); got != 8 {
+		t.Errorf("ptrdata on cacheless gcSizes = %d, want 8", got)
+	}
+}
+
+// ─── Layer 17: lookupUnsafePointer ───────────────────────────────────────────
+
+// TestLookupUnsafePointer verifies the package-init helper finds the
+// canonical unsafe.Pointer type via the unsafe package scope. A nil return
+// would silently downgrade gcSizes to its 8/8 defaults at runtime (see the
+// guarded fall-back in run()), masking architecture-specific sizes.
+func TestLookupUnsafePointer(t *testing.T) {
+	got := lookupUnsafePointer()
+	if got == nil {
+		t.Fatal("lookupUnsafePointer returned nil")
+	}
+	basic, ok := got.Underlying().(*types.Basic)
+	if !ok {
+		t.Fatalf("underlying type = %T, want *types.Basic", got.Underlying())
+	}
+	if basic.Kind() != types.UnsafePointer {
+		t.Errorf("basic kind = %v, want UnsafePointer", basic.Kind())
+	}
+}
+
+// TestUnsafePointerTypInitialized verifies the package-level variable is
+// non-nil after init. If lookupUnsafePointer ever starts returning nil, the
+// 8/8 fall-back path in run() activates and architecture autodetection
+// breaks.
+func TestUnsafePointerTypInitialized(t *testing.T) {
+	if unsafePointerTyp == nil {
+		t.Error("unsafePointerTyp is nil; run() will use 8/8 defaults instead of pass.TypesSizes")
+	}
+}
+
+// ─── Layer 18: hasGeneratedComment edge cases ────────────────────────────────
+
+// TestHasGeneratedCommentEdgeCases extends TestHasGeneratedComment with the
+// rarer arrangements that the regex and position guard must still handle
+// correctly.
+func TestHasGeneratedCommentEdgeCases(t *testing.T) {
+	t.Run("file with no comments", func(t *testing.T) {
+		f := parseTestFile(t, "package foo\n")
+		if hasGeneratedComment(f) {
+			t.Error("file with no comments must not be detected as generated")
+		}
+	})
+
+	t.Run("block comment is not recognized as generated header", func(t *testing.T) {
+		f := parseTestFile(t, "/* Code generated by foo. DO NOT EDIT. */\npackage foo\n")
+		if hasGeneratedComment(f) {
+			t.Error("block comment must not be recognized as generated header")
+		}
+	})
+
+	t.Run("matching directive in second group before package", func(t *testing.T) {
+		src := "// License header line 1\n// License header line 2\n\n// Code generated by foo. DO NOT EDIT.\npackage foo\n"
+		f := parseTestFile(t, src)
+		if !hasGeneratedComment(f) {
+			t.Error("matching directive in any group before package must be detected")
+		}
+	})
+
+	t.Run("missing trailing period is rejected", func(t *testing.T) {
+		f := parseTestFile(t, "// Code generated by foo. DO NOT EDIT\npackage foo\n")
+		if hasGeneratedComment(f) {
+			t.Error("missing trailing period must not match the generated regex")
+		}
+	})
+
+	t.Run("no Code generated prefix is rejected", func(t *testing.T) {
+		f := parseTestFile(t, "// Generated by foo. DO NOT EDIT.\npackage foo\n")
+		if hasGeneratedComment(f) {
+			t.Error("comment lacking the 'Code generated' prefix must not match")
+		}
+	})
+}
+
+// ─── Layer 19: StringArrayFlag.String ────────────────────────────────────────
+
+// TestStringArrayFlagString verifies the flag.Value Stringer contract. The
+// flag package relies on a non-panicking String() for usage messages, so even
+// a zero-value receiver must produce a printable result.
+func TestStringArrayFlagString(t *testing.T) {
+	tests := []struct {
+		name string
+		f    StringArrayFlag
+		want string
+	}{
+		{"nil prints as empty slice", nil, "[]"},
+		{"empty prints as empty slice", StringArrayFlag{}, "[]"},
+		{"single entry", StringArrayFlag{"a"}, "[a]"},
+		{"multiple entries", StringArrayFlag{"a", "b", "c"}, "[a b c]"},
+		{"entries containing spaces", StringArrayFlag{"my path"}, "[my path]"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.f.String(); got != tc.want {
+				t.Errorf("String() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// ─── Layer 20: declaredWithOptInComment ──────────────────────────────────────
+
+// TestDeclaredWithOptInComment exercises the thin wrapper that reads the
+// opt-in directive from a *ast.GenDecl's Doc field. The wrapper is invoked
+// once per type-decl group; a nil Doc is the common case (most declarations
+// have no documentation comment).
+func TestDeclaredWithOptInComment(t *testing.T) {
+	t.Run("nil Doc returns false", func(t *testing.T) {
+		decl := &ast.GenDecl{}
+		if declaredWithOptInComment(decl) {
+			t.Error("decl with nil Doc must return false")
+		}
+	})
+
+	t.Run("Doc with directive returns true", func(t *testing.T) {
+		decl := &ast.GenDecl{Doc: makeCommentGroup("// betteralign:check")}
+		if !declaredWithOptInComment(decl) {
+			t.Error("decl with betteralign:check Doc must return true")
+		}
+	})
+
+	t.Run("Doc with directive plus trailing text returns true", func(t *testing.T) {
+		decl := &ast.GenDecl{Doc: makeCommentGroup("// betteralign:check reason here")}
+		if !declaredWithOptInComment(decl) {
+			t.Error("directive with trailing text must still trigger opt-in")
+		}
+	})
+
+	t.Run("Doc without directive returns false", func(t *testing.T) {
+		decl := &ast.GenDecl{Doc: makeCommentGroup("// unrelated comment")}
+		if declaredWithOptInComment(decl) {
+			t.Error("decl with unrelated Doc must return false")
+		}
+	})
+
+	t.Run("Doc with block comment is rejected", func(t *testing.T) {
+		decl := &ast.GenDecl{Doc: makeCommentGroup("/* betteralign:check */")}
+		if declaredWithOptInComment(decl) {
+			t.Error("block comment must not trigger opt-in")
+		}
+	})
+}
+
+// ─── Layer 21: optimalOrder stability and zero-pointer fast path ─────────────
+
+// TestOptimalOrderStable verifies that fields with identical sort keys preserve
+// their declaration order. The sort uses slices.SortStableFunc; a non-stable
+// replacement could silently swap equivalent fields and produce a different
+// (but still valid) fixup, surprising users who expect a deterministic rewrite.
+func TestOptimalOrderStable(t *testing.T) {
+	fields := []*types.Var{
+		types.NewVar(token.NoPos, nil, "a", types.Typ[types.Uint32]),
+		types.NewVar(token.NoPos, nil, "b", types.Typ[types.Uint32]),
+		types.NewVar(token.NoPos, nil, "c", types.Typ[types.Uint32]),
+	}
+	strType := types.NewStruct(fields, nil)
+	indexes, _, _ := optimalOrder(strType, testSizes64)
+	want := []int{0, 1, 2}
+	if len(indexes) != len(want) {
+		t.Fatalf("got %d indexes, want %d", len(indexes), len(want))
+	}
+	for i, v := range want {
+		if indexes[i] != v {
+			t.Errorf("indexes[%d] = %d, want %d (sort must be stable)", i, indexes[i], v)
+		}
+	}
+}
+
+// TestOptimalOrderNoPointers verifies that optPtrdata is zero for a struct
+// composed entirely of non-pointer fields, ensuring the "pointer bytes"
+// diagnostic is never emitted for a struct that the GC will skip entirely.
+func TestOptimalOrderNoPointers(t *testing.T) {
+	fields := []*types.Var{
+		types.NewVar(token.NoPos, nil, "x", types.Typ[types.Int32]),
+		types.NewVar(token.NoPos, nil, "y", types.Typ[types.Uint64]),
+	}
+	strType := types.NewStruct(fields, nil)
+	_, _, optPtrdata := optimalOrder(strType, testSizes64)
+	if optPtrdata != 0 {
+		t.Errorf("optPtrdata = %d, want 0 (no pointer fields)", optPtrdata)
+	}
+}
+
+// TestOptimalOrderEmptyStructFields verifies optSize and optPtrdata for a
+// struct made entirely of zero-sized fields: stable sort keeps the order
+// unchanged, offset never advances, and the trailing-bump rule does not fire.
+func TestOptimalOrderEmptyStructFields(t *testing.T) {
+	emptyStruct := types.NewStruct(nil, nil)
+	fields := []*types.Var{
+		types.NewVar(token.NoPos, nil, "a", emptyStruct),
+		types.NewVar(token.NoPos, nil, "b", emptyStruct),
+	}
+	strType := types.NewStruct(fields, nil)
+	indexes, optSize, optPtrdata := optimalOrder(strType, testSizes64)
+	if len(indexes) != 2 || indexes[0] != 0 || indexes[1] != 1 {
+		t.Errorf("indexes = %v, want [0 1] (stable for all-equal keys)", indexes)
+	}
+	if optSize != 0 {
+		t.Errorf("optSize = %d, want 0 (all fields zero-sized)", optSize)
+	}
+	if optPtrdata != 0 {
+		t.Errorf("optPtrdata = %d, want 0", optPtrdata)
+	}
+}
+
+// TestOptimalOrderSinglePointerField verifies the optPtrdata calculation for
+// a struct containing exactly one pointer-bearing field. The pointer extent
+// must equal the field's offset (0) plus its ptrdata (one word).
+func TestOptimalOrderSinglePointerField(t *testing.T) {
+	fields := []*types.Var{
+		types.NewVar(token.NoPos, nil, "p", types.NewPointer(types.Typ[types.Int])),
+	}
+	strType := types.NewStruct(fields, nil)
+	indexes, optSize, optPtrdata := optimalOrder(strType, testSizes64)
+	if len(indexes) != 1 || indexes[0] != 0 {
+		t.Errorf("indexes = %v, want [0]", indexes)
+	}
+	if optSize != 8 {
+		t.Errorf("optSize = %d, want 8", optSize)
+	}
+	if optPtrdata != 8 {
+		t.Errorf("optPtrdata = %d, want 8", optPtrdata)
+	}
+}
