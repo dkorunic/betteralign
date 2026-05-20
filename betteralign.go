@@ -31,6 +31,7 @@ package betteralign
 
 import (
 	"bytes"
+	"cmp"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -38,7 +39,7 @@ import (
 	"go/types"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/google/renameio/v2/maybe"
@@ -84,6 +85,12 @@ gopls. Use this standalone command to run it on your code:
    $ go install github.com/dkorunic/betteralign/cmd/betteralign@latest
    $ betteralign [packages]
 
+Only named struct types declared with the ` + "`type T struct { ... }`" + ` form
+are analyzed. Anonymous structs (nested struct-typed fields, struct literals,
+` + "`var x struct{...}`" + ` declarations, and similar unnamed forms) are
+skipped. To enable analysis of one of those, lift it into a named type
+declaration.
+
 `
 
 const (
@@ -118,7 +125,13 @@ func (f *StringArrayFlag) String() string {
 }
 
 func (f *StringArrayFlag) Set(value string) error {
-	*f = append(*f, strings.Split(value, ",")...)
+	for v := range strings.SplitSeq(value, ",") {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			continue
+		}
+		*f = append(*f, v)
+	}
 	return nil
 }
 
@@ -157,96 +170,75 @@ func ResetFlags() {
 }
 
 func run(pass *analysis.Pass) (any, error) {
-	// snapshot flag into a local variable to avoid a data race when run() is invoked concurrently for multiple packages
-	// by the analysis
+	// Snapshot package-level flags so concurrent passes see a consistent view.
 	apply := fApply
 	if a := pass.Analyzer.Flags.Lookup("fix"); a != nil && a.Value.String() == "true" {
 		apply = true
 	}
+	testFiles := fTestFiles
+	generatedFiles := fGeneratedFiles
+	optInMode := fOptInMode
+	excludeDirs := fExcludeDirs
+	excludeFiles := fExcludeFiles
 
 	inspect := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 	dec := decorator.NewDecorator(pass.Fset)
-	nodeFilter := []ast.Node{
-		(*ast.File)(nil),
-		(*ast.StructType)(nil),
-		(*ast.GenDecl)(nil),
-	}
-
-	// map from each *ast.StructType position to its name and opt-in status, populated when the enclosing *ast.GenDecl
-	// is visited
-	type structMeta struct {
-		name    string
-		optedIn bool
-	}
-
-	var dFile *dst.File
 
 	dirtyFiles := make(map[string]*dst.File)
-	testFset := make(map[string]bool)
-	generatedFset := make(map[string]bool)
-	structMetaMap := make(map[token.Pos]structMeta)
+	decoratedFiles := make(map[string]*dst.File)
+	decorationFailed := make(map[string]struct{})
+	// Populated from *ast.GenDecl visits, consulted from *ast.StructType visits.
+	structOptIn := make(map[token.Pos]bool)
 
 	var wd string
-	if len(fExcludeDirs) > 0 || len(fExcludeFiles) > 0 {
+	if len(excludeDirs) > 0 || len(excludeFiles) > 0 {
 		var err error
 		wd, err = os.Getwd()
 		if err != nil {
-			return nil, fmt.Errorf("%v: %w", ErrPreFilterFiles, err)
+			return nil, fmt.Errorf("%w: %w", ErrPreFilterFiles, err)
 		}
 	}
 
+	// Fall back to 64-bit defaults if the unsafe.Pointer lookup ever fails.
+	var wordSize, maxAlign int64 = 8, 8
+	if unsafePointerTyp != nil {
+		wordSize = pass.TypesSizes.Sizeof(unsafePointerTyp)
+		maxAlign = pass.TypesSizes.Alignof(unsafePointerTyp)
+	}
+	sizes := newGCSizes(wordSize, maxAlign)
+
+	// Per-file state set on *ast.File visit; reused by child node visits.
+	var (
+		currentFn      string
+		currentASTFile *ast.File
+		currentSkip    bool
+	)
+
 	inspect.Preorder(nodeFilter, func(node ast.Node) {
-		fn := pass.Fset.File(node.Pos()).Name()
-
-		if !fTestFiles && hasSuffixes(testFset, fn, testSuffixes) {
-			return
-		}
-
-		if !fGeneratedFiles && hasSuffixes(generatedFset, fn, generatedSuffixes) {
-			return
-		}
-
-		if len(fExcludeDirs) > 0 || len(fExcludeFiles) > 0 {
-			relfn, err := filepath.Rel(wd, fn)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "%v %s: %v", ErrPreFilterFiles, fn, err)
-				return
-			}
-			dir := filepath.Dir(relfn)
-			for _, excludeDir := range fExcludeDirs {
-				rel, err := filepath.Rel(excludeDir, dir)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "%v %s: %v", ErrPreFilterFiles, fn, err)
-					return
-				}
-				if !strings.HasPrefix(rel, "..") {
-					return
-				}
-			}
-			for _, excludeFile := range fExcludeFiles {
-				match, err := filepath.Match(excludeFile, relfn)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "%v %s: %v", ErrPreFilterFiles, fn, err)
-					return
-				}
-				if match {
-					return
-				}
-			}
-		}
-
 		if f, ok := node.(*ast.File); ok {
-			var decErr error
-			dFile, decErr = dec.DecorateFile(f)
-			if decErr != nil {
-				fmt.Fprintf(os.Stderr, "failed to decorate %s: %v\n", fn, decErr)
-				dFile = nil
-			}
+			currentFn = pass.Fset.File(f.Pos()).Name()
+			currentASTFile = f
+			currentSkip = false
 
-			if !fGeneratedFiles && hasGeneratedComment(generatedFset, fn, f) {
+			if !testFiles && hasSuffix(currentFn, testSuffixes) {
+				currentSkip = true
 				return
 			}
+			if !generatedFiles && hasSuffix(currentFn, generatedSuffixes) {
+				currentSkip = true
+				return
+			}
+			if wd != "" && isExcluded(wd, currentFn, excludeDirs, excludeFiles) {
+				currentSkip = true
+				return
+			}
+			if !generatedFiles && hasGeneratedComment(f) {
+				currentSkip = true
+			}
+			return
+		}
 
+		if currentSkip {
 			return
 		}
 
@@ -259,10 +251,7 @@ func run(pass *analysis.Pass) (any, error) {
 						continue
 					}
 					if st, ok := ts.Type.(*ast.StructType); ok {
-						structMetaMap[st.Pos()] = structMeta{
-							name:    ts.Name.Name,
-							optedIn: groupOptedIn || commentGroupHasOptIn(ts.Doc),
-						}
+						structOptIn[st.Pos()] = groupOptedIn || commentGroupHasOptIn(ts.Doc)
 					}
 				}
 			}
@@ -275,32 +264,119 @@ func run(pass *analysis.Pass) (any, error) {
 			return
 		}
 
-		// Only process structs that are named type declarations.
-		meta, found := structMetaMap[s.Pos()]
+		// Only named type declarations carry an opt-in entry.
+		optedIn, found := structOptIn[s.Pos()]
 		if !found {
 			return
 		}
 
-		// if in opt-in mode, ignore structs that lack the opt-in comment magic substring
-		if fOptInMode && !meta.optedIn {
+		// In opt-in mode, skip structs lacking the opt-in directive.
+		if optInMode && !optedIn {
 			return
 		}
 
-		// skip if decoration of this file failed.
-		if dFile == nil {
+		tv, ok := pass.TypesInfo.Types[s]
+		if !ok {
+			return
+		}
+		typ, ok := tv.Type.(*types.Struct)
+		if !ok {
 			return
 		}
 
-		if tv, ok := pass.TypesInfo.Types[s]; ok {
-			betteralign(pass, s, tv.Type.(*types.Struct), dec, dFile, dirtyFiles, fn)
+		// Compute optimality without DST; clean files pay no decoration cost.
+		indexes, optsz, optptrs := optimalOrder(typ, sizes)
+		var message string
+		if sz := sizes.Sizeof(typ); sz != optsz {
+			message = fmt.Sprintf("%d bytes saved: struct of size %d could be %d", sz-optsz, sz, optsz)
+		} else if ptrs := sizes.ptrdata(typ); ptrs != optptrs {
+			message = fmt.Sprintf("%d bytes saved: struct with %d pointer bytes could be %d", ptrs-optptrs, ptrs, optptrs)
+		} else {
+			return
 		}
+
+		// Decorate this file once; never retry on failure.
+		if _, failed := decorationFailed[currentFn]; failed {
+			return
+		}
+		dFile, ok := decoratedFiles[currentFn]
+		if !ok {
+			df, err := dec.DecorateFile(currentASTFile)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to decorate %s: %v\n", currentFn, err)
+				decorationFailed[currentFn] = struct{}{}
+				return
+			}
+			decoratedFiles[currentFn] = df
+			dFile = df
+		}
+
+		dNode, ok := dec.Dst.Nodes[s].(*dst.StructType)
+		if !ok {
+			return
+		}
+
+		// Skip if // betteralign:ignore appears inside the struct body.
+		if hasIgnoreComment(dNode.Fields) {
+			return
+		}
+
+		pass.Report(analysis.Diagnostic{
+			Pos:            s.Pos(),
+			End:            s.Pos() + token.Pos(len("struct")),
+			Message:        message,
+			SuggestedFixes: nil,
+		})
+
+		// Skip DST mutation when only emitting diagnostics.
+		if !apply {
+			return
+		}
+
+		// Flatten multi-name fields (A, B int) into one slot per name.
+		// TODO: preserve multi-named fields instead of flattening.
+		flat := make([]*dst.Field, 0, len(indexes))
+		for _, fld := range dNode.Fields.List {
+			flat = append(flat, fld)
+			if len(fld.Names) == 0 {
+				continue
+			}
+			for range fld.Names[1:] {
+				flat = append(flat, dummyField)
+			}
+		}
+
+		reordered := make([]*dst.Field, 0, len(dNode.Fields.List))
+		for _, idx := range indexes {
+			fld := flat[idx]
+			if fld == dummyField {
+				continue
+			}
+			reordered = append(reordered, fld)
+		}
+		dNode.Fields.List = reordered
+		dirtyFiles[currentFn] = dFile
 	})
 
 	if apply {
-		for fn, df := range dirtyFiles {
-			var buf bytes.Buffer
+		// Sort so partial-failure ordering is reproducible across runs.
+		fns := make([]string, 0, len(dirtyFiles))
+		for fn := range dirtyFiles {
+			fns = append(fns, fn)
+		}
+		slices.Sort(fns)
+		// Reuse buffer across writes to amortize the backing byte slice.
+		var buf bytes.Buffer
+		for _, fn := range fns {
+			buf.Reset()
+			df := dirtyFiles[fn]
 			if err := decorator.Fprint(&buf, df); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to print %s: %v\n", fn, err)
+				continue
+			}
+			// Refuse to blank the user's source on a degenerate Fprint result.
+			if buf.Len() == 0 {
+				fmt.Fprintf(os.Stderr, "refusing to write empty buffer to %s\n", fn)
 				continue
 			}
 			if err := applyToFile(fn, buf.Bytes()); err != nil {
@@ -312,81 +388,53 @@ func run(pass *analysis.Pass) (any, error) {
 	return nil, nil
 }
 
-var unsafePointerTyp = types.Unsafe.Scope().Lookup("Pointer").(*types.TypeName).Type()
+// unsafePointerTyp is the canonical types.Type for unsafe.Pointer, used to
+// derive the architecture's word size and pointer alignment from
+// pass.TypesSizes. The lookup is wrapped to avoid a panic at package init in
+// the unlikely event that the standard library's unsafe package shape ever
+// changes — gcSizes still works with reasonable defaults of 8 bytes if so.
+var unsafePointerTyp = lookupUnsafePointer()
 
-func betteralign(pass *analysis.Pass, aNode *ast.StructType, typ *types.Struct, dec *decorator.Decorator,
-	dFile *dst.File, dirtyFiles map[string]*dst.File, fn string,
-) {
-	dNode := dec.Dst.Nodes[aNode].(*dst.StructType)
-
-	// Skip if explicitly ignored with magic comment substring.
-	if hasIgnoreComment(dNode.Fields) {
-		return
-	}
-
-	wordSize := pass.TypesSizes.Sizeof(unsafePointerTyp)
-	maxAlign := pass.TypesSizes.Alignof(unsafePointerTyp)
-
-	s := gcSizes{wordSize, maxAlign}
-	optimal, indexes := optimalOrder(typ, &s)
-	optsz, optptrs := s.Sizeof(optimal), s.ptrdata(optimal)
-
-	var message string
-	if sz := s.Sizeof(typ); sz != optsz {
-		message = fmt.Sprintf("%d bytes saved: struct of size %d could be %d", sz-optsz, sz, optsz)
-	} else if ptrs := s.ptrdata(typ); ptrs != optptrs {
-		message = fmt.Sprintf("%d bytes saved: struct with %d pointer bytes could be %d", ptrs-optptrs, ptrs, optptrs)
-	} else {
-		// Already optimal order.
-		return
-	}
-
-	// Flatten the ast node since it could have multiple field names per list item while
-	// *types.Struct only have one item per field.
-	// TODO: Preserve multi-named fields instead of flattening.
-	flat := make([]*dst.Field, 0, len(indexes))
-	dummy := &dst.Field{}
-	for _, f := range dNode.Fields.List {
-		flat = append(flat, f)
-		if len(f.Names) == 0 {
-			continue
-		}
-
-		for range f.Names[1:] {
-			flat = append(flat, dummy)
-		}
-	}
-
-	// Sort fields according to the optimal order.
-	reordered := make([]*dst.Field, 0, len(indexes))
-	for _, index := range indexes {
-		f := flat[index]
-		if f == dummy {
-			continue
-		}
-		reordered = append(reordered, f)
-	}
-
-	dNode.Fields.List = reordered
-
-	pass.Report(analysis.Diagnostic{
-		Pos:            aNode.Pos(),
-		End:            aNode.Pos() + token.Pos(len("struct")),
-		Message:        message,
-		SuggestedFixes: nil,
-	})
-
-	dirtyFiles[fn] = dFile
+// nodeFilter is the constant set of AST nodes the visitor cares about; declared
+// once at package level so each pass shares the same slice instead of
+// allocating a fresh one.
+var nodeFilter = []ast.Node{
+	(*ast.File)(nil),
+	(*ast.StructType)(nil),
+	(*ast.GenDecl)(nil),
 }
 
-func optimalOrder(str *types.Struct, sizes *gcSizes) (*types.Struct, []int) {
+// dummyField is a placeholder used by the apply-mode flatten/reorder logic to
+// keep flat positions aligned with optimalOrder indexes when a single dst.Field
+// declares multiple names (e.g. `A, B int`). Pointer equality with this
+// sentinel identifies skip-positions during the reorder pass. Reusing a single
+// package-level value avoids per-struct allocation.
+var dummyField = &dst.Field{}
+
+func lookupUnsafePointer() types.Type {
+	obj := types.Unsafe.Scope().Lookup("Pointer")
+	if obj == nil {
+		return nil
+	}
+	tn, ok := obj.(*types.TypeName)
+	if !ok {
+		return nil
+	}
+	return tn.Type()
+}
+
+// optimalOrder returns the optimal field permutation as a list of original
+// indexes, along with the size and ptrdata of the struct laid out in that
+// order. Computing size and ptrdata directly from the sorted elements avoids
+// rebuilding a *types.Struct just to call Sizeof / ptrdata on it.
+func optimalOrder(str *types.Struct, sizes *gcSizes) (indexes []int, optSize, optPtrdata int64) {
 	nf := str.NumFields()
 
 	type elem struct {
-		index   int
 		alignof int64
 		sizeof  int64
 		ptrdata int64
+		index   int
 	}
 
 	elems := make([]elem, nf)
@@ -394,87 +442,110 @@ func optimalOrder(str *types.Struct, sizes *gcSizes) (*types.Struct, []int) {
 		field := str.Field(i)
 		ft := field.Type()
 		elems[i] = elem{
-			i,
-			sizes.Alignof(ft),
-			sizes.Sizeof(ft),
-			sizes.ptrdata(ft),
+			alignof: sizes.Alignof(ft),
+			sizeof:  sizes.Sizeof(ft),
+			ptrdata: sizes.ptrdata(ft),
+			index:   i,
 		}
 	}
 
-	sort.SliceStable(elems, func(i, j int) bool {
-		ei := &elems[i]
-		ej := &elems[j]
-
-		// Place zero sized objects before non-zero sized objects.
-		zeroi := ei.sizeof == 0
-		zeroj := ej.sizeof == 0
-		if zeroi != zeroj {
-			return zeroi
+	slices.SortStableFunc(elems, func(a, b elem) int {
+		// Zero-sized fields before non-zero-sized.
+		if (a.sizeof == 0) != (b.sizeof == 0) {
+			if a.sizeof == 0 {
+				return -1
+			}
+			return 1
 		}
-
-		// Next, place more tightly aligned objects before less tightly aligned objects.
-		if ei.alignof != ej.alignof {
-			return ei.alignof > ej.alignof
+		// Higher alignment first.
+		if c := cmp.Compare(b.alignof, a.alignof); c != 0 {
+			return c
 		}
-
-		// Place pointerful objects before pointer-free objects.
-		noptrsi := ei.ptrdata == 0
-		noptrsj := ej.ptrdata == 0
-		if noptrsi != noptrsj {
-			return noptrsj
+		// Pointerful fields before pointer-free.
+		if (a.ptrdata == 0) != (b.ptrdata == 0) {
+			if a.ptrdata != 0 {
+				return -1
+			}
+			return 1
 		}
-
-		if !noptrsi {
-			// If both have pointers...
-
-			// ... then place objects with less trailing
-			// non-pointer bytes earlier. That is, place
-			// the field with the most trailing
-			// non-pointer bytes at the end of the
-			// pointerful section.
-			traili := ei.sizeof - ei.ptrdata
-			trailj := ej.sizeof - ej.ptrdata
-			if traili != trailj {
-				return traili < trailj
+		// Among pointerful fields, fewer trailing non-pointer bytes first.
+		if a.ptrdata != 0 {
+			if c := cmp.Compare(a.sizeof-a.ptrdata, b.sizeof-b.ptrdata); c != 0 {
+				return c
 			}
 		}
-
-		// Lastly, order by size.
-		if ei.sizeof != ej.sizeof {
-			return ei.sizeof > ej.sizeof
-		}
-
-		return false
+		// Larger size first (final tiebreaker).
+		return cmp.Compare(b.sizeof, a.sizeof)
 	})
 
-	fields := make([]*types.Var, nf)
-	indexes := make([]int, nf)
+	indexes = make([]int, nf)
+	var offset int64
+	maxAlign := int64(1)
 	for i, e := range elems {
-		fields[i] = str.Field(e.index)
 		indexes[i] = e.index
+		if e.alignof > maxAlign {
+			maxAlign = e.alignof
+		}
+		offset = align(offset, e.alignof)
+		if e.ptrdata != 0 {
+			optPtrdata = offset + e.ptrdata
+		}
+		sz := e.sizeof
+		// Trailing zero-size field on a non-empty struct gets one padding byte.
+		if i == nf-1 && sz == 0 && offset != 0 {
+			sz = 1
+		}
+		offset += sz
 	}
-	return types.NewStruct(fields, nil), indexes
+	optSize = align(offset, maxAlign)
+	return indexes, optSize, optPtrdata
 }
 
 // Code below based on go/types.StdSizes.
 
+// gcSizes computes sizes, alignments and ptrdata in the same way as the Go
+// runtime's garbage collector. The three cache maps memoise per-type results
+// within a single analysis pass — they avoid recomputing the layout of types
+// that recur across many fields (a major cost in protobuf-style generated
+// code where the same sub-message type appears repeatedly). The caches are
+// lazy-initialised so callers can still construct a *gcSizes with a struct
+// literal in tests.
 type gcSizes struct {
-	WordSize int64
-	MaxAlign int64
+	sizeCache  map[types.Type]int64
+	alignCache map[types.Type]int64
+	ptrCache   map[types.Type]int64
+	WordSize   int64
+	MaxAlign   int64
+}
+
+func newGCSizes(wordSize, maxAlign int64) *gcSizes {
+	return &gcSizes{
+		WordSize:   wordSize,
+		MaxAlign:   maxAlign,
+		sizeCache:  make(map[types.Type]int64),
+		alignCache: make(map[types.Type]int64),
+		ptrCache:   make(map[types.Type]int64),
+	}
 }
 
 func (s *gcSizes) Alignof(T types.Type) int64 {
-	// For arrays and structs, alignment is defined in terms
-	// of alignment of the elements and fields, respectively.
+	if v, ok := s.alignCache[T]; ok {
+		return v
+	}
+	v := s.alignofUncached(T)
+	if s.alignCache != nil {
+		s.alignCache[T] = v
+	}
+	return v
+}
+
+func (s *gcSizes) alignofUncached(T types.Type) int64 {
 	switch t := T.Underlying().(type) {
 	case *types.Array:
-		// spec: "For a variable x of array type: unsafe.Alignof(x)
-		// is the same as unsafe.Alignof(x[0]), but at least 1."
+		// spec: Alignof(array) == Alignof(element), ≥ 1.
 		return s.Alignof(t.Elem())
 	case *types.Struct:
-		// spec: "For a variable x of struct type: unsafe.Alignof(x)
-		// is the largest of the values unsafe.Alignof(x.f) for each
-		// field f of x, but at least 1."
+		// spec: Alignof(struct) == max(Alignof(fields)), ≥ 1.
 		max := int64(1)
 		for i, nf := 0, t.NumFields(); i < nf; i++ {
 			if a := s.Alignof(t.Field(i).Type()); a > max {
@@ -484,7 +555,7 @@ func (s *gcSizes) Alignof(T types.Type) int64 {
 		return max
 	}
 	a := s.Sizeof(T) // may be 0
-	// spec: "For a variable x of any type: unsafe.Alignof(x) is at least 1."
+	// spec: Alignof(any) ≥ 1.
 	if a < 1 {
 		return 1
 	}
@@ -511,6 +582,17 @@ var basicSizes = [...]byte{
 }
 
 func (s *gcSizes) Sizeof(T types.Type) int64 {
+	if v, ok := s.sizeCache[T]; ok {
+		return v
+	}
+	v := s.sizeofUncached(T)
+	if s.sizeCache != nil {
+		s.sizeCache[T] = v
+	}
+	return v
+}
+
+func (s *gcSizes) sizeofUncached(T types.Type) int64 {
 	switch t := T.Underlying().(type) {
 	case *types.Basic:
 		k := t.Kind()
@@ -559,6 +641,17 @@ func align(x, a int64) int64 {
 }
 
 func (s *gcSizes) ptrdata(T types.Type) int64 {
+	if v, ok := s.ptrCache[T]; ok {
+		return v
+	}
+	v := s.ptrdataUncached(T)
+	if s.ptrCache != nil {
+		s.ptrCache[T] = v
+	}
+	return v
+}
+
+func (s *gcSizes) ptrdataUncached(T types.Type) int64 {
 	switch t := T.Underlying().(type) {
 	case *types.Basic:
 		switch t.Kind() {
@@ -604,44 +697,69 @@ func (s *gcSizes) ptrdata(T types.Type) int64 {
 	panic("impossible")
 }
 
-func hasSuffixes(fset map[string]bool, fn string, suffixes []string) bool {
-	if t, ok := fset[fn]; ok {
-		return t
-	} else {
-		for _, s := range suffixes {
-			if strings.HasSuffix(fn, s) {
-				fset[fn] = true
-
-				return true
-			}
+// hasSuffix reports whether fn ends with any of the given suffixes.
+func hasSuffix(fn string, suffixes []string) bool {
+	for _, s := range suffixes {
+		if strings.HasSuffix(fn, s) {
+			return true
 		}
 	}
-
-	fset[fn] = false
-
 	return false
 }
 
-func hasGeneratedComment(generatedFset map[string]bool, fn string, file *ast.File) bool {
+// hasGeneratedComment reports whether file carries a "Code generated ... DO NOT
+// EDIT." comment before its package keyword.
+func hasGeneratedComment(file *ast.File) bool {
 	for _, cg := range file.Comments {
 		if cg.Pos() > file.Package {
 			return false
 		}
-
 		for _, l := range cg.List {
 			if reGeneratedBy(l.Text) {
-				generatedFset[fn] = true
 				return true
 			}
 		}
 	}
+	return false
+}
 
+// isExcluded reports whether fn is excluded by the given excludeDirs or
+// excludeFiles patterns relative to wd. Errors interpreting paths are logged
+// to stderr and the file is treated as excluded so the analyzer does not
+// silently emit diagnostics it cannot ground.
+func isExcluded(wd, fn string, excludeDirs, excludeFiles []string) bool {
+	relfn, err := filepath.Rel(wd, fn)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v %s: %v\n", ErrPreFilterFiles, fn, err)
+		return true
+	}
+	dir := filepath.Dir(relfn)
+	for _, excludeDir := range excludeDirs {
+		rel, err := filepath.Rel(excludeDir, dir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v %s: %v\n", ErrPreFilterFiles, fn, err)
+			return true
+		}
+		if !strings.HasPrefix(rel, "..") {
+			return true
+		}
+	}
+	for _, excludeFile := range excludeFiles {
+		match, err := filepath.Match(excludeFile, relfn)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v %s: %v\n", ErrPreFilterFiles, fn, err)
+			return true
+		}
+		if match {
+			return true
+		}
+	}
 	return false
 }
 
 func hasIgnoreComment(node *dst.FieldList) bool {
 	for _, opening := range node.Decs.Opening.All() {
-		if strings.HasPrefix(opening, "//") && strings.Contains(opening, ignoreStruct) {
+		if commentHasDirective(opening, ignoreStruct) {
 			return true
 		}
 	}
@@ -654,11 +772,33 @@ func commentGroupHasOptIn(cg *ast.CommentGroup) bool {
 		return false
 	}
 	for _, dc := range cg.List {
-		if strings.Contains(dc.Text, optInStruct) {
+		if commentHasDirective(dc.Text, optInStruct) {
 			return true
 		}
 	}
 	return false
+}
+
+// commentHasDirective reports whether comment is a "//"-style line comment
+// whose body contains directive as a whitespace-delimited token. Block
+// comments and bare strings are rejected; substring matches (e.g.
+// "betteralign:ignored" matching "betteralign:ignore") are rejected by the
+// trailing word-boundary check.
+func commentHasDirective(comment, directive string) bool {
+	body, ok := strings.CutPrefix(comment, "//")
+	if !ok {
+		return false
+	}
+	body = strings.TrimLeft(body, " \t")
+	rest, ok := strings.CutPrefix(body, directive)
+	if !ok {
+		return false
+	}
+	if rest == "" {
+		return true
+	}
+	c := rest[0]
+	return c == ' ' || c == '\t'
 }
 
 func declaredWithOptInComment(decl *ast.GenDecl) bool {
@@ -668,15 +808,15 @@ func declaredWithOptInComment(decl *ast.GenDecl) bool {
 func applyToFile(fn string, buf []byte) error {
 	st, err := os.Stat(fn)
 	if err != nil {
-		return fmt.Errorf("%v: %w", ErrStatFile, err)
+		return fmt.Errorf("%w: %w", ErrStatFile, err)
 	}
 
 	if !st.Mode().IsRegular() {
-		return fmt.Errorf("%v", ErrNotRegularFile)
+		return ErrNotRegularFile
 	}
 
 	if err := maybe.WriteFile(fn, buf, st.Mode()); err != nil {
-		return fmt.Errorf("%v: %w", ErrWriteFile, err)
+		return fmt.Errorf("%w: %w", ErrWriteFile, err)
 	}
 
 	return nil

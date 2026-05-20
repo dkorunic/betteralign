@@ -16,15 +16,20 @@ import (
 func removeOtherArches(paths []string) []string {
 	var filtered []string
 	arches := map[string]struct{}{
-		"386":     {},
-		"amd64":   {},
-		"arm":     {},
-		"arm64":   {},
-		"ppc64":   {},
-		"ppc64le": {},
-		"riscv64": {},
-		"s390x":   {},
-		"wasm":    {},
+		"386":      {},
+		"amd64":    {},
+		"arm":      {},
+		"arm64":    {},
+		"loong64":  {},
+		"mips":     {},
+		"mipsle":   {},
+		"mips64":   {},
+		"mips64le": {},
+		"ppc64":    {},
+		"ppc64le":  {},
+		"riscv64":  {},
+		"s390x":    {},
+		"wasm":     {},
 	}
 
 	delete(arches, runtime.GOARCH)
@@ -111,7 +116,7 @@ func TestApply(t *testing.T) {
 	testdata := analysistest.TestData()
 
 	analyzer := NewTestAnalyzer()
-	analyzer.Flags.Set("apply", "true")
+	_ = analyzer.Flags.Set("apply", "true")
 
 	analysistest.Run(t, testdata, analyzer, filepath.Join(filepath.Base(tmpDir), "a"))
 
@@ -133,23 +138,23 @@ func TestFlagExcludeDirs(t *testing.T) {
 	t.Run("exclude none", func(t *testing.T) {
 		testdata := analysistest.TestData()
 		analyzer := NewTestAnalyzer()
-		analyzer.Flags.Set("apply", "false")
+		_ = analyzer.Flags.Set("apply", "false")
 		analysistest.Run(t, testdata, analyzer, "exclude/none/...")
 	})
 
 	t.Run("exclude all", func(t *testing.T) {
 		testdata := analysistest.TestData()
 		analyzer := NewTestAnalyzer()
-		analyzer.Flags.Set("apply", "false")
-		analyzer.Flags.Set("exclude_dirs", "testdata/src/exclude/all/")
+		_ = analyzer.Flags.Set("apply", "false")
+		_ = analyzer.Flags.Set("exclude_dirs", "testdata/src/exclude/all/")
 		analysistest.Run(t, testdata, analyzer, "exclude/all/...")
 	})
 
 	t.Run("exclude a", func(t *testing.T) {
 		testdata := analysistest.TestData()
 		analyzer := NewTestAnalyzer()
-		analyzer.Flags.Set("apply", "false")
-		analyzer.Flags.Set("exclude_dirs", "testdata/src/exclude/a/a")
+		_ = analyzer.Flags.Set("apply", "false")
+		_ = analyzer.Flags.Set("exclude_dirs", "testdata/src/exclude/a/a")
 		analysistest.Run(t, testdata, analyzer, "exclude/a/...")
 	})
 }
@@ -158,8 +163,8 @@ func TestFlagExcludeFiles(t *testing.T) {
 	t.Run("exclude b", func(t *testing.T) {
 		testdata := analysistest.TestData()
 		analyzer := NewTestAnalyzer()
-		analyzer.Flags.Set("apply", "false")
-		analyzer.Flags.Set("exclude_files", "testdata/src/exclude/b/b/*.go")
+		_ = analyzer.Flags.Set("apply", "false")
+		_ = analyzer.Flags.Set("exclude_files", "testdata/src/exclude/b/b/*.go")
 		analysistest.Run(t, testdata, analyzer, "exclude/b/...")
 	})
 }
@@ -168,16 +173,16 @@ func TestFlagOptInMode(t *testing.T) {
 	t.Run("opt-in enabled, one bad struct opted in and another bad struct not opted in", func(t *testing.T) {
 		testdata := analysistest.TestData()
 		analyzer := NewTestAnalyzer()
-		analyzer.Flags.Set("apply", "false")
-		analyzer.Flags.Set("opt_in", "true")
+		_ = analyzer.Flags.Set("apply", "false")
+		_ = analyzer.Flags.Set("opt_in", "true")
 		analysistest.Run(t, testdata, analyzer, "optin/...")
 	})
 
 	t.Run("per-spec opt-in comment inside a grouped type declaration", func(t *testing.T) {
 		testdata := analysistest.TestData()
 		analyzer := NewTestAnalyzer()
-		analyzer.Flags.Set("apply", "false")
-		analyzer.Flags.Set("opt_in", "true")
+		_ = analyzer.Flags.Set("apply", "false")
+		_ = analyzer.Flags.Set("opt_in", "true")
 		analysistest.Run(t, testdata, analyzer, "optin/grouped")
 	})
 }
@@ -192,7 +197,7 @@ func TestFlagTestFiles(t *testing.T) {
 	t.Run("test files included with flag", func(t *testing.T) {
 		testdata := analysistest.TestData()
 		analyzer := NewTestAnalyzer()
-		analyzer.Flags.Set("test_files", "true")
+		_ = analyzer.Flags.Set("test_files", "true")
 		analysistest.Run(t, testdata, analyzer, "testfiles/b")
 	})
 }
@@ -207,7 +212,7 @@ func TestFlagGeneratedFiles(t *testing.T) {
 	t.Run("generated files included with flag", func(t *testing.T) {
 		testdata := analysistest.TestData()
 		analyzer := NewTestAnalyzer()
-		analyzer.Flags.Set("generated_files", "true")
+		_ = analyzer.Flags.Set("generated_files", "true")
 		analysistest.Run(t, testdata, analyzer, "generated/b")
 	})
 }

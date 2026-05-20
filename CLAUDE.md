@@ -48,7 +48,7 @@ Linting uses `golangci-lint run --timeout 5m` with config in `.golangci.yml` (v2
 
 1. The `inspect.Analyzer` traverses the AST; `betteralign` hooks into `Preorder` on `*ast.File`, `*ast.GenDecl`, and `*ast.StructType` nodes.
 2. For each file, a DST decorator (`decorator.NewDecorator`) is created to produce a parallel DST tree that preserves comment decorations.
-3. Each struct is checked: if field order is not optimal, `pass.Report` emits a diagnostic and the reordered DST is serialized to a buffer (keyed by filename in `applyFixesFset`).
+3. Each struct is checked: if field order is not optimal, `pass.Report` emits a diagnostic and the reordered DST is serialized to a buffer (keyed by filename in `dirtyFiles`).
 4. After the pass, if `-apply` is set, each buffer is atomically written to disk via `github.com/google/renameio/v2/maybe` (atomic on POSIX, best-effort on Windows).
 
 ### Why DST instead of SuggestedFixes

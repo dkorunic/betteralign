@@ -32,11 +32,12 @@ func main() {
 	undo, _ := maxprocs.Set()
 	defer undo()
 
-	args := os.Args[1:]
-
-	// check for version flags
-	for _, arg := range args {
-		if arg == "-V" || arg == "--version" {
+	// Intercept version flags before singlechecker; stop at first non-flag arg.
+	for _, arg := range os.Args[1:] {
+		if arg == "--" || len(arg) == 0 || arg[0] != '-' {
+			break
+		}
+		if arg == "-V" || arg == "-version" || arg == "--version" {
 			fmt.Println(getVersionString())
 			os.Exit(0)
 		}

@@ -1,14 +1,15 @@
 package betteralign
 
-// Unit tests for unexported functions: align, gcSizes (Alignof/Sizeof/ptrdata),
-// optimalOrder, hasSuffixes, hasGeneratedComment, and hasIgnoreComment.
-// Each test is labelled with the BUG-xx it is designed to catch.
+// Unit tests for unexported helpers. BUG-xx cases pin specific historical mutants.
 
 import (
+	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"go/types"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/sirkon/dst"
@@ -243,7 +244,7 @@ func TestOptimalOrderZeroSizedFirst(t *testing.T) {
 		types.NewVar(token.NoPos, nil, "z", emptyStruct),
 	}
 	strType := types.NewStruct(fields, nil)
-	_, indexes := optimalOrder(strType, testSizes64)
+	indexes, _, _ := optimalOrder(strType, testSizes64)
 
 	if len(indexes) != 2 {
 		t.Fatalf("expected 2 indexes, got %d", len(indexes))
@@ -264,7 +265,7 @@ func TestOptimalOrderHighAlignmentFirst(t *testing.T) {
 		types.NewVar(token.NoPos, nil, "u", types.Typ[types.Uint64]),
 	}
 	strType := types.NewStruct(fields, nil)
-	_, indexes := optimalOrder(strType, testSizes64)
+	indexes, _, _ := optimalOrder(strType, testSizes64)
 
 	if len(indexes) != 2 {
 		t.Fatalf("expected 2 indexes, got %d", len(indexes))
@@ -287,7 +288,7 @@ func TestOptimalOrderPointerBearingFirst(t *testing.T) {
 		types.NewVar(token.NoPos, nil, "p", ptrInt),
 	}
 	strType := types.NewStruct(fields, nil)
-	_, indexes := optimalOrder(strType, testSizes64)
+	indexes, _, _ := optimalOrder(strType, testSizes64)
 
 	if len(indexes) != 2 {
 		t.Fatalf("expected 2 indexes, got %d", len(indexes))
@@ -311,7 +312,7 @@ func TestOptimalOrderFewerTrailingFirst(t *testing.T) {
 		types.NewVar(token.NoPos, nil, "p", ptrInt),
 	}
 	strType := types.NewStruct(fields, nil)
-	_, indexes := optimalOrder(strType, testSizes64)
+	indexes, _, _ := optimalOrder(strType, testSizes64)
 
 	if len(indexes) != 2 {
 		t.Fatalf("expected 2 indexes, got %d", len(indexes))
@@ -335,7 +336,7 @@ func TestOptimalOrderLargerSizeFirst(t *testing.T) {
 		types.NewVar(token.NoPos, nil, "a", arr2u32),
 	}
 	strType := types.NewStruct(fields, nil)
-	_, indexes := optimalOrder(strType, testSizes64)
+	indexes, _, _ := optimalOrder(strType, testSizes64)
 
 	if len(indexes) != 2 {
 		t.Fatalf("expected 2 indexes, got %d", len(indexes))
@@ -346,70 +347,35 @@ func TestOptimalOrderLargerSizeFirst(t *testing.T) {
 	}
 }
 
-// ─── Layer 7: hasSuffixes (BUG-21, BUG-22) ────────────────────────────────────
+// ─── Layer 6: hasSuffix ──────────────────────────────────────────────────────
 
-// TestHasSuffixesCacheConsistency verifies that repeated calls with the same
-// filename return the same result, i.e. the cache is not inverted.
-// BUG-21: returning !t from the cache hit branch inverts results after the first call.
-func TestHasSuffixesCacheConsistency(t *testing.T) {
-	suffixes := []string{"_test.go"}
-
-	t.Run("matching file stays true on repeated calls", func(t *testing.T) {
-		fset := make(map[string]bool)
-		if !hasSuffixes(fset, "foo_test.go", suffixes) {
-			t.Error("first call: expected true for _test.go file")
-		}
-		// BUG-21 would return false on the second call.
-		if !hasSuffixes(fset, "foo_test.go", suffixes) {
-			t.Error("second call: cache inversion detected (BUG-21)")
-		}
-		// A third call should also be consistent.
-		if !hasSuffixes(fset, "foo_test.go", suffixes) {
-			t.Error("third call: cache inversion detected (BUG-21)")
-		}
-	})
-
-	t.Run("non-matching file stays false on repeated calls", func(t *testing.T) {
-		fset := make(map[string]bool)
-		if hasSuffixes(fset, "foo.go", suffixes) {
-			t.Error("first call: expected false for regular .go file")
-		}
-		// BUG-21 would return true on the second call.
-		if hasSuffixes(fset, "foo.go", suffixes) {
-			t.Error("second call: cache inversion detected (BUG-21)")
-		}
-	})
-}
-
-// TestHasSuffixesNonMatchingCachedFalse verifies that non-matching files are
-// cached as false, not as true.
-// BUG-22: unconditionally writing fset[fn] = true before the loop caches every
-// file as matching, making subsequent calls wrongly return true.
-func TestHasSuffixesNonMatchingCachedFalse(t *testing.T) {
-	suffixes := []string{"_test.go"}
-	fset := make(map[string]bool)
-
-	// First call: non-matching file must return false.
-	if hasSuffixes(fset, "regular.go", suffixes) {
-		t.Error("expected false for non-matching file")
+// TestHasSuffix verifies the suffix matcher used to skip test or generated
+// files by filename. The previous cached variant (hasSuffixes) was retired in
+// favour of a single per-file call from the visitor.
+func TestHasSuffix(t *testing.T) {
+	suffixes := []string{"_test.go", "_generated.go", ".pb.go"}
+	tests := []struct {
+		name string
+		fn   string
+		want bool
+	}{
+		{"matches _test.go", "foo_test.go", true},
+		{"matches .pb.go", "rpc.pb.go", true},
+		{"matches _generated.go", "schema_generated.go", true},
+		{"no match plain .go", "foo.go", false},
+		{"no match different suffix", "foo_tests.go", false},
+		{"empty filename", "", false},
 	}
-
-	// The cache entry for the file must be false (BUG-22 caches it as true).
-	cached, ok := fset["regular.go"]
-	if !ok {
-		t.Error("file should be cached after the first call")
-	}
-	if cached {
-		t.Error("non-matching file was cached as true (BUG-22)")
-	}
-
-	// Second call using the cache must also return false.
-	if hasSuffixes(fset, "regular.go", suffixes) {
-		t.Error("second call: cached non-matching file returned true (BUG-22)")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hasSuffix(tc.fn, suffixes); got != tc.want {
+				t.Errorf("hasSuffix(%q) = %v, want %v", tc.fn, got, tc.want)
+			}
+		})
 	}
 }
 
-// ─── Layer 7: hasGeneratedComment (BUG-23) ────────────────────────────────────
+// ─── Layer 7: hasGeneratedComment (BUG-23) ───────────────────────────────────
 
 // parseTestFile is a helper that parses src as Go source and returns the *ast.File.
 func parseTestFile(t *testing.T, src string) *ast.File {
@@ -431,14 +397,14 @@ func TestHasGeneratedComment(t *testing.T) {
 		// The canonical "DO NOT EDIT" header must be recognised.
 		// BUG-23 would return false because the guard would fire immediately.
 		f := parseTestFile(t, "// Code generated by foo. DO NOT EDIT.\npackage foo\n")
-		if !hasGeneratedComment(make(map[string]bool), "test.go", f) {
+		if !hasGeneratedComment(f) {
 			t.Error("generated comment before package keyword not detected (BUG-23)")
 		}
 	})
 
 	t.Run("no generated comment returns false", func(t *testing.T) {
 		f := parseTestFile(t, "// Regular comment.\npackage foo\n")
-		if hasGeneratedComment(make(map[string]bool), "test.go", f) {
+		if hasGeneratedComment(f) {
 			t.Error("non-generated comment should not be detected")
 		}
 	})
@@ -447,22 +413,13 @@ func TestHasGeneratedComment(t *testing.T) {
 		// Comments that appear after the package keyword are not headers and
 		// must be ignored.
 		f := parseTestFile(t, "package foo\n// Code generated by foo. DO NOT EDIT.\n")
-		if hasGeneratedComment(make(map[string]bool), "test.go", f) {
+		if hasGeneratedComment(f) {
 			t.Error("generated comment after package keyword should not be detected")
-		}
-	})
-
-	t.Run("positive detection populates the cache map", func(t *testing.T) {
-		f := parseTestFile(t, "// Code generated by foo. DO NOT EDIT.\npackage foo\n")
-		fset := make(map[string]bool)
-		hasGeneratedComment(fset, "test.go", f)
-		if !fset["test.go"] {
-			t.Error("generated file should be cached in fset after detection")
 		}
 	})
 }
 
-// ─── Layer 7/8: hasIgnoreComment (BUG-24, BUG-25) ────────────────────────────
+// ─── Layer 8: hasIgnoreComment (BUG-24, BUG-25) ──────────────────────────────
 
 // TestHasIgnoreCommentOpening verifies that the betteralign:ignore directive is
 // read from the Opening decoration of the field list, not from other positions.
@@ -550,4 +507,408 @@ func TestHasIgnoreCommentPrefixGuard(t *testing.T) {
 			t.Error("partial directive match should not trigger ignore")
 		}
 	})
+}
+
+// ─── Layer 9: optimalOrder direct size/ptrdata (P5) ──────────────────────────
+
+// TestOptimalOrderSizeAndPtrdata verifies that the size and ptrdata returned
+// directly by optimalOrder match gcSizes.Sizeof / gcSizes.ptrdata computed on
+// the same fields re-built in optimal order. The direct computation must
+// produce identical numbers to the indirect path for every input.
+func TestOptimalOrderSizeAndPtrdata(t *testing.T) {
+	ptrInt := types.NewPointer(types.Typ[types.Int])
+	arr2u32 := types.NewArray(types.Typ[types.Uint32], 2)
+	emptyStruct := types.NewStruct(nil, nil)
+	cases := []struct {
+		name   string
+		fields []*types.Var
+	}{
+		{"bool_then_uint64", []*types.Var{
+			types.NewVar(token.NoPos, nil, "b", types.Typ[types.Bool]),
+			types.NewVar(token.NoPos, nil, "u", types.Typ[types.Uint64]),
+		}},
+		{"three_mixed", []*types.Var{
+			types.NewVar(token.NoPos, nil, "x", types.Typ[types.Bool]),
+			types.NewVar(token.NoPos, nil, "y", types.Typ[types.Int32]),
+			types.NewVar(token.NoPos, nil, "z", types.Typ[types.Uint64]),
+		}},
+		{"string_then_pointer", []*types.Var{
+			types.NewVar(token.NoPos, nil, "s", types.Typ[types.String]),
+			types.NewVar(token.NoPos, nil, "p", ptrInt),
+		}},
+		{"zero_sized_field_present", []*types.Var{
+			types.NewVar(token.NoPos, nil, "x", types.Typ[types.Int32]),
+			types.NewVar(token.NoPos, nil, "z", emptyStruct),
+		}},
+		{"equal_align_size_tiebreak", []*types.Var{
+			types.NewVar(token.NoPos, nil, "u", types.Typ[types.Uint32]),
+			types.NewVar(token.NoPos, nil, "a", arr2u32),
+		}},
+		{"single_field", []*types.Var{
+			types.NewVar(token.NoPos, nil, "u", types.Typ[types.Uint64]),
+		}},
+		{"empty_struct", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			str := types.NewStruct(tc.fields, nil)
+			indexes, optSize, optPtrdata := optimalOrder(str, testSizes64)
+			if len(indexes) != len(tc.fields) {
+				t.Fatalf("indexes len = %d, want %d", len(indexes), len(tc.fields))
+			}
+			ordered := make([]*types.Var, len(indexes))
+			for i, idx := range indexes {
+				ordered[i] = str.Field(idx)
+			}
+			optStruct := types.NewStruct(ordered, nil)
+			if got := testSizes64.Sizeof(optStruct); got != optSize {
+				t.Errorf("size mismatch: optimalOrder=%d, Sizeof(optimalStruct)=%d", optSize, got)
+			}
+			if got := testSizes64.ptrdata(optStruct); got != optPtrdata {
+				t.Errorf("ptrdata mismatch: optimalOrder=%d, ptrdata(optimalStruct)=%d", optPtrdata, got)
+			}
+		})
+	}
+}
+
+// ─── Layer 10: applyToFile (BUG-28) ──────────────────────────────────────────
+
+// TestApplyToFileSuccess writes content to a pre-existing file and verifies
+// the file contents and mode are preserved as expected. The error paths are
+// covered by TestApplyToFileSentinelsAreWrapped below.
+func TestApplyToFileSuccess(t *testing.T) {
+	dir := t.TempDir()
+	fn := filepath.Join(dir, "target.go")
+	const initialContent = "package x\nvar X = 1\n"
+	const newContent = "package x\nvar X = 2\n"
+	// Use a non-default mode so we can verify it survives the write.
+	const wantMode os.FileMode = 0o640
+
+	if err := os.WriteFile(fn, []byte(initialContent), wantMode); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+
+	if err := applyToFile(fn, []byte(newContent)); err != nil {
+		t.Fatalf("applyToFile: %v", err)
+	}
+
+	got, err := os.ReadFile(fn)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if string(got) != newContent {
+		t.Errorf("file content mismatch:\n got=%q\nwant=%q", got, newContent)
+	}
+
+	info, err := os.Stat(fn)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Mode().Perm() != wantMode.Perm() {
+		t.Errorf("file mode after write = %o, want %o", info.Mode().Perm(), wantMode.Perm())
+	}
+}
+
+// TestApplyToFileSentinelsAreWrapped verifies that errors returned by
+// applyToFile chain to their sentinel via errors.Is.
+// BUG-28: formatting sentinels with %v instead of %w makes errors.Is checks
+// silently return false, breaking the public error API.
+func TestApplyToFileSentinelsAreWrapped(t *testing.T) {
+	t.Run("non-existent file wraps ErrStatFile", func(t *testing.T) {
+		err := applyToFile(filepath.Join(t.TempDir(), "does-not-exist.go"), []byte("package x\n"))
+		if err == nil {
+			t.Fatal("expected error for missing file, got nil")
+		}
+		if !errors.Is(err, ErrStatFile) {
+			t.Errorf("errors.Is(err, ErrStatFile) = false; err = %v (BUG-28)", err)
+		}
+	})
+
+	t.Run("directory wraps ErrNotRegularFile", func(t *testing.T) {
+		dir := t.TempDir()
+		err := applyToFile(dir, []byte("package x\n"))
+		if err == nil {
+			t.Fatal("expected error for directory path, got nil")
+		}
+		if !errors.Is(err, ErrNotRegularFile) {
+			t.Errorf("errors.Is(err, ErrNotRegularFile) = false; err = %v (BUG-28)", err)
+		}
+	})
+}
+
+// ─── Layer 11: StringArrayFlag.Set (BUG-26) ──────────────────────────────────
+
+// TestStringArrayFlagSetEmptyValues verifies that StringArrayFlag.Set never
+// appends empty strings.
+// BUG-26: strings.Split(value, ",") yields a single empty entry for "" and
+// adjacent empty entries for "a,", ",a", and "a,,b". An empty entry in
+// fExcludeDirs makes filepath.Rel(".", dir) succeed for every file, silently
+// excluding the entire tree from analysis.
+func TestStringArrayFlagSetEmptyValues(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  []string
+	}{
+		{"empty string yields no entries", "", nil},
+		{"single non-empty value", "a", []string{"a"}},
+		{"trailing comma drops empty tail", "a,", []string{"a"}},
+		{"leading comma drops empty head", ",a", []string{"a"}},
+		{"adjacent commas drop empty middle", "a,,b", []string{"a", "b"}},
+		{"only commas yields no entries", ",,", nil},
+		{"surrounding whitespace trimmed", " a , b ", []string{"a", "b"}},
+		{"tab whitespace trimmed", "\ta\t,\tb\t", []string{"a", "b"}},
+		{"whitespace-only entries dropped", " , a , ", []string{"a"}},
+		{"internal whitespace preserved", "my path,other path", []string{"my path", "other path"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var f StringArrayFlag
+			if err := f.Set(tc.input); err != nil {
+				t.Fatalf("Set(%q) returned error: %v", tc.input, err)
+			}
+			if len(f) != len(tc.want) {
+				t.Fatalf("Set(%q): got %d entries %v, want %d entries %v",
+					tc.input, len(f), []string(f), len(tc.want), tc.want)
+			}
+			for i := range f {
+				if f[i] != tc.want[i] {
+					t.Errorf("Set(%q)[%d] = %q, want %q", tc.input, i, f[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+// ─── Layer 12: commentGroupHasOptIn / isExcluded / commentHasDirective ───────
+
+// makeCommentGroup builds an *ast.CommentGroup from comment text strings.
+// Each string must include its // or /* */ markers.
+func makeCommentGroup(texts ...string) *ast.CommentGroup {
+	cg := &ast.CommentGroup{}
+	for _, t := range texts {
+		cg.List = append(cg.List, &ast.Comment{Text: t})
+	}
+	return cg
+}
+
+// TestCommentGroupHasOptInPrefix verifies that only line comments with the
+// betteralign:check directive as a separate token (word boundary) trigger
+// opt-in. Block comments, substring matches, and missing // prefix must not.
+// BUG-27: substring matching (strings.Contains) without a // prefix guard and
+// without a word-boundary check accepts block comments and partial directives,
+// inconsistent with hasIgnoreComment.
+func TestCommentGroupHasOptInPrefix(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+		want bool
+	}{
+		{"nil group", "", false},
+		{"line comment with directive", "// betteralign:check", true},
+		{"line comment with directive and trailing text", "// betteralign:check explanation", true},
+		{"line comment with directive and tab separator", "// betteralign:check\texplanation", true},
+		{"line comment with extra spaces before directive", "//   betteralign:check", true},
+		{"block comment is rejected", "/* betteralign:check */", false},
+		{"bare string without // prefix is rejected", "betteralign:check", false},
+		{"substring suffix is rejected (checked)", "// betteralign:checked", false},
+		{"substring prefix is rejected", "// xbetteralign:check", false},
+		{"unrelated comment", "// some other comment", false},
+		{"empty line comment", "//", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var cg *ast.CommentGroup
+			if tc.text != "" || tc.name == "empty line comment" {
+				cg = makeCommentGroup(tc.text)
+			}
+			got := commentGroupHasOptIn(cg)
+			if got != tc.want {
+				t.Errorf("commentGroupHasOptIn(%q) = %v, want %v", tc.text, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestHasIgnoreCommentPrefix verifies that hasIgnoreComment also enforces the
+// word-boundary rule. The pre-fix code matched "// betteralign:ignored" as a
+// substring of betteralign:ignore.
+func TestHasIgnoreCommentPrefix(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+		want bool
+	}{
+		{"directive matches", "// betteralign:ignore", true},
+		{"directive with trailing text matches", "// betteralign:ignore reason", true},
+		{"directive with trailing tab matches", "// betteralign:ignore\treason", true},
+		{"longer-token suffix is rejected", "// betteralign:ignored", false},
+		{"longer-token prefix is rejected", "// xbetteralign:ignore", false},
+		{"block comment rejected", "/* betteralign:ignore */", false},
+		{"bare string rejected", "betteralign:ignore", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fl := &dst.FieldList{}
+			fl.Decs.Opening = dst.Decorations{tc.text}
+			got := hasIgnoreComment(fl)
+			if got != tc.want {
+				t.Errorf("hasIgnoreComment(%q) = %v, want %v", tc.text, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestIsExcluded directly exercises the exclude_dirs / exclude_files matcher
+// without spinning up analysistest. Integration tests cover the wiring; these
+// pin down per-pattern semantics.
+func TestIsExcluded(t *testing.T) {
+	wd := filepath.Join(string(filepath.Separator), "proj")
+	tests := []struct {
+		name  string
+		fn    string
+		dirs  []string
+		files []string
+		want  bool
+	}{
+		{
+			name: "no patterns is not excluded",
+			fn:   filepath.Join(wd, "foo.go"),
+			want: false,
+		},
+		{
+			name: "file in excluded dir is excluded",
+			fn:   filepath.Join(wd, "sub", "foo.go"),
+			dirs: []string{"sub"},
+			want: true,
+		},
+		{
+			name: "file outside excluded dir is not excluded",
+			fn:   filepath.Join(wd, "other", "foo.go"),
+			dirs: []string{"sub"},
+			want: false,
+		},
+		{
+			name: "trailing slash on excludeDir still matches",
+			fn:   filepath.Join(wd, "sub", "foo.go"),
+			dirs: []string{"sub" + string(filepath.Separator)},
+			want: true,
+		},
+		{
+			name: "nested file under excluded dir is excluded",
+			fn:   filepath.Join(wd, "sub", "deep", "foo.go"),
+			dirs: []string{"sub"},
+			want: true,
+		},
+		{
+			name:  "file matching glob pattern is excluded",
+			fn:    filepath.Join(wd, "foo.go"),
+			files: []string{"*.go"},
+			want:  true,
+		},
+		{
+			name:  "file not matching glob is not excluded",
+			fn:    filepath.Join(wd, "foo.go"),
+			files: []string{"*.txt"},
+			want:  false,
+		},
+		{
+			name:  "qualified path glob matches",
+			fn:    filepath.Join(wd, "sub", "foo.go"),
+			files: []string{filepath.Join("sub", "*.go")},
+			want:  true,
+		},
+		{
+			name:  "any matching pattern wins (dir match)",
+			fn:    filepath.Join(wd, "sub", "foo.go"),
+			dirs:  []string{"other", "sub"},
+			files: []string{"*.txt"},
+			want:  true,
+		},
+		{
+			name:  "any matching pattern wins (file match)",
+			fn:    filepath.Join(wd, "foo.go"),
+			dirs:  []string{"sub"},
+			files: []string{"*.txt", "*.go"},
+			want:  true,
+		},
+		{
+			name:  "bad glob pattern is treated as excluded",
+			fn:    filepath.Join(wd, "foo.go"),
+			files: []string{"[unclosed"},
+			want:  true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := isExcluded(wd, tc.fn, tc.dirs, tc.files)
+			if got != tc.want {
+				t.Errorf("isExcluded(%q, %q) with dirs=%v files=%v = %v, want %v",
+					wd, tc.fn, tc.dirs, tc.files, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCommentHasDirective exercises the shared //-comment / word-boundary
+// matcher directly. hasIgnoreComment and commentGroupHasOptIn both delegate to
+// it; this table makes the contract explicit rather than relying on indirect
+// coverage through the two callers.
+func TestCommentHasDirective(t *testing.T) {
+	const directive = "betteralign:check"
+	tests := []struct {
+		name      string
+		comment   string
+		directive string
+		want      bool
+	}{
+		{"bare directive", "// betteralign:check", directive, true},
+		{"directive then space then text", "// betteralign:check reason", directive, true},
+		{"directive then tab then text", "// betteralign:check\treason", directive, true},
+		{"leading spaces preserved", "//   betteralign:check", directive, true},
+		{"no space after //", "//betteralign:check", directive, true},
+		{"block comment rejected", "/* betteralign:check */", directive, false},
+		{"missing // prefix", "betteralign:check", directive, false},
+		{"directive followed by colon (no boundary)", "// betteralign:check:extra", directive, false},
+		{"directive as substring suffix (checked)", "// betteralign:checked", directive, false},
+		{"directive as substring prefix", "// xbetteralign:check", directive, false},
+		{"unrelated comment", "// hello world", directive, false},
+		{"empty body", "//", directive, false},
+		{"empty input", "", directive, false},
+		{"different directive does not match", "// betteralign:ignore", directive, false},
+		{"matches ignore directive", "// betteralign:ignore", "betteralign:ignore", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := commentHasDirective(tc.comment, tc.directive)
+			if got != tc.want {
+				t.Errorf("commentHasDirective(%q, %q) = %v, want %v", tc.comment, tc.directive, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestStringArrayFlagSetAccumulates verifies that successive Set calls append.
+// Both forms (repeated flag use and comma-separated values) must accumulate
+// without inserting empty entries.
+func TestStringArrayFlagSetAccumulates(t *testing.T) {
+	var f StringArrayFlag
+	if err := f.Set("a,b"); err != nil {
+		t.Fatalf("first Set returned error: %v", err)
+	}
+	if err := f.Set("c"); err != nil {
+		t.Fatalf("second Set returned error: %v", err)
+	}
+	if err := f.Set(""); err != nil {
+		t.Fatalf("third Set returned error: %v", err)
+	}
+	want := []string{"a", "b", "c"}
+	if len(f) != len(want) {
+		t.Fatalf("got %v, want %v", []string(f), want)
+	}
+	for i := range f {
+		if f[i] != want[i] {
+			t.Errorf("[%d] = %q, want %q", i, f[i], want[i])
+		}
+	}
 }
