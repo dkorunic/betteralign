@@ -118,12 +118,20 @@ var (
 	ErrPreFilterFiles = errors.New("failed to pre-filter files")
 )
 
+// StringArrayFlag is a flag.Value that accumulates comma-separated string
+// arguments across one or more occurrences of the same flag. It backs the
+// -exclude_dirs and -exclude_files options.
 type StringArrayFlag []string
 
+// String returns the accumulated values rendered with the default Go
+// formatter, satisfying the flag.Value interface.
 func (f *StringArrayFlag) String() string {
 	return fmt.Sprintf("%v", *f)
 }
 
+// Set splits value on commas, trims surrounding whitespace from each entry,
+// and appends every non-empty result to the flag. Empty entries (e.g. from a
+// stray trailing comma) are dropped silently.
 func (f *StringArrayFlag) Set(value string) error {
 	for v := range strings.SplitSeq(value, ",") {
 		v = strings.TrimSpace(v)
@@ -142,6 +150,11 @@ var Analyzer = &analysis.Analyzer{
 	Run:      run,
 }
 
+// InitAnalyzer registers betteralign's command-line flags on analyzer. It is
+// invoked from init for the package-level Analyzer and is also exposed so
+// external drivers (custom checkers, tests constructing a fresh
+// *analysis.Analyzer via NewTestAnalyzer) can wire up the same flag set
+// without going through singlechecker.Main.
 func InitAnalyzer(analyzer *analysis.Analyzer) {
 	analyzer.Flags.BoolVar(&fApply, "apply", false, "apply suggested fixes")
 	analyzer.Flags.BoolVar(&fTestFiles, "test_files", false, "also check and fix test files")
@@ -169,6 +182,15 @@ func ResetFlags() {
 	fExcludeDirs = nil
 }
 
+// run is the analyzer's entry point invoked by the go/analysis framework. It
+// hooks into the *inspector.Inspector built by inspect.Analyzer, visiting
+// *ast.File, *ast.GenDecl and *ast.StructType nodes in source order. For
+// every named struct type whose fields are not laid out optimally it emits a
+// diagnostic; when -apply (or its -fix alias) is set, the decorated DST of
+// each affected file is reprinted and atomically written back to disk.
+// SuggestedFixes are deliberately left empty because DST cannot serialise a
+// single node without losing its comment attachments (see the file-level
+// package documentation for the full rationale).
 func run(pass *analysis.Pass) (any, error) {
 	// Snapshot package-level flags so concurrent passes see a consistent view.
 	apply := fApply
@@ -411,6 +433,10 @@ var nodeFilter = []ast.Node{
 // package-level value avoids per-struct allocation.
 var dummyField = &dst.Field{}
 
+// lookupUnsafePointer returns the canonical types.Type for unsafe.Pointer, or
+// nil if the standard library's unsafe package no longer exposes Pointer as a
+// type name. The result is cached at package init in unsafePointerTyp; run
+// falls back to architecture-default sizes (8 bytes) when this returns nil.
 func lookupUnsafePointer() types.Type {
 	obj := types.Unsafe.Scope().Lookup("Pointer")
 	if obj == nil {
@@ -518,6 +544,11 @@ type gcSizes struct {
 	MaxAlign   int64
 }
 
+// newGCSizes returns a *gcSizes seeded with the target architecture's word
+// size and maximum alignment, with empty memoisation caches ready for use.
+// Tests may also construct a *gcSizes via a struct literal; in that case the
+// caches are nil and the Alignof/Sizeof/ptrdata helpers degrade gracefully to
+// uncached computation.
 func newGCSizes(wordSize, maxAlign int64) *gcSizes {
 	return &gcSizes{
 		WordSize:   wordSize,
@@ -528,6 +559,9 @@ func newGCSizes(wordSize, maxAlign int64) *gcSizes {
 	}
 }
 
+// Alignof returns T's alignment in bytes as the Go GC observes it. Results
+// are memoised in alignCache so recurring sub-types (common in generated
+// protobuf code) are paid for once per pass.
 func (s *gcSizes) Alignof(T types.Type) int64 {
 	if v, ok := s.alignCache[T]; ok {
 		return v
@@ -539,6 +573,10 @@ func (s *gcSizes) Alignof(T types.Type) int64 {
 	return v
 }
 
+// alignofUncached computes T's alignment from its underlying type without
+// consulting the cache. Arrays defer to their element alignment, structs to
+// the max of their fields, and any other type to its size clamped to
+// [1, MaxAlign].
 func (s *gcSizes) alignofUncached(T types.Type) int64 {
 	switch t := T.Underlying().(type) {
 	case *types.Array:
@@ -581,6 +619,10 @@ var basicSizes = [...]byte{
 	types.Complex128: 16,
 }
 
+// Sizeof returns T's size in bytes as the Go GC observes it (including
+// internal padding but not the trailing-zero-field padding rule, which is
+// applied by the enclosing struct's layout). Results are memoised in
+// sizeCache.
 func (s *gcSizes) Sizeof(T types.Type) int64 {
 	if v, ok := s.sizeCache[T]; ok {
 		return v
@@ -592,6 +634,12 @@ func (s *gcSizes) Sizeof(T types.Type) int64 {
 	return v
 }
 
+// sizeofUncached computes T's size from its underlying type without
+// consulting the cache. Basic kinds come from basicSizes, strings and
+// interfaces from word-size multiples, slices from 3*WordSize, and structs
+// from a field-by-field walk that respects per-field alignment plus a single
+// padding byte after a trailing zero-sized field on a non-empty struct (a
+// runtime quirk that prevents zero-size values aliasing the next allocation).
 func (s *gcSizes) sizeofUncached(T types.Type) int64 {
 	switch t := T.Underlying().(type) {
 	case *types.Basic:
@@ -640,6 +688,10 @@ func align(x, a int64) int64 {
 	return y - y%a
 }
 
+// ptrdata returns the number of bytes at the head of T that the GC must scan
+// for pointers. A return of 0 means the type is pointer-free; otherwise it is
+// the offset just past the last pointer-bearing word. Results are memoised
+// in ptrCache.
 func (s *gcSizes) ptrdata(T types.Type) int64 {
 	if v, ok := s.ptrCache[T]; ok {
 		return v
@@ -651,6 +703,11 @@ func (s *gcSizes) ptrdata(T types.Type) int64 {
 	return v
 }
 
+// ptrdataUncached computes T's ptrdata from its underlying type without
+// consulting the cache. Arrays propagate their element's pointer span,
+// structs track the offset of the last pointer-bearing field, and basic
+// types return either a word (string, unsafe.Pointer) or zero. Panics on
+// types the analyser does not expect to encounter at this layer.
 func (s *gcSizes) ptrdataUncached(T types.Type) int64 {
 	switch t := T.Underlying().(type) {
 	case *types.Basic:
@@ -757,6 +814,11 @@ func isExcluded(wd, fn string, excludeDirs, excludeFiles []string) bool {
 	return false
 }
 
+// hasIgnoreComment reports whether the struct body's opening-brace
+// decorations include a // betteralign:ignore line directive. It scans every
+// comment attached to the opening brace because DST groups consecutive
+// comments together; the directive only counts if it appears as a recognised
+// "//"-style line comment (see commentHasDirective).
 func hasIgnoreComment(node *dst.FieldList) bool {
 	for _, opening := range node.Decs.Opening.All() {
 		if commentHasDirective(opening, ignoreStruct) {
@@ -767,6 +829,9 @@ func hasIgnoreComment(node *dst.FieldList) bool {
 	return false
 }
 
+// commentGroupHasOptIn reports whether cg carries a // betteralign:check line
+// directive. A nil cg is treated as having no comments and returns false, so
+// callers can pass an *ast.CommentGroup that may be missing.
 func commentGroupHasOptIn(cg *ast.CommentGroup) bool {
 	if cg == nil {
 		return false
@@ -801,10 +866,20 @@ func commentHasDirective(comment, directive string) bool {
 	return c == ' ' || c == '\t'
 }
 
+// declaredWithOptInComment reports whether decl's own doc comment carries a
+// // betteralign:check directive. This handles the `type ( ... )` block form,
+// where a directive attached to the GenDecl applies to every TypeSpec inside
+// the parenthesised group rather than to any individual spec.
 func declaredWithOptInComment(decl *ast.GenDecl) bool {
 	return commentGroupHasOptIn(decl.Doc)
 }
 
+// applyToFile atomically writes buf to fn while preserving the original
+// file's permission bits. Non-regular targets (symlinks, devices, named
+// pipes) are rejected with ErrNotRegularFile so the analyzer cannot silently
+// follow a symlink and clobber an unintended file. Stat and write failures
+// are wrapped with ErrStatFile and ErrWriteFile respectively so callers can
+// classify them via errors.Is.
 func applyToFile(fn string, buf []byte) error {
 	st, err := os.Stat(fn)
 	if err != nil {
