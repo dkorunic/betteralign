@@ -17,6 +17,7 @@ It is a fork of the official Go [fieldalignment](https://cs.opensource.google/go
 - skips structs annotated with `// betteralign:ignore` placed inside the struct body,
 - supports opt-in mode, where only structs annotated with `// betteralign:check` on the type declaration are checked,
 - analyzes only named struct types declared with `type T struct { ... }`; anonymous structs (nested struct-typed fields, struct literals, `var x struct{...}` declarations) are skipped,
+- detects positional composite literals (`T{1, 2, 3}` rather than `T{a: 1, b: 2, c: 3}`) anywhere in the package and reports the would-be saving without rewriting the struct — reordering its fields would silently re-map the literal's elements at the next build,
 - preserves comments (field comments, doc comments, and floating comments) — though comment position heuristics remain a work in progress,
 - performs atomic file writes to prevent corruption or data loss on rewrite ([not on Windows](https://github.com/golang/go/issues/22397#issuecomment-498856679)),
 - includes more thorough tests comparing expected versus golden output,
@@ -118,6 +119,14 @@ are analyzed. Anonymous structs (nested struct-typed fields, struct literals,
 skipped. To enable analysis of one of those, lift it into a named type
 declaration.
 
+If a struct is constructed somewhere in the package with a positional
+composite literal (`T{1, 2, 3}` rather than `T{a: 1, b: 2, c: 3}`),
+the reorder is reported but never applied: rewriting the field order would
+re-map the literal's elements to different fields, breaking the build (or
+worse, silently mis-assigning values when the new field types still happen
+to accept the old element types). Convert the literal to keyed form and
+rerun to enable the reorder.
+
 
 
 Flags:
@@ -176,6 +185,8 @@ betteralign -apply ./...
 ```
 
 Generated and test files can be included with the `-generated_files` and `-test_files` flags respectively. Use `-exclude_dirs` and `-exclude_files` to skip specific paths. Use `-opt_in` to check only structs explicitly annotated with `// betteralign:check`.
+
+Structs constructed via positional composite literals are reported but never rewritten under `-apply`; the diagnostic points at the offending literal so it can be converted to keyed form (`T{Field: value}`), after which a rerun will enable the reorder.
 
 ## Star history
 

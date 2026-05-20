@@ -230,3 +230,18 @@ func TestAnonymousStructsSkipped(t *testing.T) {
 	analyzer := NewTestAnalyzer()
 	analysistest.Run(t, testdata, analyzer, "anonymous")
 }
+
+// TestPositionalLiteralSuppressesReorder pins the safety contract that a
+// named struct constructed via a positional composite literal anywhere in
+// the package must not be silently reordered: the analyzer reports the
+// would-be saving but appends a "reorder skipped" notice pointing at the
+// offending literal so the user can convert it to a keyed form. Structs
+// only used through keyed literals (or the zero-element `T{}` form) keep
+// the original diagnostic verbatim. Covers plain literals, elided literals
+// nested in slice composites, the address-of pattern (`&T{...}`), and a
+// `type S T` chain whose positional usage transitively pins the parent.
+func TestPositionalLiteralSuppressesReorder(t *testing.T) {
+	testdata := analysistest.TestData()
+	analyzer := NewTestAnalyzer()
+	analysistest.Run(t, testdata, analyzer, "positional")
+}

@@ -91,6 +91,14 @@ are analyzed. Anonymous structs (nested struct-typed fields, struct literals,
 skipped. To enable analysis of one of those, lift it into a named type
 declaration.
 
+If a struct is constructed somewhere in the package with a positional
+composite literal (` + "`T{1, 2, 3}`" + ` rather than ` + "`T{a: 1, b: 2, c: 3}`" + `),
+the reorder is reported but never applied: rewriting the field order would
+re-map the literal's elements to different fields, breaking the build (or
+worse, silently mis-assigning values when the new field types still happen
+to accept the old element types). Convert the literal to keyed form and
+rerun to enable the reorder.
+
 `
 
 const (
@@ -204,6 +212,9 @@ func run(pass *analysis.Pass) (any, error) {
 	excludeFiles := fExcludeFiles
 
 	inspect := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
+
+	positionalUsers := collectPositionalUsers(inspect, pass)
+
 	dec := decorator.NewDecorator(pass.Fset)
 
 	dirtyFiles := make(map[string]*dst.File)
@@ -343,6 +354,20 @@ func run(pass *analysis.Pass) (any, error) {
 			return
 		}
 
+		// Positional literal pins layout: reporting is safe, mutation is not.
+		if litPos, blocked := positionalUsers[typ]; blocked {
+			pass.Report(analysis.Diagnostic{
+				Pos: s.Pos(),
+				End: s.Pos() + token.Pos(len("struct")),
+				Message: fmt.Sprintf(
+					"%s; reorder skipped: positional composite literal at %s would break, convert to keyed form first",
+					message, pass.Fset.Position(litPos),
+				),
+				SuggestedFixes: nil,
+			})
+			return
+		}
+
 		pass.Report(analysis.Diagnostic{
 			Pos:            s.Pos(),
 			End:            s.Pos() + token.Pos(len("struct")),
@@ -432,6 +457,72 @@ var nodeFilter = []ast.Node{
 // sentinel identifies skip-positions during the reorder pass. Reusing a single
 // package-level value avoids per-struct allocation.
 var dummyField = &dst.Field{}
+
+// collectPositionalUsers returns a set of *types.Struct values whose types
+// are constructed somewhere in the package via a positional composite literal
+// (e.g. `T{1, 2, 3}` rather than `T{a: 1, b: 2, c: 3}`). The map's value is
+// the position of the first such literal — surfaced in the diagnostic so the
+// user can jump straight to the source that prevents the reorder.
+//
+// The walk deliberately ignores betteralign's per-file skip flags
+// (-exclude_files, -exclude_dirs, -test_files, -generated_files): excluded
+// source still depends on the struct layout at compile time, so reordering an
+// analysed declaration would break the excluded source just as readily.
+//
+// Go's grammar forbids mixing keyed and positional elements in the same
+// literal, so inspecting the first element is sufficient to classify the
+// whole literal (this is the same shortcut go vet's "composites" pass uses).
+func collectPositionalUsers(inspect *inspector.Inspector, pass *analysis.Pass) map[*types.Struct]token.Pos {
+	users := make(map[*types.Struct]token.Pos)
+
+	inspect.Preorder([]ast.Node{(*ast.CompositeLit)(nil)}, func(node ast.Node) {
+		lit := node.(*ast.CompositeLit)
+		if len(lit.Elts) == 0 {
+			return
+		}
+		if _, keyed := lit.Elts[0].(*ast.KeyValueExpr); keyed {
+			return
+		}
+		tv, ok := pass.TypesInfo.Types[lit]
+		if !ok || tv.Type == nil {
+			return
+		}
+		st := canonicalStructType(tv.Type)
+		if st == nil {
+			return
+		}
+		if _, seen := users[st]; !seen {
+			users[st] = lit.Pos()
+		}
+	})
+
+	return users
+}
+
+// canonicalStructType returns the *types.Struct that the main alignment
+// visitor will see when it lands on the corresponding *ast.StructType, or nil
+// when t does not denote a struct type. The function resolves three forms to
+// a single canonical pointer the visitor can equate against:
+//
+//   - plain named structs (`T{...}`)               → T's struct body
+//   - chained type definitions (`type S T`)        → T's struct body (shared)
+//   - generic instantiations (`Box[int]{...}`)     → the generic origin's body
+//
+// Aliases (`type A = T`) are unwrapped via types.Unalias first. Anonymous
+// struct literals fall through the *types.Struct case and key themselves;
+// they never match a candidate (the analyzer only reports named structs) but
+// keeping them in the map is harmless and avoids special-casing.
+func canonicalStructType(t types.Type) *types.Struct {
+	t = types.Unalias(t)
+	switch tt := t.(type) {
+	case *types.Named:
+		st, _ := tt.Origin().Underlying().(*types.Struct)
+		return st
+	case *types.Struct:
+		return tt
+	}
+	return nil
+}
 
 // lookupUnsafePointer returns the canonical types.Type for unsafe.Pointer, or
 // nil if the standard library's unsafe package no longer exposes Pointer as a
