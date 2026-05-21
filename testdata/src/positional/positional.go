@@ -55,3 +55,12 @@ type Chained struct { // want `struct of size 12 could be 8; reorder skipped: po
 type AliasChained Chained
 
 var _ = AliasChained{1, 2, 3}
+
+// Elided positional inside slice-of-pointer: canonicalStructType must unwrap *T.
+type NestedSliceOfPtr struct { // want `struct of size 12 could be 8; reorder skipped: positional composite literal`
+	x byte
+	y int32
+	z byte
+}
+
+var _ = []*NestedSliceOfPtr{{1, 2, 3}}

@@ -59,12 +59,10 @@ func removeOtherArches(paths []string) []string {
 }
 
 func NewTestAnalyzer() *analysis.Analyzer {
-	betteralign.ResetFlags()
 	analyzer := &analysis.Analyzer{
 		Name:     betteralign.Analyzer.Name,
 		Doc:      betteralign.Analyzer.Doc,
 		Requires: betteralign.Analyzer.Requires,
-		Run:      betteralign.Analyzer.Run,
 	}
 	betteralign.InitAnalyzer(analyzer)
 	return analyzer
@@ -155,6 +153,22 @@ func TestFlagExcludeDirs(t *testing.T) {
 		analyzer := NewTestAnalyzer()
 		_ = analyzer.Flags.Set("apply", "false")
 		_ = analyzer.Flags.Set("exclude_dirs", "testdata/src/exclude/a/a")
+		analysistest.Run(t, testdata, analyzer, "exclude/a/...")
+	})
+
+	// Absolute paths used to fail closed (silently excluding every file)
+	// because filepath.Rel errors when basepath is absolute and targpath is
+	// relative. normalizeExcludePaths in run() rewrites absolutes to
+	// wd-relative form so both styles are supported equivalently.
+	t.Run("exclude a via absolute path", func(t *testing.T) {
+		wd, err := os.Getwd()
+		if err != nil {
+			t.Fatalf("getwd: %v", err)
+		}
+		testdata := analysistest.TestData()
+		analyzer := NewTestAnalyzer()
+		_ = analyzer.Flags.Set("apply", "false")
+		_ = analyzer.Flags.Set("exclude_dirs", filepath.Join(wd, "testdata", "src", "exclude", "a", "a"))
 		analysistest.Run(t, testdata, analyzer, "exclude/a/...")
 	})
 }

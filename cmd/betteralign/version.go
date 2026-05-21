@@ -11,10 +11,9 @@ const (
 )
 
 var (
-	Version   = defaultDevVersion
-	Commit    = defaultUnknownInfo
-	Date      = defaultUnknownInfo
-	Timestamp = defaultUnknownInfo
+	Version = defaultDevVersion
+	Commit  = defaultUnknownInfo
+	Date    = defaultUnknownInfo
 )
 
 // fillFromBuildInfo populates Version/Commit/Date from runtime build info when
@@ -42,9 +41,6 @@ func fillFromBuildInfo() {
 		case "vcs.time":
 			if Date == defaultUnknownInfo && s.Value != "" {
 				Date = s.Value
-				if Timestamp == defaultUnknownInfo {
-					Timestamp = s.Value
-				}
 			}
 		}
 	}
@@ -56,8 +52,10 @@ func fillFromBuildInfo() {
 //
 // The commit and build-date segments are omitted when their corresponding
 // ldflags were not provided (still equal to defaultUnknownInfo). Commit hashes
-// longer than seven characters are truncated to their short form; build dates
-// longer than ten characters are truncated to the YYYY-MM-DD prefix.
+// longer than seven characters are truncated to their short form. Build
+// dates of ten or more characters are sliced to their first ten bytes (the
+// YYYY-MM-DD prefix of an RFC 3339 timestamp); shorter dates are emitted
+// as-is.
 func getVersionString() string {
 	fillFromBuildInfo()
 
@@ -71,16 +69,11 @@ func getVersionString() string {
 		version += fmt.Sprintf(" (commit %s)", shortCommit)
 	}
 
-	builtDate := Date
-	if builtDate == defaultUnknownInfo && Timestamp != defaultUnknownInfo {
-		builtDate = Timestamp
-	}
-
-	if builtDate != defaultUnknownInfo {
-		if len(builtDate) >= 10 {
-			version += fmt.Sprintf(" built on %s", builtDate[:10])
+	if Date != defaultUnknownInfo {
+		if len(Date) >= 10 {
+			version += fmt.Sprintf(" built on %s", Date[:10])
 		} else {
-			version += fmt.Sprintf(" built on %s", builtDate)
+			version += fmt.Sprintf(" built on %s", Date)
 		}
 	}
 

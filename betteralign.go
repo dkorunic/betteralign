@@ -41,6 +41,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/google/renameio/v2/maybe"
 	"github.com/sirkon/dst"
@@ -106,15 +107,10 @@ const (
 	optInStruct  = "betteralign:check"
 )
 
-var (
-	// flags
-	fApply          bool
-	fTestFiles      bool
-	fGeneratedFiles bool
-	fOptInMode      bool
-	fExcludeFiles   StringArrayFlag
-	fExcludeDirs    StringArrayFlag
+// structKeywordLen sizes the diagnostic span over the `struct` keyword.
+const structKeywordLen = token.Pos(len("struct"))
 
+var (
 	// default test and generated suffixes
 	testSuffixes      = []string{"_test.go"}
 	generatedSuffixes = []string{"_generated.go", "_gen.go", ".gen.go", ".pb.go", ".pb.gw.go"}
@@ -123,8 +119,19 @@ var (
 	ErrStatFile       = errors.New("unable to stat the file")
 	ErrNotRegularFile = errors.New("not a regular file, skipping")
 	ErrWriteFile      = errors.New("unable to write to file")
+	ErrEmptyBuffer    = errors.New("refusing to write empty buffer")
 	ErrPreFilterFiles = errors.New("failed to pre-filter files")
 )
+
+// analyzerConfig holds per-analyzer flag state; one per InitAnalyzer call.
+type analyzerConfig struct {
+	excludeFiles   StringArrayFlag
+	excludeDirs    StringArrayFlag
+	apply          bool
+	testFiles      bool
+	generatedFiles bool
+	optInMode      bool
+}
 
 // StringArrayFlag is a flag.Value that accumulates comma-separated string
 // arguments across one or more occurrences of the same flag. It backs the
@@ -155,39 +162,35 @@ var Analyzer = &analysis.Analyzer{
 	Name:     "betteralign",
 	Doc:      Doc,
 	Requires: []*analysis.Analyzer{inspect.Analyzer},
-	Run:      run,
 }
 
-// InitAnalyzer registers betteralign's command-line flags on analyzer. It is
-// invoked from init for the package-level Analyzer and is also exposed so
-// external drivers (custom checkers, tests constructing a fresh
-// *analysis.Analyzer via NewTestAnalyzer) can wire up the same flag set
-// without going through singlechecker.Main.
+// InitAnalyzer wires a fresh analyzerConfig into analyzer: it allocates a new
+// config, binds the command-line flags to that config, and sets analyzer.Run
+// to the config's run method. Each analyzer constructed through InitAnalyzer
+// gets independent flag state, so concurrent test analyzers no longer share
+// mutable globals. The function is also exposed so external drivers can wire
+// up the same flag set without going through singlechecker.Main.
+//
+// Calling InitAnalyzer on an analyzer that is already initialised (i.e. its
+// flag set already carries the "apply" entry) is a no-op rather than a
+// panic. flag.FlagSet.BoolVar fatals on duplicate names; the guard lets
+// defensive callers re-init without taking down the host process.
 func InitAnalyzer(analyzer *analysis.Analyzer) {
-	analyzer.Flags.BoolVar(&fApply, "apply", false, "apply suggested fixes")
-	analyzer.Flags.BoolVar(&fTestFiles, "test_files", false, "also check and fix test files")
-	analyzer.Flags.BoolVar(&fGeneratedFiles, "generated_files", false, "also check and fix generated files")
-	analyzer.Flags.BoolVar(&fOptInMode, "opt_in", false, fmt.Sprintf("opt-in mode on per-struct basis with '%s' in comment", optInStruct))
-	analyzer.Flags.Var(&fExcludeFiles, "exclude_files", "exclude files matching a pattern")
-	analyzer.Flags.Var(&fExcludeDirs, "exclude_dirs", "exclude directories matching a pattern")
+	if analyzer.Flags.Lookup("apply") != nil {
+		return
+	}
+	cfg := &analyzerConfig{}
+	analyzer.Flags.BoolVar(&cfg.apply, "apply", false, "apply suggested fixes")
+	analyzer.Flags.BoolVar(&cfg.testFiles, "test_files", false, "also check and fix test files")
+	analyzer.Flags.BoolVar(&cfg.generatedFiles, "generated_files", false, "also check and fix generated files")
+	analyzer.Flags.BoolVar(&cfg.optInMode, "opt_in", false, fmt.Sprintf("opt-in mode on per-struct basis with '%s' in comment", optInStruct))
+	analyzer.Flags.Var(&cfg.excludeFiles, "exclude_files", "exclude files matching a pattern")
+	analyzer.Flags.Var(&cfg.excludeDirs, "exclude_dirs", "exclude directories matching a pattern")
+	analyzer.Run = cfg.run
 }
 
 func init() {
 	InitAnalyzer(Analyzer)
-}
-
-// ResetFlags resets all package-level flag variables to their zero values.
-// This function is intended for use in tests only. It must be called (via
-// NewTestAnalyzer in betteralign_test.go) before each analyzer construction
-// to prevent StringArrayFlag.Set from accumulating values across test
-// functions. It has no effect on the behaviour of the analyzer in production.
-func ResetFlags() {
-	fApply = false
-	fTestFiles = false
-	fGeneratedFiles = false
-	fOptInMode = false
-	fExcludeFiles = nil
-	fExcludeDirs = nil
 }
 
 // run is the analyzer's entry point invoked by the go/analysis framework. It
@@ -199,23 +202,23 @@ func ResetFlags() {
 // SuggestedFixes are deliberately left empty because DST cannot serialise a
 // single node without losing its comment attachments (see the file-level
 // package documentation for the full rationale).
-func run(pass *analysis.Pass) (any, error) {
-	// Snapshot package-level flags so concurrent passes see a consistent view.
-	apply := fApply
+func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
+	apply := cfg.apply
 	if a := pass.Analyzer.Flags.Lookup("fix"); a != nil && a.Value.String() == "true" {
 		apply = true
 	}
-	testFiles := fTestFiles
-	generatedFiles := fGeneratedFiles
-	optInMode := fOptInMode
-	excludeDirs := fExcludeDirs
-	excludeFiles := fExcludeFiles
+	testFiles := cfg.testFiles
+	generatedFiles := cfg.generatedFiles
+	optInMode := cfg.optInMode
+	excludeDirs := cfg.excludeDirs
+	excludeFiles := cfg.excludeFiles
 
 	inspect := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 
 	positionalUsers := collectPositionalUsers(inspect, pass)
 
-	dec := decorator.NewDecorator(pass.Fset)
+	// Lazy: nil until the first misaligned struct.
+	var dec *decorator.Decorator
 
 	dirtyFiles := make(map[string]*dst.File)
 	decoratedFiles := make(map[string]*dst.File)
@@ -227,6 +230,14 @@ func run(pass *analysis.Pass) (any, error) {
 	if len(excludeDirs) > 0 || len(excludeFiles) > 0 {
 		var err error
 		wd, err = os.Getwd()
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", ErrPreFilterFiles, err)
+		}
+		excludeDirs, err = normalizeExcludePaths(wd, excludeDirs)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", ErrPreFilterFiles, err)
+		}
+		excludeFiles, err = normalizeExcludePaths(wd, excludeFiles)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %w", ErrPreFilterFiles, err)
 		}
@@ -332,6 +343,9 @@ func run(pass *analysis.Pass) (any, error) {
 		if _, failed := decorationFailed[currentFn]; failed {
 			return
 		}
+		if dec == nil {
+			dec = decorator.NewDecorator(pass.Fset)
+		}
 		dFile, ok := decoratedFiles[currentFn]
 		if !ok {
 			df, err := dec.DecorateFile(currentASTFile)
@@ -358,7 +372,7 @@ func run(pass *analysis.Pass) (any, error) {
 		if litPos, blocked := positionalUsers[typ]; blocked {
 			pass.Report(analysis.Diagnostic{
 				Pos: s.Pos(),
-				End: s.Pos() + token.Pos(len("struct")),
+				End: s.Pos() + structKeywordLen,
 				Message: fmt.Sprintf(
 					"%s; reorder skipped: positional composite literal at %s would break, convert to keyed form first",
 					message, pass.Fset.Position(litPos),
@@ -370,7 +384,7 @@ func run(pass *analysis.Pass) (any, error) {
 
 		pass.Report(analysis.Diagnostic{
 			Pos:            s.Pos(),
-			End:            s.Pos() + token.Pos(len("struct")),
+			End:            s.Pos() + structKeywordLen,
 			Message:        message,
 			SuggestedFixes: nil,
 		})
@@ -382,7 +396,12 @@ func run(pass *analysis.Pass) (any, error) {
 
 		// Flatten multi-name fields (A, B int) into one slot per name.
 		// TODO: preserve multi-named fields instead of flattening.
-		flat := make([]*dst.Field, 0, len(indexes))
+		flat := fieldSlicePool.Get().([]*dst.Field)[:0]
+		defer func() {
+			// Drop pointer refs so the pool can't pin DST nodes.
+			clear(flat)
+			fieldSlicePool.Put(flat[:0])
+		}()
 		for _, fld := range dNode.Fields.List {
 			flat = append(flat, fld)
 			if len(fld.Names) == 0 {
@@ -421,11 +440,6 @@ func run(pass *analysis.Pass) (any, error) {
 				fmt.Fprintf(os.Stderr, "failed to print %s: %v\n", fn, err)
 				continue
 			}
-			// Refuse to blank the user's source on a degenerate Fprint result.
-			if buf.Len() == 0 {
-				fmt.Fprintf(os.Stderr, "refusing to write empty buffer to %s\n", fn)
-				continue
-			}
 			if err := applyToFile(fn, buf.Bytes()); err != nil {
 				fmt.Fprintf(os.Stderr, "error applying fixes to %v: %v\n", fn, err)
 			}
@@ -457,6 +471,24 @@ var nodeFilter = []ast.Node{
 // sentinel identifies skip-positions during the reorder pass. Reusing a single
 // package-level value avoids per-struct allocation.
 var dummyField = &dst.Field{}
+
+// fieldElem is optimalOrder's per-field sort record; lifted out so a pool can recycle it.
+type fieldElem struct {
+	alignof int64
+	sizeof  int64
+	ptrdata int64
+	index   int
+}
+
+// elemsPool recycles fieldElem scratch buffers for optimalOrder.
+var elemsPool = sync.Pool{
+	New: func() any { return []fieldElem(nil) },
+}
+
+// fieldSlicePool recycles the apply-mode flatten buffer; reordered is freshly allocated.
+var fieldSlicePool = sync.Pool{
+	New: func() any { return []*dst.Field(nil) },
+}
 
 // collectPositionalUsers returns a set of *types.Struct values whose types
 // are constructed somewhere in the package via a positional composite literal
@@ -501,19 +533,29 @@ func collectPositionalUsers(inspect *inspector.Inspector, pass *analysis.Pass) m
 
 // canonicalStructType returns the *types.Struct that the main alignment
 // visitor will see when it lands on the corresponding *ast.StructType, or nil
-// when t does not denote a struct type. The function resolves three forms to
+// when t does not denote a struct type. The function resolves four forms to
 // a single canonical pointer the visitor can equate against:
 //
 //   - plain named structs (`T{...}`)               → T's struct body
 //   - chained type definitions (`type S T`)        → T's struct body (shared)
 //   - generic instantiations (`Box[int]{...}`)     → the generic origin's body
+//   - pointer-typed elided literals (`[]*T{{...}}`) → T's struct body
 //
 // Aliases (`type A = T`) are unwrapped via types.Unalias first. Anonymous
 // struct literals fall through the *types.Struct case and key themselves;
 // they never match a candidate (the analyzer only reports named structs) but
 // keeping them in the map is harmless and avoids special-casing.
+//
+// The pointer arm matters for elided composite literals inside slice, array
+// or map types whose element type is a pointer: in `[]*T{{1,2,3}}` the
+// type-checker records the inner literal with type `*T`, not `T`, so without
+// unwrapping the layout-pinning detection would miss the literal and the
+// analyzer would happily reorder T's fields, breaking the build.
 func canonicalStructType(t types.Type) *types.Struct {
 	t = types.Unalias(t)
+	if p, ok := t.(*types.Pointer); ok {
+		t = types.Unalias(p.Elem())
+	}
 	switch tt := t.(type) {
 	case *types.Named:
 		st, _ := tt.Origin().Underlying().(*types.Struct)
@@ -544,21 +586,28 @@ func lookupUnsafePointer() types.Type {
 // indexes, along with the size and ptrdata of the struct laid out in that
 // order. Computing size and ptrdata directly from the sorted elements avoids
 // rebuilding a *types.Struct just to call Sizeof / ptrdata on it.
+//
+// The fieldElem scratch slice is recycled through elemsPool so that
+// successive optimalOrder calls amortise the backing-array allocation across
+// the pass; the returned indexes slice is freshly allocated because it
+// outlives this function.
 func optimalOrder(str *types.Struct, sizes *gcSizes) (indexes []int, optSize, optPtrdata int64) {
 	nf := str.NumFields()
 
-	type elem struct {
-		alignof int64
-		sizeof  int64
-		ptrdata int64
-		index   int
+	elems := elemsPool.Get().([]fieldElem)
+	if cap(elems) < nf {
+		elems = make([]fieldElem, nf)
+	} else {
+		elems = elems[:nf]
 	}
+	defer func() {
+		elemsPool.Put(elems[:0])
+	}()
 
-	elems := make([]elem, nf)
 	for i := range nf {
 		field := str.Field(i)
 		ft := field.Type()
-		elems[i] = elem{
+		elems[i] = fieldElem{
 			alignof: sizes.Alignof(ft),
 			sizeof:  sizes.Sizeof(ft),
 			ptrdata: sizes.ptrdata(ft),
@@ -566,7 +615,7 @@ func optimalOrder(str *types.Struct, sizes *gcSizes) (indexes []int, optSize, op
 		}
 	}
 
-	slices.SortStableFunc(elems, func(a, b elem) int {
+	slices.SortStableFunc(elems, func(a, b fieldElem) int {
 		// Zero-sized fields before non-zero-sized.
 		if (a.sizeof == 0) != (b.sizeof == 0) {
 			if a.sizeof == 0 {
@@ -855,8 +904,16 @@ func hasSuffix(fn string, suffixes []string) bool {
 	return false
 }
 
-// hasGeneratedComment reports whether file carries a "Code generated ... DO NOT
-// EDIT." comment before its package keyword.
+// hasGeneratedComment reports whether file carries the canonical "Code
+// generated ... DO NOT EDIT." marker before its package keyword.
+//
+// file.Comments is sorted by source position, so the loop walks comment
+// groups from the top of the file downward and bails out as soon as it
+// crosses file.Package — comments that appear after the package keyword
+// cannot be the generated-file header per the Go specification and need
+// not be scanned. Within a candidate comment group the individual
+// // lines are matched against reGeneratedBy (the rec-generated DFA for
+// ^//\s*Code generated by .* DO NOT EDIT\.$).
 func hasGeneratedComment(file *ast.File) bool {
 	for _, cg := range file.Comments {
 		if cg.Pos() > file.Package {
@@ -869,6 +926,39 @@ func hasGeneratedComment(file *ast.File) bool {
 		}
 	}
 	return false
+}
+
+// normalizeExcludePaths rewrites every absolute entry in paths as a
+// wd-relative path. Patterns that are already relative are passed through
+// unchanged. isExcluded compares against a wd-relative file name, so mixing
+// absolute and relative paths in filepath.Rel/filepath.Match would silently
+// fail; this normalisation step keeps both forms compatible.
+//
+// When no entry is absolute (the common case), the input slice is returned
+// unchanged — no allocation. Callers must therefore not mutate the result;
+// they only read from it. When at least one entry is absolute, a fresh slice
+// is returned and the input is left untouched.
+//
+// Errors from filepath.Rel are wrapped with the offending path and the
+// working directory so users can diagnose cross-volume mismatches (Windows)
+// or working-directory mismatches without inspecting the underlying error.
+func normalizeExcludePaths(wd string, paths []string) ([]string, error) {
+	if !slices.ContainsFunc(paths, filepath.IsAbs) {
+		return paths, nil
+	}
+	out := make([]string, len(paths))
+	for i, p := range paths {
+		if !filepath.IsAbs(p) {
+			out[i] = p
+			continue
+		}
+		rel, err := filepath.Rel(wd, p)
+		if err != nil {
+			return nil, fmt.Errorf("exclude path %q is not resolvable relative to working directory %q (cross-volume on Windows, or requires runtime cwd): %w", p, wd, err)
+		}
+		out[i] = rel
+	}
+	return out, nil
 }
 
 // isExcluded reports whether fn is excluded by the given excludeDirs or
@@ -966,13 +1056,26 @@ func declaredWithOptInComment(decl *ast.GenDecl) bool {
 }
 
 // applyToFile atomically writes buf to fn while preserving the original
-// file's permission bits. Non-regular targets (symlinks, devices, named
+// file's permission bits. An empty buf is refused with ErrEmptyBuffer so a
+// degenerate Fprint result (e.g. from a future DST regression) cannot blank
+// the user's source file. Non-regular targets (symlinks, devices, named
 // pipes) are rejected with ErrNotRegularFile so the analyzer cannot silently
 // follow a symlink and clobber an unintended file. Stat and write failures
 // are wrapped with ErrStatFile and ErrWriteFile respectively so callers can
 // classify them via errors.Is.
+//
+// os.Lstat is used (rather than os.Stat) so that the regular-file check
+// observes the symlink directly. With os.Stat a symlink whose target is a
+// regular file would pass the IsRegular guard and the subsequent rename
+// would replace the symlink itself, clobbering the user's intent. A TOCTOU
+// window remains between Lstat and the renameio temp-rename, but the common
+// "symlink already at the path" case is now refused outright.
 func applyToFile(fn string, buf []byte) error {
-	st, err := os.Stat(fn)
+	if len(buf) == 0 {
+		return ErrEmptyBuffer
+	}
+
+	st, err := os.Lstat(fn)
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrStatFile, err)
 	}

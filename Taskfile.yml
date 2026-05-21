@@ -55,7 +55,7 @@ tasks:
     cmds:
       - task: generate
       - task: fmt
-      - go build -trimpath -pgo=auto -ldflags="-s -w -extldflags '-static' -X main.Version={{.GIT_LAST_TAG}}{{.GIT_MODIFIED}} -X main.Commit={{.GIT_HEAD_COMMIT}} -X main.Date={{.BUILD_DATE}} -X main.Timestamp={{.BUILD_DATE}}" -o {{.TARGET}} ./cmd/betteralign
+      - go build -trimpath -pgo=auto -ldflags="-s -w -extldflags '-static' -X main.Version={{.GIT_LAST_TAG}}{{.GIT_MODIFIED}} -X main.Commit={{.GIT_HEAD_COMMIT}} -X main.Date={{.BUILD_DATE}}" -o {{.TARGET}} ./cmd/betteralign
 
   build-debug:
     env:
@@ -64,7 +64,7 @@ tasks:
       - task: update
       - task: generate
       - task: fmt
-      - go build -ldflags="-X main.Version={{.GIT_LAST_TAG}}{{.GIT_MODIFIED}} -X main.Commit={{.GIT_HEAD_COMMIT}} -X main.Date={{.BUILD_DATE}} -X main.Timestamp={{.BUILD_DATE}}" -race -o {{.TARGET}} ./cmd/betteralign
+      - go build -ldflags="-X main.Version={{.GIT_LAST_TAG}}{{.GIT_MODIFIED}} -X main.Commit={{.GIT_HEAD_COMMIT}} -X main.Date={{.BUILD_DATE}}" -race -o {{.TARGET}} ./cmd/betteralign
 
   lint:
     cmds:

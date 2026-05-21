@@ -10,9 +10,11 @@ import (
 	"go/types"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/sirkon/dst"
+	"golang.org/x/tools/go/analysis"
 )
 
 // testSizes64 is a gcSizes configured for a 64-bit platform (WordSize=8, MaxAlign=8).
@@ -634,6 +636,33 @@ func TestApplyToFileSentinelsAreWrapped(t *testing.T) {
 			t.Errorf("errors.Is(err, ErrNotRegularFile) = false; err = %v (BUG-28)", err)
 		}
 	})
+
+	t.Run("symlink to regular file wraps ErrNotRegularFile", func(t *testing.T) {
+		// Lstat must observe the symlink, not its target.
+		dir := t.TempDir()
+		target := filepath.Join(dir, "target.go")
+		if err := os.WriteFile(target, []byte("package x\n"), 0o644); err != nil {
+			t.Fatalf("seed target: %v", err)
+		}
+		link := filepath.Join(dir, "link.go")
+		if err := os.Symlink(target, link); err != nil {
+			t.Skipf("symlink unsupported: %v", err)
+		}
+		err := applyToFile(link, []byte("package y\n"))
+		if err == nil {
+			t.Fatal("expected error for symlink path, got nil")
+		}
+		if !errors.Is(err, ErrNotRegularFile) {
+			t.Errorf("errors.Is(err, ErrNotRegularFile) = false; err = %v", err)
+		}
+		got, err := os.ReadFile(target)
+		if err != nil {
+			t.Fatalf("read target after refused write: %v", err)
+		}
+		if string(got) != "package x\n" {
+			t.Errorf("symlink target was modified: got %q, want %q", got, "package x\n")
+		}
+	})
 }
 
 // ─── Layer 11: StringArrayFlag.Set (BUG-26) ──────────────────────────────────
@@ -642,7 +671,7 @@ func TestApplyToFileSentinelsAreWrapped(t *testing.T) {
 // appends empty strings.
 // BUG-26: strings.Split(value, ",") yields a single empty entry for "" and
 // adjacent empty entries for "a,", ",a", and "a,,b". An empty entry in
-// fExcludeDirs makes filepath.Rel(".", dir) succeed for every file, silently
+// excludeDirs makes filepath.Rel(".", dir) succeed for every file, silently
 // excluding the entire tree from analysis.
 func TestStringArrayFlagSetEmptyValues(t *testing.T) {
 	tests := []struct {
@@ -1503,5 +1532,173 @@ func TestOptimalOrderSinglePointerField(t *testing.T) {
 	}
 	if optPtrdata != 8 {
 		t.Errorf("optPtrdata = %d, want 8", optPtrdata)
+	}
+}
+
+// ─── Layer 22: normalizeExcludePaths ─────────────────────────────────────────
+
+// TestNormalizeExcludePaths verifies that absolute paths are rewritten to be
+// wd-relative while relative paths pass through unchanged. The function backs
+// the run-time conversion of -exclude_dirs/-exclude_files patterns so that
+// users can supply either form interchangeably without silently disabling
+// the analyzer.
+func TestNormalizeExcludePaths(t *testing.T) {
+	wd := filepath.Join(string(filepath.Separator), "proj")
+	tests := []struct {
+		name    string
+		paths   []string
+		want    []string
+		wantErr bool
+	}{
+		{
+			name:  "all relative passes through",
+			paths: []string{"vendor", "third_party/grpc", "*.gen.go"},
+			want:  []string{"vendor", "third_party/grpc", "*.gen.go"},
+		},
+		{
+			name:  "absolute under wd rewrites to relative",
+			paths: []string{filepath.Join(wd, "vendor")},
+			want:  []string{"vendor"},
+		},
+		{
+			name:  "mixed forms each handled independently",
+			paths: []string{"vendor", filepath.Join(wd, "third_party")},
+			want:  []string{"vendor", "third_party"},
+		},
+		{
+			name:  "empty input yields empty output",
+			paths: nil,
+			want:  []string{},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := normalizeExcludePaths(wd, tc.paths)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("normalizeExcludePaths(%v) succeeded; want error", tc.paths)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("normalizeExcludePaths(%v) error: %v", tc.paths, err)
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("len = %d, want %d (got=%v)", len(got), len(tc.want), got)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("[%d] = %q, want %q", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestNormalizeExcludePathsDoesNotMutateInput verifies that the slow path
+// (input contains at least one absolute entry) leaves the caller-owned slice
+// unmodified. The input slice is backed by the analyzer's flag-bound
+// StringArrayFlag, so mutating it would leak run-time state across passes.
+func TestNormalizeExcludePathsDoesNotMutateInput(t *testing.T) {
+	wd := filepath.Join(string(filepath.Separator), "proj")
+	in := []string{filepath.Join(wd, "vendor"), "third_party"}
+	original := append([]string(nil), in...)
+	_, err := normalizeExcludePaths(wd, in)
+	if err != nil {
+		t.Fatalf("normalize error: %v", err)
+	}
+	for i := range in {
+		if in[i] != original[i] {
+			t.Errorf("input mutated at [%d]: got %q, want %q", i, in[i], original[i])
+		}
+	}
+}
+
+// TestNormalizeExcludePathsFastPathReturnsInput verifies that when no entry
+// is absolute, the function returns the caller-supplied slice unchanged
+// (same backing array). The common case — relative-only patterns —
+// avoids an allocation.
+func TestNormalizeExcludePathsFastPathReturnsInput(t *testing.T) {
+	wd := filepath.Join(string(filepath.Separator), "proj")
+	in := []string{"vendor", "third_party"}
+	got, err := normalizeExcludePaths(wd, in)
+	if err != nil {
+		t.Fatalf("normalize error: %v", err)
+	}
+	// Same backing array iff first-element addresses match.
+	if len(in) == 0 || len(got) == 0 || &in[0] != &got[0] {
+		t.Errorf("fast path allocated; want input slice returned unchanged")
+	}
+}
+
+// TestNormalizeExcludePathsErrorMessage exercises the error wrapping for
+// cross-volume / non-resolvable absolute paths. On POSIX, filepath.Rel only
+// errors when relativisation would require runtime cwd; we synthesise that
+// by passing wd="" so filepath.Rel cannot fall back to a known base.
+func TestNormalizeExcludePathsErrorMessage(t *testing.T) {
+	// Relative wd + absolute path forces filepath.Rel to error.
+	got, err := normalizeExcludePaths("relative-wd", []string{string(filepath.Separator) + "abs"})
+	if err == nil {
+		t.Fatalf("expected error, got result %v", got)
+	}
+	msg := err.Error()
+	for _, want := range []string{"exclude path", "relative-wd"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error message missing %q: %s", want, msg)
+		}
+	}
+}
+
+// ─── Layer 23: InitAnalyzer double-registration guard ────────────────────────
+
+// TestInitAnalyzerDoubleRegistrationIsNoop verifies that calling InitAnalyzer
+// twice on the same *analysis.Analyzer does not panic. flag.FlagSet.BoolVar
+// fatals on duplicate names, so without the guard a defensive caller that
+// re-inits the package-level Analyzer (or any analyzer already passed
+// through InitAnalyzer) would crash the host process.
+func TestInitAnalyzerDoubleRegistrationIsNoop(t *testing.T) {
+	a := &analysis.Analyzer{Name: "t", Doc: "t"}
+	InitAnalyzer(a)
+	if a.Run == nil {
+		t.Fatal("first InitAnalyzer left Run nil")
+	}
+	// Second call must not panic.
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("second InitAnalyzer panicked: %v", r)
+		}
+	}()
+	InitAnalyzer(a)
+	if a.Run == nil {
+		t.Fatal("Run cleared by second InitAnalyzer")
+	}
+}
+
+// ─── Layer 24: applyToFile empty-buffer guard ────────────────────────────────
+
+// TestApplyToFileRejectsEmptyBuffer verifies that applyToFile refuses to
+// write an empty byte slice. The earlier upstream check in run() was
+// consolidated into applyToFile so that the guarantee lives at the
+// boundary, regardless of how the caller arrived there.
+func TestApplyToFileRejectsEmptyBuffer(t *testing.T) {
+	dir := t.TempDir()
+	fn := filepath.Join(dir, "x.go")
+	if err := os.WriteFile(fn, []byte("package x\n"), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	err := applyToFile(fn, nil)
+	if err == nil {
+		t.Fatal("expected error for empty buffer, got nil")
+	}
+	if !errors.Is(err, ErrEmptyBuffer) {
+		t.Errorf("errors.Is(err, ErrEmptyBuffer) = false; err = %v", err)
+	}
+	// File contents must be unchanged.
+	got, err := os.ReadFile(fn)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if string(got) != "package x\n" {
+		t.Errorf("file was modified despite empty-buffer guard: got %q", got)
 	}
 }

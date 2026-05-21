@@ -14,7 +14,6 @@ builds:
       - -X main.Version={{.Version}}
       - -X main.Commit={{.Commit}}
       - -X main.Date={{.Date}}
-      - -X main.Timestamp={{.Timestamp}}
     goos:
       - linux
       - darwin
