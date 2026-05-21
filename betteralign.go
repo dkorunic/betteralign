@@ -331,6 +331,10 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 
 		// Compute optimality without DST; clean files pay no decoration cost.
 		indexes, optsz, optptrs := optimalOrder(typ, sizes)
+		// Identity permutation means the original layout is already optimal.
+		if isIdentityOrder(indexes) {
+			return
+		}
 		var message string
 		if sz := sizes.Sizeof(typ); sz != optsz {
 			message = fmt.Sprintf("%d bytes saved: struct of size %d could be %d", sz-optsz, sz, optsz)
@@ -678,6 +682,19 @@ func optimalOrder(str *types.Struct, sizes *gcSizes) (indexes []int, optSize, op
 	}
 	optSize = align(offset, maxAlign)
 	return indexes, optSize, optPtrdata
+}
+
+// isIdentityOrder reports whether indexes is the identity permutation
+// [0, 1, ..., len(indexes)-1]. The analyzer uses this to short-circuit the
+// Sizeof/ptrdata recomputation when the stable sort confirms the original
+// field order is already optimal under optimalOrder's comparator.
+func isIdentityOrder(indexes []int) bool {
+	for i, idx := range indexes {
+		if idx != i {
+			return false
+		}
+	}
+	return true
 }
 
 // Code below based on go/types.StdSizes.
