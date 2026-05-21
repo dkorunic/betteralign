@@ -35,6 +35,7 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
+	"go/parser"
 	"go/token"
 	"go/types"
 	"os"
@@ -360,6 +361,8 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 
 		dNode, ok := dec.Dst.Nodes[s].(*dst.StructType)
 		if !ok {
+			fmt.Fprintf(os.Stderr, "betteralign: missing DST mapping for struct at %s; skipping\n",
+				pass.Fset.Position(s.Pos()))
 			return
 		}
 
@@ -396,11 +399,13 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 
 		// Flatten multi-name fields (A, B int) into one slot per name.
 		// TODO: preserve multi-named fields instead of flattening.
-		flat := fieldSlicePool.Get().([]*dst.Field)[:0]
+		flatPtr := fieldSlicePool.Get().(*[]*dst.Field)
+		flat := (*flatPtr)[:0]
 		defer func() {
 			// Drop pointer refs so the pool can't pin DST nodes.
 			clear(flat)
-			fieldSlicePool.Put(flat[:0])
+			*flatPtr = flat[:0]
+			fieldSlicePool.Put(flatPtr)
 		}()
 		for _, fld := range dNode.Fields.List {
 			flat = append(flat, fld)
@@ -438,6 +443,11 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 			df := dirtyFiles[fn]
 			if err := decorator.Fprint(&buf, df); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to print %s: %v\n", fn, err)
+				continue
+			}
+			// Refuse to overwrite source with unparseable bytes.
+			if _, err := parser.ParseFile(token.NewFileSet(), fn, buf.Bytes(), parser.SkipObjectResolution); err != nil {
+				fmt.Fprintf(os.Stderr, "betteralign: refusing to write %s: rewritten output failed to parse: %v\n", fn, err)
 				continue
 			}
 			if err := applyToFile(fn, buf.Bytes()); err != nil {
@@ -481,13 +491,14 @@ type fieldElem struct {
 }
 
 // elemsPool recycles fieldElem scratch buffers for optimalOrder.
+// Holds *[]T to avoid boxing slice headers via any (SA6002).
 var elemsPool = sync.Pool{
-	New: func() any { return []fieldElem(nil) },
+	New: func() any { s := []fieldElem(nil); return &s },
 }
 
 // fieldSlicePool recycles the apply-mode flatten buffer; reordered is freshly allocated.
 var fieldSlicePool = sync.Pool{
-	New: func() any { return []*dst.Field(nil) },
+	New: func() any { s := []*dst.Field(nil); return &s },
 }
 
 // collectPositionalUsers returns a set of *types.Struct values whose types
@@ -594,14 +605,16 @@ func lookupUnsafePointer() types.Type {
 func optimalOrder(str *types.Struct, sizes *gcSizes) (indexes []int, optSize, optPtrdata int64) {
 	nf := str.NumFields()
 
-	elems := elemsPool.Get().([]fieldElem)
+	elemsPtr := elemsPool.Get().(*[]fieldElem)
+	elems := *elemsPtr
 	if cap(elems) < nf {
 		elems = make([]fieldElem, nf)
 	} else {
 		elems = elems[:nf]
 	}
 	defer func() {
-		elemsPool.Put(elems[:0])
+		*elemsPtr = elems[:0]
+		elemsPool.Put(elemsPtr)
 	}()
 
 	for i := range nf {
@@ -846,8 +859,10 @@ func (s *gcSizes) ptrdata(T types.Type) int64 {
 // ptrdataUncached computes T's ptrdata from its underlying type without
 // consulting the cache. Arrays propagate their element's pointer span,
 // structs track the offset of the last pointer-bearing field, and basic
-// types return either a word (string, unsafe.Pointer) or zero. Panics on
-// types the analyser does not expect to encounter at this layer.
+// types return either a word (string, unsafe.Pointer) or zero. Type kinds
+// the switch does not enumerate (most importantly *types.TypeParam, whose
+// Underlying() returns itself rather than its constraint) fall through to
+// a conservative one-word fallback rather than panicking.
 func (s *gcSizes) ptrdataUncached(T types.Type) int64 {
 	switch t := T.Underlying().(type) {
 	case *types.Basic:
@@ -891,7 +906,8 @@ func (s *gcSizes) ptrdataUncached(T types.Type) int64 {
 		return p
 	}
 
-	panic("impossible")
+	// Conservative one-word fallback for unenumerated kinds (e.g. uninstantiated TypeParam).
+	return s.WordSize
 }
 
 // hasSuffix reports whether fn ends with any of the given suffixes.

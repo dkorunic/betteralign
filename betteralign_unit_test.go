@@ -1239,6 +1239,57 @@ func TestGcSizesPtrdataMidStructPointer(t *testing.T) {
 	}
 }
 
+// unknownType is a synthetic types.Type that drives ptrdataUncached's fallback branch.
+type unknownType struct{}
+
+func (u unknownType) Underlying() types.Type { return u }
+func (u unknownType) String() string         { return "unknown" }
+
+// TestGcSizesPtrdataUnknownTypeFallback pins the WordSize catch-all in
+// ptrdataUncached. BUG-B2: the prior `panic("impossible")` would crash
+// the analyzer on any types.Type whose Underlying() matched none of the
+// enumerated kinds — a hazard for any future Go release that adds a new
+// kind, and for third-party types.Type implementations.
+//
+// The standalone call exercises the fallback path directly; the struct-
+// embedded call confirms the same fallback fires through the recursive
+// per-field walk inside the *types.Struct arm.
+func TestGcSizesPtrdataUnknownTypeFallback(t *testing.T) {
+	if got := testSizes64.ptrdata(unknownType{}); got != testSizes64.WordSize {
+		t.Errorf("ptrdata(unknown) = %d, want %d (WordSize fallback)",
+			got, testSizes64.WordSize)
+	}
+
+	strType := types.NewStruct([]*types.Var{
+		types.NewVar(token.NoPos, nil, "v", unknownType{}),
+	}, nil)
+	if got := testSizes64.ptrdata(strType); got != testSizes64.WordSize {
+		t.Errorf("ptrdata(struct{v unknown}) = %d, want %d",
+			got, testSizes64.WordSize)
+	}
+}
+
+// TestGcSizesPtrdataTypeParamSmoke locks the user-visible BUG-B2 guarantee:
+// a struct field declared as a generic type parameter must not crash the
+// analyzer. In current Go (1.26) *types.TypeParam.Underlying() returns the
+// constraint's interface, so the call routes through the *types.Interface
+// arm (2*WordSize) — not the fallback. The Go standard library deprecates
+// that behavior, so a future release may switch Underlying() to return the
+// TypeParam itself, at which point the fallback would activate. The test
+// accepts either path; what it pins is that no path panics.
+func TestGcSizesPtrdataTypeParamSmoke(t *testing.T) {
+	tn := types.NewTypeName(token.NoPos, nil, "T", nil)
+	iface := types.NewInterfaceType(nil, nil)
+	iface.Complete()
+	tp := types.NewTypeParam(tn, iface)
+
+	got := testSizes64.ptrdata(tp)
+	if got != testSizes64.WordSize && got != 2*testSizes64.WordSize {
+		t.Errorf("ptrdata(TypeParam) = %d, want %d (fallback) or %d (Interface arm)",
+			got, testSizes64.WordSize, 2*testSizes64.WordSize)
+	}
+}
+
 // ─── Layer 16: gcSizes caches and newGCSizes ─────────────────────────────────
 
 // TestNewGCSizesInitializesCaches verifies the constructor allocates all
