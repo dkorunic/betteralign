@@ -962,27 +962,32 @@ func hasGeneratedComment(file *ast.File) bool {
 }
 
 // normalizeExcludePaths rewrites every absolute entry in paths as a
-// wd-relative path. Patterns that are already relative are passed through
-// unchanged. isExcluded compares against a wd-relative file name, so mixing
-// absolute and relative paths in filepath.Rel/filepath.Match would silently
-// fail; this normalisation step keeps both forms compatible.
+// wd-relative path and runs filepath.Clean on every entry so isExcluded can
+// hand the result straight to filepath.Match. isExcluded compares against a
+// wd-relative file name, so mixing absolute and relative paths in
+// filepath.Rel/filepath.Match would silently fail; this normalisation step
+// keeps both forms compatible. Cleaning also strips trailing separators
+// ("vendor/" → "vendor") that filepath.Match does not handle on its own.
 //
-// When no entry is absolute (the common case), the input slice is returned
-// unchanged — no allocation. Callers must therefore not mutate the result;
-// they only read from it. When at least one entry is absolute, a fresh slice
-// is returned and the input is left untouched.
+// When no entry needs normalising (the common case), the input slice is
+// returned unchanged — no allocation. Callers must therefore not mutate the
+// result; they only read from it. When at least one entry is absolute or
+// non-canonical, a fresh slice is returned and the input is left untouched.
 //
 // Errors from filepath.Rel are wrapped with the offending path and the
 // working directory so users can diagnose cross-volume mismatches (Windows)
 // or working-directory mismatches without inspecting the underlying error.
 func normalizeExcludePaths(wd string, paths []string) ([]string, error) {
-	if !slices.ContainsFunc(paths, filepath.IsAbs) {
+	needsNorm := slices.ContainsFunc(paths, func(p string) bool {
+		return filepath.IsAbs(p) || filepath.Clean(p) != p
+	})
+	if !needsNorm {
 		return paths, nil
 	}
 	out := make([]string, len(paths))
 	for i, p := range paths {
 		if !filepath.IsAbs(p) {
-			out[i] = p
+			out[i] = filepath.Clean(p)
 			continue
 		}
 		rel, err := filepath.Rel(wd, p)
@@ -995,8 +1000,12 @@ func normalizeExcludePaths(wd string, paths []string) ([]string, error) {
 }
 
 // isExcluded reports whether fn is excluded by the given excludeDirs or
-// excludeFiles patterns relative to wd. Errors interpreting paths are logged
-// to stderr and the file is treated as excluded so the analyzer does not
+// excludeFiles patterns relative to wd. Both flag sets use filepath.Match
+// semantics: excludeDirs is tested against every ancestor of the file's
+// directory, so "vendor" matches "vendor/**" (because the "vendor" ancestor
+// matches the literal pattern) and "a/*/c" matches "a/b/c/file.go" via glob
+// expansion on the ancestor "a/b/c". Errors interpreting paths are logged to
+// stderr and the file is treated as excluded so the analyzer does not
 // silently emit diagnostics it cannot ground.
 func isExcluded(wd, fn string, excludeDirs, excludeFiles []string) bool {
 	relfn, err := filepath.Rel(wd, fn)
@@ -1004,15 +1013,25 @@ func isExcluded(wd, fn string, excludeDirs, excludeFiles []string) bool {
 		fmt.Fprintf(os.Stderr, "%v %s: %v\n", ErrPreFilterFiles, fn, err)
 		return true
 	}
-	dir := filepath.Dir(relfn)
-	for _, excludeDir := range excludeDirs {
-		rel, err := filepath.Rel(excludeDir, dir)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "%v %s: %v\n", ErrPreFilterFiles, fn, err)
-			return true
-		}
-		if !strings.HasPrefix(rel, "..") {
-			return true
+	if len(excludeDirs) > 0 {
+		ancestor := filepath.Dir(relfn)
+		for {
+			for _, excludeDir := range excludeDirs {
+				// filepath.Match doesn't clean; covers callers that skip normalizeExcludePaths.
+				match, err := filepath.Match(filepath.Clean(excludeDir), ancestor)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "%v %s: %v\n", ErrPreFilterFiles, fn, err)
+					return true
+				}
+				if match {
+					return true
+				}
+			}
+			parent := filepath.Dir(ancestor)
+			if parent == ancestor {
+				break
+			}
+			ancestor = parent
 		}
 	}
 	for _, excludeFile := range excludeFiles {

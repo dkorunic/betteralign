@@ -171,6 +171,15 @@ func TestFlagExcludeDirs(t *testing.T) {
 		_ = analyzer.Flags.Set("exclude_dirs", filepath.Join(wd, "testdata", "src", "exclude", "a", "a"))
 		analysistest.Run(t, testdata, analyzer, "exclude/a/...")
 	})
+
+	// Regression for #34: glob patterns were silently ignored.
+	t.Run("exclude a via glob pattern", func(t *testing.T) {
+		testdata := analysistest.TestData()
+		analyzer := NewTestAnalyzer()
+		_ = analyzer.Flags.Set("apply", "false")
+		_ = analyzer.Flags.Set("exclude_dirs", "testdata/src/exclude/*/a")
+		analysistest.Run(t, testdata, analyzer, "exclude/a/...")
+	})
 }
 
 func TestFlagExcludeFiles(t *testing.T) {
