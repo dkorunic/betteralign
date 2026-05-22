@@ -99,6 +99,18 @@ geomean                           38.30           38.30       +0.00%            
 
 v0.8.0 brought a modest 12% speedup on small structs with no allocation change. v0.11.0 refactored `optimalOrder` to return an index permutation (`[]int`) instead of reconstructing a full `*types.Struct`, cutting allocations from O(n) down to a single allocation regardless of struct size — a ~66% speedup and ~94% memory reduction across all struct sizes.
 
+### Decision-path benchmark (v0.11.0)
+
+Three scenarios measured on a 20-field struct, collected with `go test -bench=^BenchmarkDecisionPath -benchmem -count=10`. All paths allocate identically (1 alloc, 160 B — the `[]int` permutation), so only time is shown.
+
+| Benchmark                          | sec/op      | Description                                                           |
+| ---------------------------------- | ----------- | --------------------------------------------------------------------- |
+| `DecisionPath_Optimal_NoFastPath`  | 2.173µ ± 1% | `optimalOrder` + `Sizeof` + `ptrdata` walk, no identity check         |
+| `DecisionPath_Optimal_FastPath`    | 1.113µ ± 0% | identity check fires → `Sizeof`/`ptrdata` skipped (**−49%**)          |
+| `DecisionPath_Suboptimal_FastPath` | 2.627µ ± 0% | identity check misses → full walk proceeds (**+21% vs no-fast-path**) |
+
+When a struct is already optimally ordered the fast path saves ~1.06µs per call by skipping the `Sizeof` and `ptrdata` tree walks entirely. Suboptimal structs pay a small overhead (~454 ns) for the `isIdentityOrder` scan before the full walk runs. The optimisation is a net win on any codebase where a significant fraction of structs are already well-aligned.
+
 ## Installation
 
 **Manual:** Download the appropriate binary from [the releases page](https://github.com/dkorunic/betteralign/releases) and place it in your `PATH`, typically `/usr/local/bin/betteralign`.
