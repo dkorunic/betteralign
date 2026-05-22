@@ -64,6 +64,41 @@ type IPAddr struct {
 
 `Zone` comes first because `string` has fewer trailing non-pointer bytes than `[]byte`: `Sizeof(string) - ptrdata(string) = 8` versus `Sizeof([]byte) - ptrdata([]byte) = 16`.
 
+## Performance
+
+Benchmarks compare the core `optimalOrder` field-sorting function across three releases. Each benchmark exercises the function with structs of 5 (Small), 20 (Medium), and 100 (Large) fields using alternating types of varying alignment. Results were collected with `go test -bench=^BenchmarkOptimalOrder -benchmem -count=10` and compared with `benchstat`.
+
+Environment: Apple M1 Ultra, darwin/arm64, Go 1.26.3.
+
+```
+goos: darwin
+goarch: arm64
+pkg: github.com/dkorunic/betteralign
+cpu: Apple M1 Ultra
+                       │    v0.6.0     │               v0.8.0                │               v0.11.0               │
+                       │    sec/op     │    sec/op     vs base                │   sec/op     vs base                │
+OptimalOrder_Small-20           755.4n ± 11%    662.8n ± 0%  -12.26% (p=0.000 n=10)   253.2n ± 5%  -66.47% (p=0.000 n=10)
+OptimalOrder_Medium-20          3.575µ ±  1%    3.566µ ± 0%        ~ (p=0.159 n=10)   1.204µ ± 4%  -66.33% (p=0.000 n=10)
+OptimalOrder_Large-20          21.111µ ±  0%   21.088µ ± 0%   -0.11% (p=0.050 n=10)   7.673µ ± 3%  -63.65% (p=0.000 n=10)
+geomean                          3.848µ          3.680µ        -4.38%                  1.327µ       -65.51%
+
+                       │    v0.6.0     │               v0.8.0                │               v0.11.0              │
+                       │     B/op      │     B/op      vs base               │    B/op     vs base                │
+OptimalOrder_Small-20            764.0 ± 0%      764.0 ± 0%       ~ (p=1.000 n=10)    48.0 ± 0%  -93.72% (p=0.000 n=10)
+OptimalOrder_Medium-20           3360.0 ± 0%    3360.0 ± 0%       ~ (p=1.000 n=10)   160.0 ± 0%  -95.24% (p=0.000 n=10)
+OptimalOrder_Large-20           15056.0 ± 0%   15056.0 ± 0%       ~ (p=1.000 n=10)   896.0 ± 0%  -94.05% (p=0.000 n=10)
+geomean                          3.302Ki         3.302Ki       +0.00%                  190.2      -94.37%
+
+                       │    v0.6.0     │               v0.8.0                │               v0.11.0              │
+                       │  allocs/op   │  allocs/op    vs base               │ allocs/op   vs base                │
+OptimalOrder_Small-20            14.0 ± 0%       14.0 ± 0%       ~ (p=1.000 n=10)     1.0 ± 0%  -92.86% (p=0.000 n=10)
+OptimalOrder_Medium-20           34.0 ± 0%       34.0 ± 0%       ~ (p=1.000 n=10)     1.0 ± 0%  -97.06% (p=0.000 n=10)
+OptimalOrder_Large-20           118.0 ± 0%      118.0 ± 0%       ~ (p=1.000 n=10)     1.0 ± 0%  -99.15% (p=0.000 n=10)
+geomean                           38.30           38.30       +0.00%                   1.000      -97.39%
+```
+
+v0.8.0 brought a modest 12% speedup on small structs with no allocation change. v0.11.0 refactored `optimalOrder` to return an index permutation (`[]int`) instead of reconstructing a full `*types.Struct`, cutting allocations from O(n) down to a single allocation regardless of struct size — a ~66% speedup and ~94% memory reduction across all struct sizes.
+
 ## Installation
 
 **Manual:** Download the appropriate binary from [the releases page](https://github.com/dkorunic/betteralign/releases) and place it in your `PATH`, typically `/usr/local/bin/betteralign`.
