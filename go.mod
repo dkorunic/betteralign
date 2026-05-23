@@ -5,7 +5,6 @@ go 1.26
 require (
 	github.com/KimMachineGun/automemlimit v0.7.5
 	github.com/google/renameio/v2 v2.0.2
-	github.com/sirkon/dst v0.26.4
 	go.uber.org/automaxprocs v1.6.0
 	golang.org/x/tools v0.45.0
 	gotest.tools/v3 v3.5.2

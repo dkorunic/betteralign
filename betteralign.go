@@ -44,9 +44,8 @@ import (
 	"strings"
 	"sync"
 
+	dst "github.com/dkorunic/betteralign/internal/dstmin"
 	"github.com/google/renameio/v2/maybe"
-	"github.com/sirkon/dst"
-	"github.com/sirkon/dst/decorator"
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/inspect"
 	"golang.org/x/tools/go/ast/inspector"
@@ -219,7 +218,7 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 	positionalUsers := collectPositionalUsers(inspect, pass)
 
 	// Lazy: nil until the first misaligned struct.
-	var dec *decorator.Decorator
+	var dec *dst.Decorator
 
 	dirtyFiles := make(map[string]*dst.File)
 	decoratedFiles := make(map[string]*dst.File)
@@ -349,7 +348,7 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 			return
 		}
 		if dec == nil {
-			dec = decorator.NewDecorator(pass.Fset)
+			dec = dst.NewDecorator(pass.Fset)
 		}
 		dFile, ok := decoratedFiles[currentFn]
 		if !ok {
@@ -445,7 +444,7 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 		for _, fn := range fns {
 			buf.Reset()
 			df := dirtyFiles[fn]
-			if err := decorator.Fprint(&buf, df); err != nil {
+			if err := dst.Fprint(&buf, df); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to print %s: %v\n", fn, err)
 				continue
 			}

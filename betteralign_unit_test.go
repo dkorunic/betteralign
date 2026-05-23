@@ -13,7 +13,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/sirkon/dst"
+	dst "github.com/dkorunic/betteralign/internal/dstmin"
 	"golang.org/x/tools/go/analysis"
 )
 
