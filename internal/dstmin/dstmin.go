@@ -413,10 +413,7 @@ func (df *File) consumeBlankLines(off, limit int) int {
 	for off < limit {
 		lineEnd := df.lineEndOffset(off)
 		blank := true
-		end := lineEnd - 1
-		if end > limit {
-			end = limit
-		}
+		end := min(lineEnd-1, limit)
 		for j := off; j < end; j++ {
 			if df.source[j] != '\t' && df.source[j] != ' ' {
 				blank = false
