@@ -1,5 +1,6 @@
 // Copyright (c) 2026 Dinko Korunic <dinko.korunic@gmail.com>
 //
+// SPDX-FileCopyrightText: Copyright (c) 2026 Dinko Korunic <dinko.korunic@gmail.com>
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package dstmin is an internal replacement for the betteralign-relevant

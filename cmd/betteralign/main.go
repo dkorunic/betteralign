@@ -3,6 +3,10 @@
 // license that can be found in the LICENSE file.
 //
 // Forked and modified by Dinko Korunic, 2022
+//
+// SPDX-FileCopyrightText: Copyright 2021 The Go Authors
+// SPDX-FileCopyrightText: Copyright 2022 Dinko Korunic <dinko.korunic@gmail.com>
+// SPDX-License-Identifier: BSD-3-Clause
 
 package main
 
