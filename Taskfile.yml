@@ -33,6 +33,13 @@ tasks:
       - go get -u ./cmd/betteralign
       - go mod tidy
 
+  update-plugin:
+    dir: vscode-betteralign
+    cmds:
+      - npx npm-check-updates -u --peer
+      - npm install
+      - npm audit fix
+
   check:
     cmds:
       - gomajor list

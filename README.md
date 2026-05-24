@@ -66,36 +66,36 @@ type IPAddr struct {
 
 ## Performance
 
-Benchmarks compare the core `optimalOrder` field-sorting function across three releases. Each benchmark exercises the function with structs of 5 (Small), 20 (Medium), and 100 (Large) fields using alternating types of varying alignment. Results were collected with `go test -bench=^BenchmarkOptimalOrder -benchmem -count=10` and compared with `benchstat`.
+Benchmarks compare the core `optimalOrder` field-sorting function across three releases. Each benchmark exercises the function with structs of 5 (Small), 20 (Medium), and 100 (Large) fields using alternating types of varying alignment.
 
-Environment: Apple M1 Ultra, darwin/arm64, Go 1.26.3.
+Environment: Apple M1 Ultra, darwin/arm64, Go 1.26.3. Collected with `go test -bench=^BenchmarkOptimalOrder -benchmem -count=10`, compared with `benchstat` (`n=10`; all non-`~` deltas significant at `p=0.000`).
 
-```
-goos: darwin
-goarch: arm64
-pkg: github.com/dkorunic/betteralign
-cpu: Apple M1 Ultra
-                       │    v0.6.0     │               v0.8.0                │               v0.11.0               │
-                       │    sec/op     │    sec/op     vs base                │   sec/op     vs base                │
-OptimalOrder_Small-20           755.4n ± 11%    662.8n ± 0%  -12.26% (p=0.000 n=10)   253.2n ± 5%  -66.47% (p=0.000 n=10)
-OptimalOrder_Medium-20          3.575µ ±  1%    3.566µ ± 0%        ~ (p=0.159 n=10)   1.204µ ± 4%  -66.33% (p=0.000 n=10)
-OptimalOrder_Large-20          21.111µ ±  0%   21.088µ ± 0%   -0.11% (p=0.050 n=10)   7.673µ ± 3%  -63.65% (p=0.000 n=10)
-geomean                          3.848µ          3.680µ        -4.38%                  1.327µ       -65.51%
+**sec/op**
 
-                       │    v0.6.0     │               v0.8.0                │               v0.11.0              │
-                       │     B/op      │     B/op      vs base               │    B/op     vs base                │
-OptimalOrder_Small-20            764.0 ± 0%      764.0 ± 0%       ~ (p=1.000 n=10)    48.0 ± 0%  -93.72% (p=0.000 n=10)
-OptimalOrder_Medium-20           3360.0 ± 0%    3360.0 ± 0%       ~ (p=1.000 n=10)   160.0 ± 0%  -95.24% (p=0.000 n=10)
-OptimalOrder_Large-20           15056.0 ± 0%   15056.0 ± 0%       ~ (p=1.000 n=10)   896.0 ± 0%  -94.05% (p=0.000 n=10)
-geomean                          3.302Ki         3.302Ki       +0.00%                  190.2      -94.37%
+| Benchmark | v0.6.0 | v0.8.0 | Δ v0.8 | v0.11.0 | Δ v0.11 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `OptimalOrder_Small` | 755.4 ns ± 11% | 662.8 ns ± 0% | −12.26% | 253.2 ns ± 5% | **−66.47%** |
+| `OptimalOrder_Medium` | 3.575 µs ± 1% | 3.566 µs ± 0% | ~ | 1.204 µs ± 4% | **−66.33%** |
+| `OptimalOrder_Large` | 21.111 µs ± 0% | 21.088 µs ± 0% | −0.11% | 7.673 µs ± 3% | **−63.65%** |
+| geomean | 3.848 µs | 3.680 µs | −4.38% | 1.327 µs | **−65.51%** |
 
-                       │    v0.6.0     │               v0.8.0                │               v0.11.0              │
-                       │  allocs/op   │  allocs/op    vs base               │ allocs/op   vs base                │
-OptimalOrder_Small-20            14.0 ± 0%       14.0 ± 0%       ~ (p=1.000 n=10)     1.0 ± 0%  -92.86% (p=0.000 n=10)
-OptimalOrder_Medium-20           34.0 ± 0%       34.0 ± 0%       ~ (p=1.000 n=10)     1.0 ± 0%  -97.06% (p=0.000 n=10)
-OptimalOrder_Large-20           118.0 ± 0%      118.0 ± 0%       ~ (p=1.000 n=10)     1.0 ± 0%  -99.15% (p=0.000 n=10)
-geomean                           38.30           38.30       +0.00%                   1.000      -97.39%
-```
+**B/op**
+
+| Benchmark | v0.6.0 | v0.8.0 | Δ v0.8 | v0.11.0 | Δ v0.11 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `OptimalOrder_Small` | 764 B | 764 B | ~ | 48 B | **−93.72%** |
+| `OptimalOrder_Medium` | 3,360 B | 3,360 B | ~ | 160 B | **−95.24%** |
+| `OptimalOrder_Large` | 15,056 B | 15,056 B | ~ | 896 B | **−94.05%** |
+| geomean | 3.302 KiB | 3.302 KiB | +0.00% | 190.2 B | **−94.37%** |
+
+**allocs/op**
+
+| Benchmark | v0.6.0 | v0.8.0 | Δ v0.8 | v0.11.0 | Δ v0.11 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `OptimalOrder_Small` | 14 | 14 | ~ | 1 | **−92.86%** |
+| `OptimalOrder_Medium` | 34 | 34 | ~ | 1 | **−97.06%** |
+| `OptimalOrder_Large` | 118 | 118 | ~ | 1 | **−99.15%** |
+| geomean | 38.30 | 38.30 | +0.00% | 1.000 | **−97.39%** |
 
 v0.8.0 brought a modest 12% speedup on small structs with no allocation change. v0.11.0 refactored `optimalOrder` to return an index permutation (`[]int`) instead of reconstructing a full `*types.Struct`, cutting allocations from O(n) down to a single allocation regardless of struct size — a ~66% speedup and ~94% memory reduction across all struct sizes.
 
@@ -103,11 +103,11 @@ v0.8.0 brought a modest 12% speedup on small structs with no allocation change. 
 
 Three scenarios measured on a 20-field struct, collected with `go test -bench=^BenchmarkDecisionPath -benchmem -count=10`. All paths allocate identically (1 alloc, 160 B — the `[]int` permutation), so only time is shown.
 
-| Benchmark                          | sec/op      | Description                                                           |
-| ---------------------------------- | ----------- | --------------------------------------------------------------------- |
-| `DecisionPath_Optimal_NoFastPath`  | 2.173µ ± 1% | `optimalOrder` + `Sizeof` + `ptrdata` walk, no identity check         |
-| `DecisionPath_Optimal_FastPath`    | 1.113µ ± 0% | identity check fires → `Sizeof`/`ptrdata` skipped (**−49%**)          |
-| `DecisionPath_Suboptimal_FastPath` | 2.627µ ± 0% | identity check misses → full walk proceeds (**+21% vs no-fast-path**) |
+| Benchmark | sec/op | Description |
+| --- | ---: | --- |
+| `DecisionPath_Optimal_NoFastPath` | 2.173 µs ± 1% | `optimalOrder` + `Sizeof` + `ptrdata` walk, no identity check |
+| `DecisionPath_Optimal_FastPath` | 1.113 µs ± 0% | identity check fires → `Sizeof`/`ptrdata` skipped (**−49%**) |
+| `DecisionPath_Suboptimal_FastPath` | 2.627 µs ± 0% | identity check misses → full walk proceeds (**+21% vs no-fast-path**) |
 
 When a struct is already optimally ordered the fast path saves ~1.06µs per call by skipping the `Sizeof` and `ptrdata` tree walks entirely. Suboptimal structs pay a small overhead (~454 ns) for the `isIdentityOrder` scan before the full walk runs. The optimisation is a net win on any codebase where a significant fraction of structs are already well-aligned.
 
