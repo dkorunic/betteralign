@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Dinko Korunic <dinko.korunic@gmail.com>
+//
+// SPDX-License-Identifier: BSD-3-Clause
+
 // Package dstmin is an internal replacement for the betteralign-relevant
 // subset of github.com/sirkon/dst and github.com/sirkon/dst/decorator. It
 // supports exactly one mutation — reordering the field list of an
