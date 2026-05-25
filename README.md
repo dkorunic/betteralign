@@ -44,7 +44,7 @@ This tool builds upon the following prior work:
 
 `betteralign` pursues two goals:
 
-1. Minimize struct size by sorting fields in **descending alignment order**, reducing internal padding between fields.
+1. Minimize struct size by sorting fields in **descending alignment order** and placing zero-sized fields first, reducing internal padding (and avoiding the one-byte tail the runtime adds when a struct ends in a zero-sized field).
 2. Reduce **GC pointer scan overhead** by grouping pointer-bearing fields before pointer-free ones ([the GC stops scanning at the last pointer in a value](https://go.dev/doc/gc-guide)).
 
 With those goals in mind, fields are sorted stably by the following criteria, in order:
@@ -55,18 +55,30 @@ With those goals in mind, fields are sorted stably by the following criteria, in
 4. Among pointer-bearing types, those with **fewer trailing non-pointer bytes** first (minimizing GC `ptrdata`).
 5. **Larger size** first.
 
-Consider the following example:
+### Size: sorting by descending alignment
 
 ```go
-package foo
+type Record struct {
+	Flag  bool  // 1 byte,  1-byte aligned
+	ID    int64 // 8 bytes, 8-byte aligned
+	Count int32 // 4 bytes, 4-byte aligned
+}
+```
 
+As declared, `Record` is **24 bytes** on a 64-bit platform: `Flag` sits at offset 0, then 7 padding bytes appear so `ID` can land on an 8-byte boundary; `Count` follows at offset 16, and the struct is rounded up to the next multiple of its highest alignment (8), adding 4 trailing padding bytes.
+
+After `optimalOrder` sorts by descending alignment, the layout becomes `ID, Count, Flag` and shrinks to **16 bytes**: `ID` at offset 0, `Count` at offset 8, `Flag` at offset 12, plus 3 trailing padding bytes to round to 16. No internal padding is needed because each field already lands on a correctly-aligned offset. Same data, 33% less memory.
+
+### GC scan: ordering pointer-bearing fields by trailing non-pointer bytes
+
+```go
 type IPAddr struct {
 	Zone string // 16 bytes, 8-byte aligned
 	IP   []byte // 24 bytes, 8-byte aligned
 }
 ```
 
-`Zone` comes first because `string` has fewer trailing non-pointer bytes than `[]byte`: `Sizeof(string) - ptrdata(string) = 8` versus `Sizeof([]byte) - ptrdata([]byte) = 16`.
+`Zone` comes first because `string` has fewer trailing non-pointer bytes than `[]byte`: `Sizeof(string) - ptrdata(string) = 8` versus `Sizeof([]byte) - ptrdata([]byte) = 16`. The struct is 40 bytes either way on a 64-bit platform, but with `Zone` first the GC only scans the first 24 bytes for pointers; reversing the fields would push that to 32.
 
 ## Performance
 
