@@ -38,18 +38,19 @@ caller diff to two import lines and two call-site renames.
 
 ## Testing
 
-- 25 unit tests covering decoration corner cases (nested structs,
-  rejected layouts, comment classification, lead/trail attachment) and a
-  table-driven `TestFprint` exercising 9 scenarios from identity to
-  multi-blank-line reorder.
+- 12 decoration-level test functions covering corner cases (nested
+  structs, rejected layouts, comment classification, lead/trail
+  attachment), a table-driven `TestFprint` with 9 scenarios from
+  identity to multi-blank-line reorder, and a separate regression for
+  the form-feed-in-import-path gofmt corruption case.
 - Go-native fuzz targets `FuzzDecorateFileIdentity` and
   `FuzzDecorateFileReorder` seeded with hand-crafted edge cases and
   every `.go` / `.go.golden` file from the project's testdata.
 - One regression seed committed under
   `testdata/fuzz/FuzzDecorateFileReorder/400aebff9b202cec` for the
   form-feed-in-import gofmt-corruption case the fuzzer found early on.
-- 12 hours of fuzzing on the final code (6 h identity, 6 h reorder,
-  ~621M execs combined) produced zero new failures.
+- 24 hours of fuzzing on the final code (12 h identity, 12 h reorder,
+  ~1.27 billion execs combined) produced zero new failures.
 
 ## Performance vs `github.com/sirkon/dst`
 
@@ -63,10 +64,10 @@ outside the timer. Benchstat with `n=10`; all deltas significant at
 
 | Operation | `sirkon/dst` | `internal/dstmin` | Δ wall-clock | Δ B/op | Δ allocs/op |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `DecorateFile` | 54.94 µs | 8.46 µs | **−84.60%** (6.5×) | −72.66% | −88.93% |
-| `FprintIdentity` (clean-file pass-through) | 27.95 µs | 25.59 ns | **−99.91%** (~1100×) | −100% | −100% |
-| `DecorateReorderPrint` (decorate + swap two fields + print) | 93.71 µs | 56.08 µs | **−40.15%** (1.67×) | −44.80% | −29.93% |
-| geomean | 52.40 µs | 2.30 µs | **−95.61%** | | |
+| `DecorateFile` | 55.05 µs | 8.91 µs | **−83.81%** (6.2×) | −71.91% | −88.93% |
+| `FprintIdentity` (clean-file pass-through) | 27.73 µs | 24.66 ns | **−99.91%** (~1100×) | −100% | −100% |
+| `DecorateReorderPrint` (decorate + swap two fields + print) | 93.53 µs | 56.91 µs | **−39.15%** (1.64×) | −44.31% | −29.93% |
+| geomean | 52.27 µs | 2.32 µs | **−95.56%** | | |
 
 ### Macro benchmark (end-to-end `betteralign -apply ./...`)
 
@@ -78,9 +79,9 @@ runs per binary, alternating, fresh corpus copied for every run.
 
 | Implementation | Wall-clock mean | Min | Max | User CPU mean |
 | --- | ---: | ---: | ---: | ---: |
-| `sirkon/dst` (main) | 811.9 ± 138.2 ms | 648.8 ms | 1313.8 ms | 236.9 ms |
-| `internal/dstmin` (HEAD) | **665.6 ± 59.3 ms** | 559.9 ms | 759.3 ms | **110.5 ms** |
-| ratio | **1.22× faster** | | | **2.14× less CPU** |
+| `sirkon/dst` (pre-migration) | 782.3 ± 127.0 ms | 584.0 ms | 1124.7 ms | 240.4 ms |
+| `internal/dstmin` (HEAD) | **698.0 ± 70.0 ms** | 582.6 ms | 894.3 ms | **105.2 ms** |
+| ratio | **1.12× faster** | | | **2.29× less CPU** |
 
 Both binaries produce **byte-identical output** on the corpus (verified
 with `diff -r` between the two reordered trees).
@@ -89,14 +90,14 @@ with `diff -r` between the two reordered trees).
 
 | Implementation | Stripped binary | Δ |
 | --- | ---: | ---: |
-| `sirkon/dst` (main) | 7,696,546 B (7.34 MB) | — |
-| `internal/dstmin` (HEAD) | **7,266,466 B (6.93 MB)** | **−5.6%** |
+| `sirkon/dst` (pre-migration) | 7,696,546 B (7.34 MB) | — |
+| `internal/dstmin` (HEAD) | **7,270,562 B (6.93 MB)** | **−5.5%** |
 
 ### Dependency footprint
 
 | Implementation | Direct deps in `go.mod` |
 | --- | ---: |
-| `sirkon/dst` (main) | 6 |
+| `sirkon/dst` (pre-migration) | 6 |
 | `internal/dstmin` (HEAD) | **5** (no `sirkon/dst`) |
 
 ## Why dstmin wins
@@ -109,7 +110,7 @@ with `diff -r` between the two reordered trees).
   no-op. For betteralign's typical workload (analyze many files,
   mutate few) this dominates the wall-clock savings.
 
-- **Decoration is 6.5× cheaper.** `sirkon/dst` materialises one fragment
+- **Decoration is 6.2× cheaper.** `sirkon/dst` materialises one fragment
   object (`commentFragment`, `newlineFragment`, `tokenFragment`, ...) for
   every comment and token in the file, sorts them by position, then walks
   the result. dstmin walks the AST once and records byte offsets — 28
@@ -122,14 +123,14 @@ with `diff -r` between the two reordered trees).
   reprints the whole file through `go/printer`.
 
 - **The macro speedup is muted by I/O.** The end-to-end analyzer wall-clock
-  improvement (~22%) is smaller than the per-operation improvement because
+  improvement (~12%) is smaller than the per-operation improvement because
   process startup, AST parsing, type-checking, and atomic file writes are
   shared between the implementations. The User CPU time is a cleaner
-  signal (2.14× less) — that is where dstmin pays back.
+  signal (2.29× less) — that is where dstmin pays back.
 
 - **Allocation pressure is much lower, so GC pauses are rarer.** In the
-  macro run, `sirkon/dst`'s upper tail reached 1.31s (1.6× its own mean)
-  while dstmin's max was 759 ms (1.14× its mean). The tight dstmin
+  macro run, `sirkon/dst`'s upper tail reached 1.12 s (1.44× its own mean)
+  while dstmin's max was 894 ms (1.28× its mean). The tight dstmin
   distribution is consistent with fewer transient allocations and less
   GC work during the per-file pipeline.
 
