@@ -136,6 +136,42 @@ func TestDecorateFile_LeadDocAttachedToField(t *testing.T) {
 	}
 }
 
+func TestDecorateFile_MultiLineLeadDoc(t *testing.T) {
+	src := "package p\n\ntype S struct {\n\t// line one\n\t// line two\n\ta int\n\tb int\n}\n"
+	fset, f, _ := parseSource(t, src)
+	dec := NewDecorator(fset)
+	df, err := dec.DecorateFile(f)
+	if err != nil {
+		t.Fatalf("DecorateFile: %v", err)
+	}
+	st := df.structs[0]
+	got := st.Fields.List[0].lead.All()
+	want := []string{"// line one", "// line two"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("field a lead = %q, want %q", got, want)
+	}
+	if l := st.Fields.List[1].lead.All(); len(l) != 0 {
+		t.Errorf("field b lead = %q, want empty", l)
+	}
+}
+
+func TestDecorateFile_BlockCommentLeadDoc(t *testing.T) {
+	src := "package p\n\ntype S struct {\n\t/* lead */\n\ta int\n\tb int\n}\n"
+	fset, f, _ := parseSource(t, src)
+	dec := NewDecorator(fset)
+	df, err := dec.DecorateFile(f)
+	if err != nil {
+		t.Fatalf("DecorateFile: %v", err)
+	}
+	st := df.structs[0]
+	if got := st.Fields.List[0].lead.All(); len(got) != 1 || got[0] != "/* lead */" {
+		t.Errorf("field a lead = %q, want [%q]", got, "/* lead */")
+	}
+	if l := st.Fields.List[1].lead.All(); len(l) != 0 {
+		t.Errorf("field b lead = %q, want empty", l)
+	}
+}
+
 func TestDecorateFile_TrailingLineCommentInField(t *testing.T) {
 	src := "package p\n\ntype S struct {\n\ta int // trailing a\n\tb int\n}\n"
 	fset, f, _ := parseSource(t, src)
@@ -217,6 +253,28 @@ func TestDecorateFile_NestedStructCommentNotCapturedByOuter(t *testing.T) {
 	}
 	if got := inner.Fields.List[0].lead.All(); len(got) != 1 || got[0] != "// lead for a" {
 		t.Errorf("inner.a.lead = %q, want [%q]", got, "// lead for a")
+	}
+}
+
+func TestDecorateFile_CommentBetweenIdentifierAndType(t *testing.T) {
+	// Unnamed position in upstream dst; dstmin survives via byte-splicing.
+	src := "package p\n\ntype S struct {\n\ta /*c*/ int\n\tb int\n}\n"
+	fset, f, _ := parseSource(t, src)
+	dec := NewDecorator(fset)
+	df, err := dec.DecorateFile(f)
+	if err != nil {
+		t.Fatalf("DecorateFile: %v", err)
+	}
+	st := df.structs[0]
+	aBody := string(df.source[st.Fields.List[0].bodyStart:st.Fields.List[0].bodyEnd])
+	if aBody != "\ta /*c*/ int\n" {
+		t.Errorf("field a body = %q, want %q (inline comment must be inside body span)", aBody, "\ta /*c*/ int\n")
+	}
+	if got := st.Fields.List[0].lead.All(); len(got) != 0 {
+		t.Errorf("field a lead = %q, want empty (inline comment, not lead-doc)", got)
+	}
+	if got := st.Fields.Decs.Opening.All(); len(got) != 0 {
+		t.Errorf("Opening = %q, want empty", got)
 	}
 }
 
@@ -348,6 +406,35 @@ func TestFprint(t *testing.T) {
 				st.Fields.List = []*Field{st.Fields.List[1], st.Fields.List[0], st.Fields.List[2]}
 			},
 			want: "package p\n\ntype S struct { // want \"struct of size 12 could be 8\"\n\ty int32\n\tx byte\n\tz byte\n}\n",
+		},
+		{
+			name: "struct tags survive reorder",
+			code: "package p\n\ntype S struct {\n\tX byte  `json:\"x\"`\n\tY int32 `json:\"y\"`\n}\n",
+			mutate: func(df *File) {
+				st := df.structs[0]
+				st.Fields.List[0], st.Fields.List[1] = st.Fields.List[1], st.Fields.List[0]
+			},
+			want: "package p\n\ntype S struct {\n\tY int32 `json:\"y\"`\n\tX byte  `json:\"x\"`\n}\n",
+		},
+		{
+			// Multi-name group is one *Field; swap must keep names together.
+			name: "multi-name field stays grouped under reorder",
+			code: "package p\n\ntype S struct {\n\tA, B int\n\tc    string\n}\n",
+			mutate: func(df *File) {
+				st := df.structs[0]
+				st.Fields.List[0], st.Fields.List[1] = st.Fields.List[1], st.Fields.List[0]
+			},
+			want: "package p\n\ntype S struct {\n\tc    string\n\tA, B int\n}\n",
+		},
+		{
+			// Embedded field has empty Names; spans only the type identifier.
+			name: "embedded field survives reorder",
+			code: "package p\n\ntype T int\n\ntype S struct {\n\tT\n\ta int\n}\n",
+			mutate: func(df *File) {
+				st := df.structs[0]
+				st.Fields.List[0], st.Fields.List[1] = st.Fields.List[1], st.Fields.List[0]
+			},
+			want: "package p\n\ntype T int\n\ntype S struct {\n\ta int\n\tT\n}\n",
 		},
 		{
 			name: "preserves lead and trailing line comment",

@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"errors"
 	"go/parser"
+	"go/scanner"
 	"go/token"
 	"io/fs"
 	"os"
@@ -124,6 +125,17 @@ func FuzzDecorateFileReorder(f *testing.F) {
 		if target == nil {
 			t.Skip("no struct with >=2 fields")
 		}
+
+		// Capture pre-mutation field bytes; each must survive in the reordered output.
+		origFields := make([]string, len(target.Fields.List))
+		for i, fld := range target.Fields.List {
+			body := string(df.source[fld.bodyStart:fld.bodyEnd])
+			if fld.trailEnd > fld.trailStart {
+				body += string(df.source[fld.trailStart:fld.trailEnd])
+			}
+			origFields[i] = body
+		}
+
 		target.Fields.List[0], target.Fields.List[1] = target.Fields.List[1], target.Fields.List[0]
 
 		var buf bytes.Buffer
@@ -138,5 +150,59 @@ func FuzzDecorateFileReorder(f *testing.F) {
 		if _, err := parser.ParseFile(token.NewFileSet(), "out.go", buf.Bytes(), parser.ParseComments|parser.SkipObjectResolution); err != nil {
 			t.Errorf("reorder produced invalid Go:\n=== OUTPUT ===\n%s\n=== PARSE ERROR ===\n%v\n=== INPUT ===\n%s", buf.String(), err, src)
 		}
+		// Token-level match tolerates gofmt whitespace normalizations.
+		outToks := goTokens(buf.Bytes())
+		for i, body := range origFields {
+			needle := goTokens([]byte(body))
+			if len(needle) == 0 {
+				continue
+			}
+			if !containsTokenSeq(outToks, needle) {
+				t.Errorf("field %d token sequence missing from reordered output\nNEEDLE: %v\nOUTPUT:\n%s\nINPUT:\n%s", i, needle, buf.String(), src)
+			}
+		}
 	})
+}
+
+// goTokens tokenizes src, skipping comments and semicolons (gofmt rewrites
+// both independently of dstmin).
+func goTokens(src []byte) []string {
+	var s scanner.Scanner
+	fset := token.NewFileSet()
+	file := fset.AddFile("", -1, len(src))
+	s.Init(file, src, nil, 0) // don't ScanComments
+	var toks []string
+	for {
+		_, tok, lit := s.Scan()
+		if tok == token.EOF {
+			return toks
+		}
+		if tok == token.SEMICOLON {
+			continue
+		}
+		if lit != "" {
+			toks = append(toks, lit)
+			continue
+		}
+		toks = append(toks, tok.String())
+	}
+}
+
+func containsTokenSeq(hay, needle []string) bool {
+	if len(needle) > len(hay) {
+		return false
+	}
+	for i := 0; i <= len(hay)-len(needle); i++ {
+		match := true
+		for j, n := range needle {
+			if hay[i+j] != n {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
 }
