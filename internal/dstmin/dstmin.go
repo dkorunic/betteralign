@@ -27,14 +27,13 @@ import (
 	"os"
 )
 
-// Sentinel errors; wrapped with fmt.Errorf and classified via errors.Is.
+// Sentinel errors classified via errors.Is.
 var (
 	ErrSourceRead = errors.New("dstmin: unable to read source")
 	ErrFormat     = errors.New("dstmin: formatted output rejected by gofmt")
 )
 
-// Decorator owns decorated trees. Dst.Nodes maps each *ast.StructType to its
-// *StructType wrapper for AST→DST lookup.
+// Decorator owns decorated trees; Dst.Nodes maps AST struct types to DST wrappers.
 type Decorator struct {
 	Fset *token.FileSet
 	Dst  struct {
@@ -55,7 +54,7 @@ func NewDecorator(fset *token.FileSet) *Decorator {
 type File struct {
 	ast    *ast.File
 	source []byte
-	tf     *token.File // cached for offsetOf.
+	tf     *token.File
 	// Every decorated *StructType, in source order.
 	structs []*StructType
 }
@@ -121,7 +120,13 @@ func (dec *Decorator) DecorateFile(f *ast.File) (*File, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s: %w", ErrSourceRead, tf.Name(), err)
 	}
+	return dec.DecorateFileSrc(f, src), nil
+}
 
+// DecorateFileSrc decorates f using pre-loaded src bytes; skips the disk read DecorateFile does.
+// The returned *File retains src by reference for splice-based reprinting.
+func (dec *Decorator) DecorateFileSrc(f *ast.File, src []byte) *File {
+	tf := dec.Fset.File(f.Pos())
 	df := &File{ast: f, source: src, tf: tf}
 
 	// Pass 1: register every decoratable struct.
@@ -139,22 +144,37 @@ func (dec *Decorator) DecorateFile(f *ast.File) (*File, error) {
 		return true
 	})
 
-	// Pass 2: nested-range lookup, including rejected structs, to prevent comment leak.
+	// Pass 2: nested-range lookup. ast.Inspect is preorder, so a stack of
+	// currently-open struct bodies gives O(n*depth) ancestor lookup instead
+	// of the previous O(n*decorated_n) outer-loop. Decorated-set membership
+	// is checked once per ancestor to record only outer structs we kept.
 	nestedRanges := make(map[*ast.StructType][]nestedRange, len(df.structs))
+	decoratedSet := make(map[*ast.StructType]struct{}, len(df.structs))
+	for _, dstSt := range df.structs {
+		decoratedSet[dstSt.ast] = struct{}{}
+	}
+	var stack []*ast.StructType
 	ast.Inspect(f, func(n ast.Node) bool {
 		inner, ok := n.(*ast.StructType)
 		if !ok || inner.Fields == nil {
 			return true
 		}
-		for _, dstOuter := range df.structs {
-			outer := dstOuter.ast
-			if inner == outer {
+		// Pop any stack entries that don't contain inner (preorder siblings).
+		for len(stack) > 0 {
+			top := stack[len(stack)-1]
+			if inner.Fields.Opening > top.Fields.Opening && inner.Fields.Closing < top.Fields.Closing {
+				break
+			}
+			stack = stack[:len(stack)-1]
+		}
+		// Remaining stack members are inner's true ancestors.
+		for _, outer := range stack {
+			if _, ok := decoratedSet[outer]; !ok {
 				continue
 			}
-			if inner.Fields.Opening > outer.Fields.Opening && inner.Fields.Closing < outer.Fields.Closing {
-				nestedRanges[outer] = append(nestedRanges[outer], nestedRange{lo: inner.Fields.Opening, hi: inner.Fields.Closing})
-			}
+			nestedRanges[outer] = append(nestedRanges[outer], nestedRange{lo: inner.Fields.Opening, hi: inner.Fields.Closing})
 		}
+		stack = append(stack, inner)
 		return true
 	})
 
@@ -190,7 +210,7 @@ func (dec *Decorator) DecorateFile(f *ast.File) (*File, error) {
 		}
 	}
 
-	return df, nil
+	return df
 }
 
 // buildStruct constructs the DST wrappers for one *ast.StructType. Decoration

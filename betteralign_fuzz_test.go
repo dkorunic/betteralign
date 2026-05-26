@@ -13,9 +13,36 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
+
+// dumpInflight writes src to a per-worker file under $FUZZ_INFLIGHT_DIR before
+// each fuzz exec. When a worker is SIGKILL'd silently by the coordinator (a
+// failure mode that emits no panic, no stack trace, just "EOF" from the
+// framework), the file is the only record of the input the worker was
+// processing. No-op when the env var is unset, so production test runs are
+// unaffected.
+func dumpInflight(src string) {
+	dir := os.Getenv("FUZZ_INFLIGHT_DIR")
+	if dir == "" {
+		return
+	}
+	_ = os.WriteFile(filepath.Join(dir, "worker-"+strconv.Itoa(os.Getpid())+".txt"), []byte(src), 0o600)
+}
+
+// markPhase writes a short phase tag to a per-worker file. Combined with
+// dumpInflight's source capture, this lets us reconstruct after a silent
+// worker death exactly what input was being processed AND which stage of
+// the pipeline died on it: typecheck, walk, or check.
+func markPhase(p string) {
+	dir := os.Getenv("FUZZ_INFLIGHT_DIR")
+	if dir == "" {
+		return
+	}
+	_ = os.WriteFile(filepath.Join(dir, "phase-"+strconv.Itoa(os.Getpid())+".txt"), []byte(p), 0o600)
+}
 
 // addFuzzCorpus walks every .go and .go.golden file under root and adds its
 // bytes as a fuzz seed. Errors are silent; missing corpus just means fewer
@@ -41,16 +68,16 @@ func addFuzzCorpus(f *testing.F, root string) {
 // typeCheckFuzzInput parses and type-checks src. The Importer is nil so any
 // imports resolve to errors-but-non-nil packages; the resulting *types.Package
 // is still usable for struct introspection. Returns nil on parser failure
-// (uninteresting input), never panics.
-func typeCheckFuzzInput(t *testing.T, src string) *types.Package {
+// (uninteresting input). Bytes are fed to parser.ParseFile directly via its
+// src parameter — no temp file is created per exec, which matters at fuzz
+// throughput where 56k tempdir create/cleanup cycles/sec would otherwise
+// hammer the disk. Panics from go/types itself (malformed generics, recursive
+// alias chains — known upstream defects) are recovered and reported as Skip
+// so the fuzzer keeps hunting for real betteralign bugs.
+func typeCheckFuzzInput(t *testing.T, src string) (pkg *types.Package) {
 	t.Helper()
-	dir := t.TempDir()
-	path := filepath.Join(dir, "input.go")
-	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
-		t.Skipf("write tmp source: %v", err)
-	}
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, path, nil, parser.ParseComments|parser.SkipObjectResolution)
+	file, err := parser.ParseFile(fset, "input.go", src, parser.ParseComments|parser.SkipObjectResolution)
 	if err != nil {
 		t.Skip("input not valid Go")
 	}
@@ -58,7 +85,12 @@ func typeCheckFuzzInput(t *testing.T, src string) *types.Package {
 		Error:    func(error) {}, // swallow type errors; partial info is enough
 		Importer: nil,            // imports resolve to errors; struct internals still type-check
 	}
-	pkg, _ := conf.Check("fuzz", fset, []*ast.File{file}, nil)
+	defer func() {
+		if r := recover(); r != nil {
+			t.Skipf("go/types panic (upstream): %v", r)
+		}
+	}()
+	pkg, _ = conf.Check("fuzz", fset, []*ast.File{file}, nil)
 	return pkg
 }
 
@@ -80,10 +112,13 @@ func FuzzOptimalOrder(f *testing.F) {
 	f.Add("package p\n\ntype S[T any] struct { x T; y int }\n")
 
 	f.Fuzz(func(t *testing.T, src string) {
+		dumpInflight(src)
+		markPhase("typecheck")
 		pkg := typeCheckFuzzInput(t, src)
 		if pkg == nil {
 			t.Skip("type-check produced nil package")
 		}
+		markPhase("walk")
 		sizes := newGCSizes(8, 8)
 		for _, name := range pkg.Scope().Names() {
 			tn, ok := pkg.Scope().Lookup(name).(*types.TypeName)
@@ -101,8 +136,10 @@ func FuzzOptimalOrder(f *testing.F) {
 			if st.NumFields() == 0 {
 				continue
 			}
+			markPhase("check")
 			checkOptimalOrderInvariants(t, name, st, sizes)
 		}
+		markPhase("done")
 	})
 }
 
@@ -126,6 +163,16 @@ func checkOptimalOrderInvariants(t *testing.T, name string, st *types.Struct, si
 			return
 		}
 		seen[idx] = true
+	}
+
+	// Non-negativity guard. Without this the upper-bound checks below are
+	// trivially satisfied when origSize / origPtrdata saturate to MaxInt64,
+	// hiding bugs where the optimalOrder accumulator wraps to a negative.
+	if optSize < 0 {
+		t.Errorf("%s: optSize=%d (negative; integer overflow in accumulator)", name, optSize)
+	}
+	if optPtrdata < 0 {
+		t.Errorf("%s: optPtrdata=%d (negative; integer overflow in accumulator)", name, optPtrdata)
 	}
 
 	origSize := sizes.Sizeof(st)
@@ -157,10 +204,13 @@ func FuzzGCSizes(f *testing.F) {
 	f.Add("package p\n\ntype A [3]uint8\n")
 
 	f.Fuzz(func(t *testing.T, src string) {
+		dumpInflight(src)
+		markPhase("typecheck")
 		pkg := typeCheckFuzzInput(t, src)
 		if pkg == nil {
 			t.Skip("type-check produced nil package")
 		}
+		markPhase("walk")
 		sizes := newGCSizes(8, 8)
 		for _, name := range pkg.Scope().Names() {
 			tn, ok := pkg.Scope().Lookup(name).(*types.TypeName)
@@ -168,8 +218,10 @@ func FuzzGCSizes(f *testing.F) {
 				continue
 			}
 			typ := tn.Type()
+			markPhase("check")
 			checkGCSizesInvariants(t, name, typ, sizes)
 		}
+		markPhase("done")
 	})
 }
 
@@ -178,6 +230,12 @@ func checkGCSizesInvariants(t *testing.T, name string, typ types.Type, sizes *gc
 	sz := sizes.Sizeof(typ)
 	al := sizes.Alignof(typ)
 	pd := sizes.ptrdata(typ)
+	if sz < 0 {
+		t.Errorf("%s: Sizeof=%d (negative; integer overflow)", name, sz)
+	}
+	if pd < 0 {
+		t.Errorf("%s: ptrdata=%d (negative; integer overflow)", name, pd)
+	}
 	if al < 1 {
 		t.Errorf("%s: Alignof=%d, want >=1", name, al)
 	}

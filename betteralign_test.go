@@ -161,10 +161,7 @@ func TestFlagExcludeDirs(t *testing.T) {
 		analysistest.Run(t, testdata, analyzer, "exclude/a/...")
 	})
 
-	// Absolute paths used to fail closed (silently excluding every file)
-	// because filepath.Rel errors when basepath is absolute and targpath is
-	// relative. normalizeExcludePaths in run() rewrites absolutes to
-	// wd-relative form so both styles are supported equivalently.
+	// Absolute paths used to fail closed via filepath.Rel; now normalized to wd-relative.
 	t.Run("exclude a via absolute path", func(t *testing.T) {
 		wd, err := os.Getwd()
 		if err != nil {

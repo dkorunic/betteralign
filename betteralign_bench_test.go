@@ -12,11 +12,6 @@ import (
 	"testing"
 )
 
-// benchSizes is a 64-bit gcSizes shared across benchmarks. Caches are populated
-// once per BenchmarkOptimalOrder_* invocation, so cache cost shows up only in
-// the first iteration; subsequent iterations exercise the sort + reorder path.
-var benchSizes = newGCSizes(8, 8)
-
 // makeBenchStruct constructs a struct with n alternating fields of varying
 // alignment to exercise every branch of the optimalOrder comparator.
 func makeBenchStruct(n int) *types.Struct {
@@ -42,7 +37,8 @@ func BenchmarkOptimalOrder_Small(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		_, _, _ = optimalOrder(str, benchSizes)
+		sizes := newGCSizes(8, 8)
+		_, _, _ = optimalOrder(str, sizes)
 	}
 }
 
@@ -51,7 +47,8 @@ func BenchmarkOptimalOrder_Medium(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		_, _, _ = optimalOrder(str, benchSizes)
+		sizes := newGCSizes(8, 8)
+		_, _, _ = optimalOrder(str, sizes)
 	}
 }
 
@@ -60,7 +57,8 @@ func BenchmarkOptimalOrder_Large(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		_, _, _ = optimalOrder(str, benchSizes)
+		sizes := newGCSizes(8, 8)
+		_, _, _ = optimalOrder(str, sizes)
 	}
 }
 

@@ -73,24 +73,13 @@ func FuzzDecorateFileIdentity(f *testing.F) {
 	}
 
 	f.Fuzz(func(t *testing.T, src string) {
-		dir := t.TempDir()
-		path := filepath.Join(dir, "input.go")
-		if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
-			t.Fatalf("write: %v", err)
-		}
 		fset := token.NewFileSet()
-		file, err := parser.ParseFile(fset, path, nil, parser.ParseComments|parser.SkipObjectResolution)
+		file, err := parser.ParseFile(fset, "input.go", src, parser.ParseComments|parser.SkipObjectResolution)
 		if err != nil {
 			t.Skip("input not valid Go")
 		}
 		dec := NewDecorator(fset)
-		df, err := dec.DecorateFile(file)
-		if err != nil {
-			if errors.Is(err, ErrSourceRead) {
-				t.Skipf("source read failed: %v", err)
-			}
-			t.Fatalf("DecorateFile: %v", err)
-		}
+		df := dec.DecorateFileSrc(file, []byte(src))
 		var buf bytes.Buffer
 		if err := Fprint(&buf, df); err != nil {
 			t.Fatalf("Fprint (no mutation): %v", err)
@@ -117,24 +106,13 @@ func FuzzDecorateFileReorder(f *testing.F) {
 	}
 
 	f.Fuzz(func(t *testing.T, src string) {
-		dir := t.TempDir()
-		path := filepath.Join(dir, "input.go")
-		if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
-			t.Fatalf("write: %v", err)
-		}
 		fset := token.NewFileSet()
-		file, err := parser.ParseFile(fset, path, nil, parser.ParseComments|parser.SkipObjectResolution)
+		file, err := parser.ParseFile(fset, "input.go", src, parser.ParseComments|parser.SkipObjectResolution)
 		if err != nil {
 			t.Skip("input not valid Go")
 		}
 		dec := NewDecorator(fset)
-		df, err := dec.DecorateFile(file)
-		if err != nil {
-			if errors.Is(err, ErrSourceRead) {
-				t.Skipf("source read failed: %v", err)
-			}
-			t.Fatalf("DecorateFile: %v", err)
-		}
+		df := dec.DecorateFileSrc(file, []byte(src))
 		// Find the first struct with >=2 fields. Skip if none.
 		var target *StructType
 		for _, st := range df.structs {

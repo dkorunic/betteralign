@@ -42,6 +42,7 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -137,9 +138,7 @@ type analyzerConfig struct {
 	optInMode      bool
 }
 
-// StringArrayFlag is a flag.Value that accumulates comma-separated string
-// arguments across one or more occurrences of the same flag. It backs the
-// -exclude_dirs and -exclude_files options.
+// StringArrayFlag accumulates comma-separated values across repeated flag occurrences; backs -exclude_dirs / -exclude_files.
 type StringArrayFlag []string
 
 // String returns the accumulated values rendered with the default Go
@@ -214,8 +213,10 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 	testFiles := cfg.testFiles
 	generatedFiles := cfg.generatedFiles
 	optInMode := cfg.optInMode
-	excludeDirs := cfg.excludeDirs
-	excludeFiles := cfg.excludeFiles
+	// Defensive clones: golangci-lint and other hosts may run analyzers in
+	// parallel while StringArrayFlag.Set could be appending concurrently.
+	excludeDirs := slices.Clone(cfg.excludeDirs)
+	excludeFiles := slices.Clone(cfg.excludeFiles)
 
 	inspect := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 
@@ -466,27 +467,19 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 	return nil, nil
 }
 
-// unsafePointerTyp is the canonical types.Type for unsafe.Pointer, used to
-// derive the architecture's word size and pointer alignment from
-// pass.TypesSizes. The lookup is wrapped to avoid a panic at package init in
-// the unlikely event that the standard library's unsafe package shape ever
-// changes — gcSizes still works with reasonable defaults of 8 bytes if so.
+// unsafePointerTyp anchors word-size and pointer-alignment lookups via pass.TypesSizes.
+// Wrapped to avoid an init-time panic if unsafe's shape ever changes; gcSizes falls back to 8.
 var unsafePointerTyp = lookupUnsafePointer()
 
-// nodeFilter is the constant set of AST nodes the visitor cares about; declared
-// once at package level so each pass shares the same slice instead of
-// allocating a fresh one.
+// nodeFilter is the visitor's node set; package-level so passes share one slice.
 var nodeFilter = []ast.Node{
 	(*ast.File)(nil),
 	(*ast.StructType)(nil),
 	(*ast.GenDecl)(nil),
 }
 
-// dummyField is a placeholder used by the apply-mode flatten/reorder logic to
-// keep flat positions aligned with optimalOrder indexes when a single dst.Field
-// declares multiple names (e.g. `A, B int`). Pointer equality with this
-// sentinel identifies skip-positions during the reorder pass. Reusing a single
-// package-level value avoids per-struct allocation.
+// dummyField is a skip-position sentinel for the apply-mode reorder when one dst.Field
+// declares multiple names (`A, B int`); pointer-identity, package-level to avoid allocation.
 var dummyField = &dst.Field{}
 
 // fieldElem is optimalOrder's per-field sort record; lifted out so a pool can recycle it.
@@ -674,14 +667,14 @@ func optimalOrder(str *types.Struct, sizes *gcSizes) (indexes []int, optSize, op
 		}
 		offset = align(offset, e.alignof)
 		if e.ptrdata != 0 {
-			optPtrdata = offset + e.ptrdata
+			optPtrdata = addSize(offset, e.ptrdata)
 		}
 		sz := e.sizeof
 		// Trailing zero-size field on a non-empty struct gets one padding byte.
 		if i == nf-1 && sz == 0 && offset != 0 {
 			sz = 1
 		}
-		offset += sz
+		offset = addSize(offset, sz)
 	}
 	optSize = align(offset, maxAlign)
 	return indexes, optSize, optPtrdata
@@ -702,13 +695,9 @@ func isIdentityOrder(indexes []int) bool {
 
 // Code below based on go/types.StdSizes.
 
-// gcSizes computes sizes, alignments and ptrdata in the same way as the Go
-// runtime's garbage collector. The three cache maps memoise per-type results
-// within a single analysis pass — they avoid recomputing the layout of types
-// that recur across many fields (a major cost in protobuf-style generated
-// code where the same sub-message type appears repeatedly). The caches are
-// lazy-initialised so callers can still construct a *gcSizes with a struct
-// literal in tests.
+// gcSizes computes sizes, alignments, and ptrdata matching the Go GC's layout.
+// Caches memoise per-type results to avoid recomputing recurring sub-types;
+// nil caches are permitted so tests can construct via struct literal.
 type gcSizes struct {
 	sizeCache  map[types.Type]int64
 	alignCache map[types.Type]int64
@@ -734,10 +723,17 @@ func newGCSizes(wordSize, maxAlign int64) *gcSizes {
 
 // Alignof returns T's alignment in bytes as the Go GC observes it. Results
 // are memoised in alignCache so recurring sub-types (common in generated
-// protobuf code) are paid for once per pass.
+// protobuf code) are paid for once per pass. A sentinel of 1 is stored
+// before recursing so that invalid recursive types (which go/types lets
+// through in multi-declaration corners — see BUG-29) hit the cache on the
+// re-entry and terminate at the spec minimum instead of unwinding the
+// goroutine stack.
 func (s *gcSizes) Alignof(T types.Type) int64 {
 	if v, ok := s.alignCache[T]; ok {
 		return v
+	}
+	if s.alignCache != nil {
+		s.alignCache[T] = 1
 	}
 	v := s.alignofUncached(T)
 	if s.alignCache != nil {
@@ -795,10 +791,15 @@ var basicSizes = [...]byte{
 // Sizeof returns T's size in bytes as the Go GC observes it (including
 // internal padding but not the trailing-zero-field padding rule, which is
 // applied by the enclosing struct's layout). Results are memoised in
-// sizeCache.
+// sizeCache. A sentinel of 0 is stored before recursing so an invalid
+// self-referencing struct (see BUG-29) collapses to a finite size rather
+// than overflowing the stack.
 func (s *gcSizes) Sizeof(T types.Type) int64 {
 	if v, ok := s.sizeCache[T]; ok {
 		return v
+	}
+	if s.sizeCache != nil {
+		s.sizeCache[T] = 0
 	}
 	v := s.sizeofUncached(T)
 	if s.sizeCache != nil {
@@ -826,7 +827,7 @@ func (s *gcSizes) sizeofUncached(T types.Type) int64 {
 			return s.WordSize * 2
 		}
 	case *types.Array:
-		return t.Len() * s.Sizeof(t.Elem())
+		return mulSize(t.Len(), s.Sizeof(t.Elem()))
 	case *types.Slice:
 		return s.WordSize * 3
 	case *types.Struct:
@@ -846,7 +847,7 @@ func (s *gcSizes) sizeofUncached(T types.Type) int64 {
 			if i == nf-1 && sz == 0 && o != 0 {
 				sz = 1
 			}
-			o = align(o, a) + sz
+			o = addSize(align(o, a), sz)
 		}
 		return align(o, max)
 	case *types.Interface:
@@ -855,19 +856,50 @@ func (s *gcSizes) sizeofUncached(T types.Type) int64 {
 	return s.WordSize // catch-all
 }
 
-// align returns the smallest y >= x such that y % a == 0.
+// align returns the smallest y >= x such that y % a == 0; saturates at math.MaxInt64.
 func align(x, a int64) int64 {
+	if x > math.MaxInt64-(a-1) {
+		return math.MaxInt64
+	}
 	y := x + a - 1
 	return y - y%a
+}
+
+// mulSize multiplies layout values, saturating at math.MaxInt64; non-positive inputs collapse to 0.
+// BUG-30: raw int64 multiply wraps negative on adversarial array lengths.
+func mulSize(n, size int64) int64 {
+	if n <= 0 || size <= 0 {
+		return 0
+	}
+	if n > math.MaxInt64/size {
+		return math.MaxInt64
+	}
+	return n * size
+}
+
+// addSize accumulates layout sums, saturating at math.MaxInt64.
+func addSize(a, b int64) int64 {
+	if a < 0 || b < 0 {
+		return 0
+	}
+	if a > math.MaxInt64-b {
+		return math.MaxInt64
+	}
+	return a + b
 }
 
 // ptrdata returns the number of bytes at the head of T that the GC must scan
 // for pointers. A return of 0 means the type is pointer-free; otherwise it is
 // the offset just past the last pointer-bearing word. Results are memoised
-// in ptrCache.
+// in ptrCache. A sentinel of 0 is stored before recursing so an invalid
+// self-referencing struct (see BUG-29) treats its own embedded self as
+// pointer-free rather than infinitely re-entering.
 func (s *gcSizes) ptrdata(T types.Type) int64 {
 	if v, ok := s.ptrCache[T]; ok {
 		return v
+	}
+	if s.ptrCache != nil {
+		s.ptrCache[T] = 0
 	}
 	v := s.ptrdataUncached(T)
 	if s.ptrCache != nil {
@@ -897,7 +929,7 @@ func (s *gcSizes) ptrdataUncached(T types.Type) int64 {
 		return 2 * s.WordSize
 	case *types.Array:
 		n := t.Len()
-		if n == 0 {
+		if n <= 0 {
 			return 0
 		}
 		a := s.ptrdata(t.Elem())
@@ -905,7 +937,7 @@ func (s *gcSizes) ptrdataUncached(T types.Type) int64 {
 			return 0
 		}
 		z := s.Sizeof(t.Elem())
-		return (n-1)*z + a
+		return addSize(mulSize(n-1, z), a)
 	case *types.Struct:
 		nf := t.NumFields()
 		if nf == 0 {
@@ -919,9 +951,9 @@ func (s *gcSizes) ptrdataUncached(T types.Type) int64 {
 			fp := s.ptrdata(ft)
 			o = align(o, a)
 			if fp != 0 {
-				p = o + fp
+				p = addSize(o, fp)
 			}
-			o += sz
+			o = addSize(o, sz)
 		}
 		return p
 	}
@@ -996,6 +1028,10 @@ func normalizeExcludePaths(wd string, paths []string) ([]string, error) {
 		rel, err := filepath.Rel(wd, p)
 		if err != nil {
 			return nil, fmt.Errorf("exclude path %q is not resolvable relative to working directory %q (cross-volume on Windows, or requires runtime cwd): %w", p, wd, err)
+		}
+		// A "../"-prefixed rel never matches real paths under filepath.Match; fail loud not silent.
+		if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return nil, fmt.Errorf("exclude path %q escapes working directory %q (resolved to %q); supply a path inside the working tree or use a relative pattern", p, wd, rel)
 		}
 		out[i] = rel
 	}

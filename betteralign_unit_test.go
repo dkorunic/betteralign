@@ -13,17 +13,18 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	dst "github.com/dkorunic/betteralign/internal/dstmin"
 	"golang.org/x/tools/go/analysis"
 )
 
-// testSizes64 is a gcSizes configured for a 64-bit platform (WordSize=8, MaxAlign=8).
-// All size/alignment expectations in this file assume a 64-bit target.
+// testSizes64 is the 64-bit gcSizes used by every size/alignment expectation here.
 var testSizes64 = &gcSizes{WordSize: 8, MaxAlign: 8}
 
 // ─── Layer 1: align() (BUG-01) ────────────────────────────────────────────────
@@ -82,8 +83,7 @@ func TestGcSizesAlignofArray(t *testing.T) {
 // field alignment, not the minimum.
 // BUG-03: using < instead of > in the running-max comparison.
 func TestGcSizesAlignofStruct(t *testing.T) {
-	// struct { bool; uint64 }: alignment = max(1, 8) = 8.
-	// BUG-03 would compute min(1, 8) = 1.
+	// struct{bool;uint64}: max(1,8) = 8 (BUG-03 would yield min = 1).
 	fields := []*types.Var{
 		types.NewVar(token.NoPos, nil, "x", types.Typ[types.Bool]),
 		types.NewVar(token.NoPos, nil, "y", types.Typ[types.Uint64]),
@@ -150,8 +150,7 @@ func TestGcSizesSizeofEmptyStruct(t *testing.T) {
 // the struct's maximum field alignment (trailing padding is added).
 // BUG-08: returning the raw byte offset without the final align() call.
 func TestGcSizesSizeofTrailingPadding(t *testing.T) {
-	// struct { uint64; bool } = 8 + 1 + 7 padding = 16.
-	// BUG-08 would return 9 (no trailing padding).
+	// struct{uint64;bool} = 16 with trailing padding (BUG-08 would return 9).
 	fields := []*types.Var{
 		types.NewVar(token.NoPos, nil, "x", types.Typ[types.Uint64]),
 		types.NewVar(token.NoPos, nil, "y", types.Typ[types.Bool]),
@@ -196,8 +195,7 @@ func TestGcSizesPtrdataInterface(t *testing.T) {
 // TestGcSizesPtrdataArray verifies the array ptrdata formula: (n-1)*stride + elem_ptrdata.
 // BUG-11: using n instead of n-1, overestimating by one element's stride.
 func TestGcSizesPtrdataArray(t *testing.T) {
-	// [3]*int: (3-1)*8 + 8 = 24.
-	// BUG-11 would compute 3*8 + 8 = 32.
+	// [3]*int = (3-1)*8 + 8 = 24 (BUG-11 uses n instead of n-1 → 32).
 	ptrInt := types.NewPointer(types.Typ[types.Int])
 	arr := types.NewArray(ptrInt, 3)
 	if got := testSizes64.ptrdata(arr); got != 24 {
@@ -222,11 +220,7 @@ func TestGcSizesPtrdataArray(t *testing.T) {
 // BUG-12: advancing o += sz before recording p = o + fp, shifting all pointer
 // extents by one field's size.
 func TestGcSizesPtrdataStructOffset(t *testing.T) {
-	// struct { *int; int }:
-	//   field 0 (*int) at offset 0: fp=8 → p = 0 + 8 = 8, then o = 8
-	//   field 1 (int)  at offset 8: fp=0 → p unchanged = 8
-	// ptrdata = 8.
-	// BUG-12 would report p = (0+8) + 8 = 16.
+	// struct{*int;int}: ptrdata = 8 (BUG-12 would report 16 by advancing o before recording p).
 	ptrInt := types.NewPointer(types.Typ[types.Int])
 	fields := []*types.Var{
 		types.NewVar(token.NoPos, nil, "ptr", ptrInt),
@@ -235,6 +229,161 @@ func TestGcSizesPtrdataStructOffset(t *testing.T) {
 	strType := types.NewStruct(fields, nil)
 	if got := testSizes64.ptrdata(strType); got != 8 {
 		t.Errorf("ptrdata(struct{*int;int}) = %d, want 8 (BUG-12 would return 16)", got)
+	}
+}
+
+// ─── Layer 4.5: gcSizes cycle safety (BUG-29) ────────────────────────────────
+
+// TestGcSizesCycleSafety pins the sentinel-pre-population in Alignof / Sizeof
+// / ptrdata. The trigger is a self-embedding struct whose composite-literal
+// use forces go/types to materialise the struct type instead of replacing
+// it with Invalid. Without the literal, the type-checker's cycle detector
+// rewrites e to *types.Basic[Invalid] and the bug stays dormant.
+//
+// BUG-29: cache filled only after recursion returns, so the in-progress call
+// re-enters itself, recurses without bound, and exhausts the goroutine
+// stack. Found by FuzzOptimalOrder; trigger pinned as fuzz seed
+// testdata/fuzz/FuzzOptimalOrder/bug29_recursive_struct.
+//
+// The watchdog guards against a regression hanging the whole test binary:
+// the goroutine running optimalOrder still leaks until the process exits,
+// but the test result is deterministic.
+func TestGcSizesCycleSafety(t *testing.T) {
+	const src = `package p
+type e struct {
+	e
+}
+var _ = e{}
+`
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "in.go", src, 0)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	conf := types.Config{Error: func(error) {}, Importer: nil}
+	pkg, _ := conf.Check("p", fset, []*ast.File{file}, nil)
+	if pkg == nil {
+		t.Fatal("nil package from type-check")
+	}
+	tn, ok := pkg.Scope().Lookup("e").(*types.TypeName)
+	if !ok {
+		t.Fatal("type e missing from scope")
+	}
+	named, ok := tn.Type().(*types.Named)
+	if !ok {
+		t.Fatalf("e.Type() = %T, want *types.Named", tn.Type())
+	}
+	st, ok := named.Origin().Underlying().(*types.Struct)
+	if !ok {
+		t.Skipf("type-checker no longer admits self-embedding here (Underlying = %T); BUG-29 trigger neutralised upstream", named.Underlying())
+	}
+	if st.NumFields() == 0 || st.Field(0).Type() != named {
+		t.Skip("type-checker no longer makes field[0] self-referential; BUG-29 trigger neutralised upstream")
+	}
+
+	sizes := newGCSizes(8, 8)
+	type result struct {
+		indexes             []int
+		optSize, optPtrdata int64
+	}
+	resCh := make(chan result, 1)
+	go func() {
+		indexes, optSize, optPtrdata := optimalOrder(st, sizes)
+		resCh <- result{indexes, optSize, optPtrdata}
+	}()
+	var res result
+	select {
+	case res = <-resCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("BUG-29: optimalOrder did not terminate within 5s on a self-embedding struct (cache sentinel missing)")
+	}
+
+	if len(res.indexes) != st.NumFields() {
+		t.Errorf("len(indexes) = %d, want %d", len(res.indexes), st.NumFields())
+	}
+	seen := make([]bool, st.NumFields())
+	for _, i := range res.indexes {
+		if i < 0 || i >= st.NumFields() {
+			t.Errorf("index %d out of range [0,%d)", i, st.NumFields())
+			continue
+		}
+		if seen[i] {
+			t.Errorf("index %d appears twice", i)
+		}
+		seen[i] = true
+	}
+	if origSize := sizes.Sizeof(st); res.optSize > origSize {
+		t.Errorf("optSize=%d > origSize=%d", res.optSize, origSize)
+	}
+	if origPtrdata := sizes.ptrdata(st); res.optPtrdata > origPtrdata {
+		t.Errorf("optPtrdata=%d > origPtrdata=%d", res.optPtrdata, origPtrdata)
+	}
+}
+
+// ─── Layer 4.6: gcSizes overflow safety (BUG-30) ─────────────────────────────
+
+// TestGcSizesArrayOverflowSaturates pins saturation in Sizeof / ptrdata array paths.
+// BUG-30: raw int64 multiply on huge arrays wrapped Sizeof to MinInt64.
+// Fuzz seed testdata/fuzz/FuzzGCSizes/d713d410fe8c6747 is the corpus-level regression.
+func TestGcSizesArrayOverflowSaturates(t *testing.T) {
+	sizes := newGCSizes(8, 8)
+
+	huge := types.NewArray(types.Typ[types.Uint64], 1<<60)
+	if got := sizes.Sizeof(huge); got < 0 {
+		t.Errorf("Sizeof saturating: got %d (negative), want MaxInt64", got)
+	}
+
+	hugePtrs := types.NewArray(types.NewPointer(types.Typ[types.Int]), 1<<60)
+	sz := sizes.Sizeof(hugePtrs)
+	pd := sizes.ptrdata(hugePtrs)
+	if pd < 0 || sz < 0 {
+		t.Errorf("array of pointers overflow: Sizeof=%d ptrdata=%d, want both non-negative", sz, pd)
+	}
+	if pd > sz {
+		t.Errorf("invariant violation: ptrdata=%d > Sizeof=%d", pd, sz)
+	}
+}
+
+// TestMulSizeSaturates pins the saturating-multiply helper directly.
+func TestMulSizeSaturates(t *testing.T) {
+	cases := []struct {
+		name    string
+		n, size int64
+		want    int64
+	}{
+		{"normal", 10, 8, 80},
+		{"zero size", 100, 0, 0},
+		{"zero n", 0, 100, 0},
+		{"negative n", -1, 100, 0},
+		{"overflow saturates", 1 << 60, 1 << 10, math.MaxInt64},
+		{"exact MaxInt64", math.MaxInt64, 1, math.MaxInt64},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := mulSize(tc.n, tc.size); got != tc.want {
+				t.Errorf("mulSize(%d, %d) = %d, want %d", tc.n, tc.size, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAddSizeSaturates pins the saturating-add helper directly.
+func TestAddSizeSaturates(t *testing.T) {
+	cases := []struct {
+		name string
+		a, b int64
+		want int64
+	}{
+		{"normal", 10, 20, 30},
+		{"overflow saturates", math.MaxInt64 - 5, 10, math.MaxInt64},
+		{"max + zero", math.MaxInt64, 0, math.MaxInt64},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := addSize(tc.a, tc.b); got != tc.want {
+				t.Errorf("addSize(%d, %d) = %d, want %d", tc.a, tc.b, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -287,8 +436,7 @@ func TestOptimalOrderHighAlignmentFirst(t *testing.T) {
 // before pointer-free fields of the same alignment.
 // BUG-15: returning noptrsi instead of noptrsj swaps the placement.
 func TestOptimalOrderPointerBearingFirst(t *testing.T) {
-	// struct { uint64; *int }: both have alignment 8.
-	// *int  (ptrdata=8) must precede uint64 (ptrdata=0).
+	// Same alignment 8; *int (pointer-bearing) must precede uint64.
 	ptrInt := types.NewPointer(types.Typ[types.Int])
 	fields := []*types.Var{
 		types.NewVar(token.NoPos, nil, "u", types.Typ[types.Uint64]),
@@ -310,9 +458,7 @@ func TestOptimalOrderPointerBearingFirst(t *testing.T) {
 // the one with fewer trailing non-pointer bytes sorts first.
 // BUG-16: using > instead of < inverts the trailing-bytes comparison.
 func TestOptimalOrderFewerTrailingFirst(t *testing.T) {
-	// *int:   sizeof=8,  ptrdata=8,  trailing = 8-8 = 0
-	// string: sizeof=16, ptrdata=8,  trailing = 16-8 = 8
-	// *int (trailing=0) must precede string (trailing=8).
+	// *int (trailing=0) must precede string (trailing=8) under the fewer-trailing rule.
 	ptrInt := types.NewPointer(types.Typ[types.Int])
 	fields := []*types.Var{
 		types.NewVar(token.NoPos, nil, "s", types.Typ[types.String]),
@@ -334,9 +480,7 @@ func TestOptimalOrderFewerTrailingFirst(t *testing.T) {
 // fields sort before smaller fields when all other criteria are equal.
 // BUG-17: using < instead of > places smaller fields first.
 func TestOptimalOrderLargerSizeFirst(t *testing.T) {
-	// uint32:    sizeof=4, align=4, ptrdata=0
-	// [2]uint32: sizeof=8, align=4, ptrdata=0
-	// [2]uint32 (larger) must precede uint32 (smaller).
+	// Same align/ptrdata; [2]uint32 (larger) must precede uint32 as final tiebreak.
 	arr2u32 := types.NewArray(types.Typ[types.Uint32], 2)
 	fields := []*types.Var{
 		types.NewVar(token.NoPos, nil, "u", types.Typ[types.Uint32]),
@@ -401,8 +545,7 @@ func parseTestFile(t *testing.T, src string) *ast.File {
 // precede the package keyword, never inspecting them.
 func TestHasGeneratedComment(t *testing.T) {
 	t.Run("generated comment before package is detected", func(t *testing.T) {
-		// The canonical "DO NOT EDIT" header must be recognised.
-		// BUG-23 would return false because the guard would fire immediately.
+		// Canonical "DO NOT EDIT" header (BUG-23 would short-circuit the guard).
 		f := parseTestFile(t, "// Code generated by foo. DO NOT EDIT.\npackage foo\n")
 		if !hasGeneratedComment(f) {
 			t.Error("generated comment before package keyword not detected (BUG-23)")
@@ -417,8 +560,7 @@ func TestHasGeneratedComment(t *testing.T) {
 	})
 
 	t.Run("generated comment after package keyword is not detected", func(t *testing.T) {
-		// Comments that appear after the package keyword are not headers and
-		// must be ignored.
+		// Post-package comments are not headers and must be ignored.
 		f := parseTestFile(t, "package foo\n// Code generated by foo. DO NOT EDIT.\n")
 		if hasGeneratedComment(f) {
 			t.Error("generated comment after package keyword should not be detected")
@@ -442,8 +584,7 @@ func TestHasIgnoreCommentOpening(t *testing.T) {
 	})
 
 	t.Run("ignore comment in End (node tail) is NOT detected", func(t *testing.T) {
-		// BUG-24 moves the check to a different decoration position;
-		// comments placed there should not trigger ignore.
+		// BUG-24 would also fire on End-decorations; this asserts it doesn't.
 		fl := &dst.FieldList{}
 		fl.Decs.End = dst.Decorations{"// betteralign:ignore"}
 		if hasIgnoreComment(fl) {
@@ -498,8 +639,7 @@ func TestHasIgnoreCommentPrefixGuard(t *testing.T) {
 	})
 
 	t.Run("bare string containing directive does NOT trigger ignore", func(t *testing.T) {
-		// Without the // prefix guard any decoration string containing the
-		// magic substring would match — BUG-25 risk.
+		// Without the // prefix guard a bare substring match would fire (BUG-25).
 		fl := &dst.FieldList{}
 		fl.Decs.Opening = dst.Decorations{"betteralign:ignore"}
 		if hasIgnoreComment(fl) {
@@ -1702,6 +1842,22 @@ func TestNormalizeExcludePathsErrorMessage(t *testing.T) {
 		if !strings.Contains(msg, want) {
 			t.Errorf("error message missing %q: %s", want, msg)
 		}
+	}
+}
+
+// TestNormalizeExcludePathsRejectsEscapingPath: absolute paths outside wd must error, not silently no-op.
+func TestNormalizeExcludePathsRejectsEscapingPath(t *testing.T) {
+	wd := filepath.Join(string(filepath.Separator), "proj", "deep")
+	outside := filepath.Join(string(filepath.Separator), "other", "vendor")
+	got, err := normalizeExcludePaths(wd, []string{outside})
+	if err == nil {
+		t.Fatalf("expected error for path escaping wd, got result %v", got)
+	}
+	if !strings.Contains(err.Error(), outside) {
+		t.Errorf("error should mention the offending path: %v", err)
+	}
+	if !strings.Contains(err.Error(), "escapes working directory") {
+		t.Errorf("error should explain the escape: %v", err)
 	}
 }
 

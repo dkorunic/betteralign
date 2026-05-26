@@ -371,8 +371,7 @@ func TestFprint(t *testing.T) {
 		},
 		{
 			name: "blank line attaches to both prev and next field",
-			// Dual-attachment: inter-field blanks attach to both neighbours.
-			// Gofmt coalesces duplicates and strips brace-adjacent blanks.
+			// Dual-attachment of inter-field blanks; gofmt coalesces duplicates.
 			code: "package p\n\n" +
 				"type S struct {\n" +
 				"\tA byte\n\n" +
