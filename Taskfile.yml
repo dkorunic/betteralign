@@ -136,51 +136,37 @@ tasks:
     cmds:
       - go test -run='^$' -fuzz=^FuzzDecorateFileReorder$ -fuzztime={{.FUZZTIME}} ./internal/dstmin
 
-  fuzz-go:
-    desc: 'Run all go-fuzz (github.com/dvyukov/go-fuzz) targets sequentially. Override: task fuzz-go FUZZTIME=5m (default 30s per target). FUZZTIME uses timeout(1) syntax: a single number + unit (s/m/h), e.g. 30s, 5m, 2h. Requires go-fuzz/go-fuzz-build installed.'
-    vars:
-      FUZZTIME: '{{.FUZZTIME | default "30s"}}'
-    cmds:
-      - task: fuzz-go-optimalorder
-        vars: { FUZZTIME: '{{.FUZZTIME}}' }
-      - task: fuzz-go-gcsizes
-        vars: { FUZZTIME: '{{.FUZZTIME}}' }
-      - task: fuzz-go-decoratefileidentity
-        vars: { FUZZTIME: '{{.FUZZTIME}}' }
-      - task: fuzz-go-decoratefilereorder
-        vars: { FUZZTIME: '{{.FUZZTIME}}' }
-
   fuzz-go-optimalorder:
-    desc: 'Run FuzzOptimalOrder under go-fuzz for FUZZTIME (default 30s, timeout(1) syntax).'
+    desc: 'Run FuzzOptimalOrder under go-fuzz.'
     deps: [fuzz-go-build]
     vars:
       FUZZTIME: '{{.FUZZTIME | default "30s"}}'
     cmds:
-      - timeout {{.FUZZTIME}} go-fuzz -bin=fuzz/optimalorder-fuzz.zip -workdir=fuzz/optimalorder || [ $? -eq 124 ]
+      - go-fuzz -bin=fuzz/optimalorder-fuzz.zip -workdir=fuzz/optimalorder || [ $? -eq 124 ]
 
   fuzz-go-gcsizes:
-    desc: 'Run FuzzGCSizes under go-fuzz for FUZZTIME (default 30s, timeout(1) syntax).'
+    desc: 'Run FuzzGCSizes under go-fuzz.'
     deps: [fuzz-go-build]
     vars:
       FUZZTIME: '{{.FUZZTIME | default "30s"}}'
     cmds:
-      - timeout {{.FUZZTIME}} go-fuzz -bin=fuzz/gcsizes-fuzz.zip -workdir=fuzz/gcsizes || [ $? -eq 124 ]
+      - go-fuzz -bin=fuzz/gcsizes-fuzz.zip -workdir=fuzz/gcsizes || [ $? -eq 124 ]
 
   fuzz-go-decoratefileidentity:
-    desc: 'Run FuzzDecorateFileIdentity under go-fuzz for FUZZTIME (default 30s, timeout(1) syntax).'
+    desc: 'Run FuzzDecorateFileIdentity under go-fuzz.'
     deps: [fuzz-go-build]
     vars:
       FUZZTIME: '{{.FUZZTIME | default "30s"}}'
     cmds:
-      - timeout {{.FUZZTIME}} go-fuzz -bin=fuzz/decoratefileidentity-fuzz.zip -workdir=fuzz/decoratefileidentity || [ $? -eq 124 ]
+      - go-fuzz -bin=fuzz/decoratefileidentity-fuzz.zip -workdir=fuzz/decoratefileidentity || [ $? -eq 124 ]
 
   fuzz-go-decoratefilereorder:
-    desc: 'Run FuzzDecorateFileReorder under go-fuzz for FUZZTIME (default 30s, timeout(1) syntax).'
+    desc: 'Run FuzzDecorateFileReorder under go-fuzz.'
     deps: [fuzz-go-build]
     vars:
       FUZZTIME: '{{.FUZZTIME | default "30s"}}'
     cmds:
-      - timeout {{.FUZZTIME}} go-fuzz -bin=fuzz/decoratefilereorder-fuzz.zip -workdir=fuzz/decoratefilereorder || [ $? -eq 124 ]
+      - go-fuzz -bin=fuzz/decoratefilereorder-fuzz.zip -workdir=fuzz/decoratefilereorder || [ $? -eq 124 ]
 
   fuzz-go-corpus:
     desc: Regenerate testdata/fuzz-corpus/ from testdata/src/ for use as a go-fuzz seed corpus.
@@ -210,3 +196,9 @@ tasks:
           mkdir -p "fuzz/$d/corpus"
           cp -n testdata/fuzz-corpus/* "fuzz/$d/corpus/" 2>/dev/null || true
         done
+
+  fuzz-clean:
+    desc: 'Clean go-fuzz targets and fuzz corpus.'
+    run: once
+    cmds:
+      - rm -rf fuzz testdata/fuzz-corpus

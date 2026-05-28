@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
+	"go/build/constraint"
 	"go/format"
 	"go/parser"
 	"go/token"
@@ -42,9 +43,13 @@ type Decorator struct {
 	}
 }
 
-// NewDecorator returns a Decorator bound to fset. The returned value owns its
-// own Dst.Nodes map; callers may DecorateFile multiple files through the same
-// decorator and the maps accumulate.
+// NewDecorator constructs a Decorator bound to fset for the lifetime of the
+// decoration session. Reuse across multiple DecorateFile calls is supported
+// and intentional: each call appends into Dst.Nodes so the caller can resolve
+// any *ast.StructType back to its DST wrapper without re-decorating. fset
+// must be the same FileSet the input *ast.File was parsed against, otherwise
+// position lookups (tf.Offset, tf.Line) return garbage. Not safe for
+// concurrent decoration through one Decorator — the Dst.Nodes map is plain.
 func NewDecorator(fset *token.FileSet) *Decorator {
 	d := &Decorator{Fset: fset}
 	d.Dst.Nodes = make(map[ast.Node]any, 64)
@@ -91,8 +96,11 @@ type Decorations []string
 // nestedRange is a [lo, hi) token.Pos interval of a nested struct body.
 type nestedRange struct{ lo, hi token.Pos }
 
-// All returns the underlying slice. Provided for API parity with sirkon/dst,
-// which exposes decorations as a struct method.
+// All exposes the underlying slice as []string. Exists solely for API parity
+// with github.com/sirkon/dst, whose Decorations type wraps the slice through
+// a getter — keeping the same shape here means the betteralign caller diff
+// against the sirkon/dst era stayed minimal. The slice is aliased, not
+// copied; mutating it mutates the receiver.
 func (d Decorations) All() []string { return []string(d) }
 
 // Field wraps *ast.Field.
@@ -112,9 +120,15 @@ type Field struct {
 	trailStart, trailEnd int
 }
 
-// DecorateFile decorates f and returns the resulting *File. Sources are read
-// from disk via dec.Fset.File(f.Pos()).Name(). Returns ErrSourceRead wrapped
-// with the filename when the read fails.
+// DecorateFile is the production entry point: it reads the source from disk
+// (the path comes from dec.Fset.File(f.Pos()).Name(), so f must belong to
+// dec.Fset) and hands off to DecorateFileSrc. Splice-based reprinting needs
+// the verbatim source bytes — they are NOT recoverable from the AST alone,
+// since the parser discards positional whitespace and comments that don't
+// belong to any node. Returns ErrSourceRead wrapped with the path on read
+// failure so callers can errors.Is() the sentinel without parsing strings.
+// The returned *File retains the source slice by reference; do not mutate
+// the bytes underneath.
 func (dec *Decorator) DecorateFile(f *ast.File) (*File, error) {
 	tf := dec.Fset.File(f.Pos())
 	src, err := os.ReadFile(tf.Name())
@@ -124,8 +138,22 @@ func (dec *Decorator) DecorateFile(f *ast.File) (*File, error) {
 	return dec.DecorateFileSrc(f, src), nil
 }
 
-// DecorateFileSrc decorates f using pre-loaded src bytes; skips the disk read DecorateFile does.
-// The returned *File retains src by reference for splice-based reprinting.
+// DecorateFileSrc is the in-memory entry point used by tests and fuzz
+// harnesses that already hold the source bytes. f must come from parsing src
+// with parser.ParseComments through dec.Fset, otherwise the recorded
+// positions don't line up with the source and splicing emits garbage. The
+// returned *File aliases src; never mutate the bytes for the lifetime of
+// the *File. The decoration runs in four passes against the AST: (1) a
+// single preorder walk that filters structs through buildStruct + the
+// safety guards (hasUnsafeBlockComment, hasBuildConstraintComment,
+// hasLineDirectiveComment) and records nested-struct ranges for the next
+// pass; (2) implicit during the walk — registering decorated structs in
+// dec.Dst.Nodes; (3) per-struct comment routing via decorateComments,
+// using the precomputed nested ranges to avoid re-walking the AST; (4)
+// per-field lead/trail blank spans so Fprint can dual-emit boundary
+// whitespace and let gofmt coalesce duplicates. Never errors — inputs
+// that would corrupt splicing are silently filtered out and their
+// structs simply do not appear in the returned File.structs.
 func (dec *Decorator) DecorateFileSrc(f *ast.File, src []byte) *File {
 	tf := dec.Fset.File(f.Pos())
 	df := &File{ast: f, source: src, tf: tf}
@@ -154,7 +182,10 @@ func (dec *Decorator) DecorateFileSrc(f *ast.File, src []byte) *File {
 			}
 			nestedRanges[outer] = append(nestedRanges[outer], nestedRange{lo: st.Fields.Opening, hi: st.Fields.Closing})
 		}
-		if dstSt, ok := dec.buildStruct(df, st); ok && !hasUnsafeBlockComment(dec.Fset, st, f.Comments) {
+		if dstSt, ok := dec.buildStruct(df, st); ok &&
+			!hasUnsafeBlockComment(dec.Fset, st, f.Comments) &&
+			!hasBuildConstraintComment(st, f.Comments) &&
+			!hasLineDirectiveComment(st, f.Comments) {
 			dec.Dst.Nodes[st] = dstSt
 			df.structs = append(df.structs, dstSt)
 			decoratedSet[st] = struct{}{}
@@ -198,10 +229,26 @@ func (dec *Decorator) DecorateFileSrc(f *ast.File, src []byte) *File {
 	return df
 }
 
-// buildStruct constructs the DST wrappers for one *ast.StructType. Decoration
-// (comment routing, source-span recording) is layered on top in later tasks.
-// Returns (nil, false) for single-line struct declarations where { and } share
-// a line — span arithmetic would invert for those, so they are not decorated.
+// buildStruct constructs the DST wrappers and per-field byte spans for one
+// struct, or returns (nil, false) when the struct's source shape would break
+// splice-based reprinting. The returned StructType is fully populated apart
+// from comment-derived state (lead/trail), which decorateComments fills in
+// later. The rejection sweep here is the single source of truth for "shapes
+// dstmin will never touch"; each `return nil, false` carries the originating
+// bug tag so future regressions land near the matching test:
+//
+//   - single-line struct ({ ... } on one line): span arithmetic inverts.
+//   - first field on the { line: field span would overlap struct header.
+//   - last field on the } line (BUG-31): field span overflows struct footer.
+//   - consecutive fields sharing a source line (BUG-34/38): no clean
+//     per-field byte cut.
+//   - body containing \r (BUG-35) or \f (BUG-37): position math and gofmt
+//     trailing-newline collapse, respectively, both break splicing.
+//   - body containing *//* or *///: gofmt-impossible patterns (BUG-40).
+//
+// hasUnsafeBlockComment / hasBuildConstraintComment / hasLineDirectiveComment
+// catch comment-induced shapes; this function handles structural shapes only.
+// Pure with respect to df.source — never mutates the bytes.
 func (dec *Decorator) buildStruct(df *File, st *ast.StructType) (*StructType, bool) {
 	dstSt := &StructType{ast: st}
 	fl := &FieldList{}
@@ -280,11 +327,28 @@ func (dec *Decorator) buildStruct(df *File, st *ast.StructType) (*StructType, bo
 	return dstSt, true
 }
 
-// decorateComments walks file.Comments and routes each comment group inside
-// the struct's body to Opening, a Field's lead, or a Field's trailing block,
-// per the rules documented in the design spec. nested is the precomputed list
-// of direct and indirect descendant struct body ranges for st; it is built
-// once in DecorateFile to avoid per-struct ast.Inspect re-walks.
+// decorateComments routes each in-body comment group to one of four
+// attachment slots (Opening, lead-doc of a field, trailing block of a field,
+// or none) so that reorder can move comments together with their owning
+// field. nested is the precomputed slice of descendant struct body ranges
+// for st — comments inside an inner struct are routed by that inner
+// struct's own decorateComments call, not by the outer one. Hoisting the
+// nested list out of an ast.Inspect re-walk per struct turns the whole
+// pass from O(N²) into O(N+C) where N is struct count and C is comment
+// count.
+//
+// The four rules are applied in order; the first match wins:
+//
+//	Rule 1: comment on the { line          -> Opening
+//	Rule 3: comment starts on a field's last line -> field's trail
+//	Rule 2: comment ends on the line just before a field -> field's lead-doc
+//	Rule 4: floating block between fields  -> nearest preceding field's trail
+//
+// Rule numbering predates the implementation order and is preserved to keep
+// the BUG- references readable (BUG-36 / BUG-39 are extension fixes on
+// Rules 4 and 2 respectively, where a comment group spans across the rule
+// boundary; the in-line // comments at each fix mark the BUG tag).
+// Mutates dstSt.Fields.List entries in place. Pure with respect to df.source.
 func (dec *Decorator) decorateComments(df *File, st *ast.StructType, dstSt *StructType, fileComments []*ast.CommentGroup, nested []nestedRange) {
 	if len(dstSt.Fields.List) == 0 {
 		// No fields: every body comment routes to Opening.
@@ -424,16 +488,38 @@ func (dec *Decorator) decorateComments(df *File, st *ast.StructType, dstSt *Stru
 	}
 }
 
-// insideStructBody reports whether cg is between st.Fields.Opening and
-// st.Fields.Closing (exclusive of the brace lines themselves except for
-// same-line cases).
+// insideStructBody is the body-membership predicate used by decorateComments
+// and the comment-based safety guards. The strict inequality on both ends
+// is intentional: a comment that starts AT the { position is the brace's
+// own associated comment (none in Go, but defensive), and one that ends AT
+// the } position would otherwise be claimed by this struct AND swallowed
+// by spliceDirty's cursor advance past bodyEnd. Treating both boundaries
+// as exclusive keeps the comment in the surrounding source span, where
+// the verbatim splice copies it without dstmin needing to attach it.
 func insideStructBody(st *ast.StructType, cg *ast.CommentGroup) bool {
 	return cg.Pos() > st.Fields.Opening && cg.End() < st.Fields.Closing
 }
 
-// hasUnsafeBlockComment rejects multi-line block comments whose halves would
-// land in different splice partitions: brace-crossing (BUG-32) or `*/` on a
-// field's first line (BUG-33).
+// hasUnsafeBlockComment rejects structs whose body holds a block comment
+// shape that splice-based reprinting cannot keep consistent. Three failure
+// modes are covered together because all three are queries against the
+// same iterator over comments — separating them would re-scan three times:
+//
+//   - BUG-32: a /* ... */ that spans the { or } boundary. The two halves
+//     would land in different splice partitions (struct-body vs surrounding
+//     source) and reorder would split the comment in two.
+//   - BUG-33: a multi-line block comment whose closing */ lands on a
+//     field's first line. The header bytes and the field bytes share a
+//     line, so there's no clean per-field byte cut.
+//   - BUG-41: a comment group containing multiple comments where any of
+//     them is a block comment. Comment routing assigns the group as a unit;
+//     the trailing/lead bytes can't be kept consistent when reorder moves
+//     the group's anchor.
+//
+// fieldFirstLines is built lazily so the common case (no block comments in
+// body) stays alloc-free. Pure predicate, no mutation. Caller must have
+// already ruled out single-line { ... } via buildStruct's earlier checks —
+// the lbraceLine/rbraceLine comparisons assume {/} are on distinct lines.
 func hasUnsafeBlockComment(fset *token.FileSet, st *ast.StructType, comments []*ast.CommentGroup) bool {
 	tf := fset.File(st.Fields.Opening)
 	lbraceLine := tf.Line(st.Fields.Opening)
@@ -480,14 +566,71 @@ func hasUnsafeBlockComment(fset *token.FileSet, st *ast.StructType, comments []*
 	return false
 }
 
-// offsetOf returns the byte offset of pos within the file df.source belongs
-// to. Pos must be valid and inside the file.
+// hasLineDirectiveComment rejects structs whose body carries a recognised
+// Go line directive (//line file:line or /*line file:line*/). BUG-43: the
+// parser remaps tf.Line() for every position after such a directive to the
+// logical line; dstmin's other guards (hasUnsafeBlockComment, the per-rule
+// line comparisons in decorateComments, the consecutive-field check in
+// buildStruct) all read tf.Line() expecting monotonic growth with byte
+// offset, so a directive in the body lets a comment's *end* (physical line)
+// and a later field's *start* (logical line) sit in different number spaces
+// and overlap silently. The prefix match mirrors the scanner's recognition
+// rule exactly: literal "//line " or "/*line " with a single space after
+// "line"; tabs, newlines, and forms like /*line:42*/ are not directives and
+// stay decoratable. Pure predicate, no mutation.
+func hasLineDirectiveComment(st *ast.StructType, comments []*ast.CommentGroup) bool {
+	for _, cg := range comments {
+		if cg.End() <= st.Fields.Opening || cg.Pos() >= st.Fields.Closing {
+			continue
+		}
+		for _, c := range cg.List {
+			if strings.HasPrefix(c.Text, "//line ") || strings.HasPrefix(c.Text, "/*line ") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hasBuildConstraintComment rejects structs whose body carries a comment
+// gofmt recognises as a build constraint (//go:build, //+build, or
+// // +build). BUG-42: gofmt hoists such directives to the file header even
+// when they appear mid-struct, and in doing so drops the line break
+// separating the carrier field from its successor — after a reorder the
+// resulting field count diverges from the gofmt-normalised input. Detection
+// delegates to go/build/constraint.IsGoBuild and IsPlusBuild so the rule
+// stays in lock-step with gofmt's own recognition, including the word
+// boundary that excludes lookalikes like //go:buildtag or //+buildfoo. Pure
+// predicate, no mutation.
+func hasBuildConstraintComment(st *ast.StructType, comments []*ast.CommentGroup) bool {
+	for _, cg := range comments {
+		if cg.End() <= st.Fields.Opening || cg.Pos() >= st.Fields.Closing {
+			continue
+		}
+		for _, c := range cg.List {
+			if constraint.IsGoBuild(c.Text) || constraint.IsPlusBuild(c.Text) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// offsetOf is the byte-offset accessor used throughout the splice math.
+// Wraps token.File.Offset for readability and because every offset-using
+// call site does df.offsetOf(pos), making the bare token.File access
+// implicit. pos must be a valid position inside df.tf; passing a pos from
+// another file panics inside token.File.Offset.
 func (df *File) offsetOf(pos token.Pos) int {
 	return df.tf.Offset(pos)
 }
 
-// lineStartOffset returns the byte offset of the first byte of the line
-// containing offset. Walks back from offset to the preceding newline.
+// lineStartOffset is the inclusive lower bound for "take this line's bytes".
+// Used to anchor a field's bodyStart at column 0 even when the field
+// declaration starts mid-line in the source (after indentation or after a
+// trailing-comment-of-previous-field). Walking back to the preceding \n is
+// O(line length), which dominates only on pathological single-line files;
+// real Go code keeps it tiny. offset is clamped at 0 to handle line 1.
 func (df *File) lineStartOffset(offset int) int {
 	for offset > 0 && df.source[offset-1] != '\n' {
 		offset--
@@ -495,10 +638,11 @@ func (df *File) lineStartOffset(offset int) int {
 	return offset
 }
 
-// lineEndOffset returns the byte offset just past the next newline at or
-// after offset (or len(df.source) if EOF reached). The returned offset is
-// suitable as an exclusive upper bound — emitting source[start:end] includes
-// the trailing newline.
+// lineEndOffset is the exclusive upper bound for "take this line's bytes".
+// Returned offset is positioned just past the trailing \n so that
+// source[lineStart:lineEnd] is a self-contained line including its
+// terminator. EOF without a trailing newline returns len(df.source), which
+// callers slice safely — bodyEnd at EOF stays in-range. O(line length).
 func (df *File) lineEndOffset(offset int) int {
 	for offset < len(df.source) && df.source[offset] != '\n' {
 		offset++
@@ -509,9 +653,15 @@ func (df *File) lineEndOffset(offset int) int {
 	return offset
 }
 
-// consumeBlankLines returns the offset of the first non-blank line at or before limit.
-// A line is blank if it contains only tabs or spaces before its newline. The advance
-// is clamped to limit so the result never overlaps a following bodyStart.
+// consumeBlankLines advances past blank lines (tabs and spaces only before
+// the newline) starting at off, stopping at the first non-blank line or at
+// limit, whichever comes first. Used by Rule 4 in decorateComments to grow
+// a field's trailing span to include trailing blanks that visually belong
+// to the just-attached floating block — without this, reorder would leave
+// orphaned blanks behind the moving field's old position. The limit clamp
+// is load-bearing: the next field's bodyStart is the natural boundary, and
+// overshooting would double-attach the next field's leading whitespace.
+// O(scanned bytes); trivial in practice.
 func (df *File) consumeBlankLines(off, limit int) int {
 	for off < limit {
 		lineEnd := df.lineEndOffset(off)
@@ -534,14 +684,19 @@ func (df *File) consumeBlankLines(off, limit int) int {
 	return off
 }
 
-// filterOutermost filters dirty to only the outermost dirty structs. f.structs
-// is in source order from ast.Inspect (parent before children); a dirty struct
-// nested inside another dirty struct's body span would cause spliceDirty to
-// emit a backward slice. Drop the inner ones — their reorder is silently lost
-// but the file stays valid. (In practice betteralign filters to named top-level
-// struct declarations, so this case is not reachable today.)
+// filterOutermost keeps only the outermost dirty structs so spliceDirty's
+// monotone cursor advance does not emit a backward slice. dirty arrives in
+// source order (parent before children, courtesy of ast.Inspect during
+// DecorateFileSrc), so a single forward scan with a containment check
+// against the kept-so-far set is sufficient. Inner dirty structs are
+// silently dropped: their reorder is lost but the emitted file stays
+// valid Go, which is the safe failure mode. In practice betteralign's
+// caller filters to named top-level struct declarations before mutating,
+// so nested dirties are not reachable today — the filter exists as a
+// defence in depth against future callers that mutate freely.
 //
-// Inner dirty structs whose body span is inside another dirty struct are intentionally dropped.
+// O(K²) in the number of dirty structs, but K is tiny (typically 0 or 1
+// per file, occasionally a handful) so the quadratic factor never bites.
 func filterOutermost(dirty []*StructType) []*StructType {
 	out := dirty[:0:0]
 	for _, st := range dirty {
@@ -559,14 +714,27 @@ func filterOutermost(dirty []*StructType) []*StructType {
 	return out
 }
 
-// Fprint writes the source representation of f to w, with any modifications
-// to *StructType.Fields.List applied. Returns ErrFormat wrapped with details
-// when go/format.Source rejects the spliced output, or when the formatted
-// bytes fail to re-parse.
+// Fprint is the public emit entry point. It writes f's source with any
+// Fields.List mutations applied, going through gofmt on the way out and
+// re-parsing the formatted result to verify well-formed Go before handing
+// bytes to w. The double-validation is deliberate: gofmt sometimes
+// silently accepts inputs it rewrites into syntactically broken Go (the
+// build-constraint promotion case from BUG-42 was discovered through this
+// re-parse check), so callers can rely on a successful Fprint meaning
+// "the byte slice w received parses".
 //
-// Each field emits both its lead-blanks and trail-blanks; gofmt's natural
-// behavior coalesces the resulting double-blanks and strips brace-adjacent
-// blanks, producing output that matches sirkon/dst's dual-decoration model.
+// When no struct in f has been mutated (dirtyStructs returns empty), Fprint
+// short-circuits by writing f.source verbatim — neither gofmt nor reparse
+// runs. This is what makes the "decorated but never mutated" path a true
+// identity: no formatting drift, no risk of gofmt rewriting unrelated
+// code.
+//
+// On gofmt failure or re-parse failure the error wraps ErrFormat so
+// callers can errors.Is() and route the failure to "skip this file" rather
+// than aborting. Each field's lead-blanks and trail-blanks both get
+// emitted; gofmt's coalescing strips the resulting duplicate blank lines
+// and brace-adjacent blanks, mirroring sirkon/dst's dual-decoration model
+// without dstmin needing its own coalescer.
 func Fprint(w io.Writer, f *File) error {
 	dirty := dirtyStructs(f)
 	if len(dirty) == 0 {
@@ -586,8 +754,12 @@ func Fprint(w io.Writer, f *File) error {
 	return err
 }
 
-// dirtyStructs returns every struct in f whose Fields.List has been mutated
-// relative to its decoration-time snapshot (pointer-sequence comparison).
+// dirtyStructs collects the structs whose Fields.List the caller has
+// reordered since decoration. The comparison is by *Field pointer identity,
+// not deep equality, so swap-in-place is detected reliably without dstmin
+// having to clone fields. Used by Fprint to decide between the verbatim
+// fast path and the splice-and-format slow path. Allocation is preserved
+// at zero when nothing is dirty.
 func dirtyStructs(f *File) []*StructType {
 	out := make([]*StructType, 0, 4)
 	for _, st := range f.structs {
@@ -598,8 +770,12 @@ func dirtyStructs(f *File) []*StructType {
 	return out
 }
 
-// isDirty reports whether st's current Fields.List differs (by pointer
-// sequence) from the snapshot captured at decoration time.
+// isDirty is the per-struct half of dirtyStructs. Pointer-sequence
+// equality means a callers that creates new *Field values would falsely
+// appear dirty, but the dstmin API exposes no constructor for *Field —
+// the only legitimate mutation is reorder of the existing slice, which
+// keeps the pointers intact. Length divergence is the cheap early-out for
+// hypothetical add/remove.
 func isDirty(st *StructType) bool {
 	if len(st.Fields.List) != len(st.origList) {
 		return true
@@ -612,9 +788,14 @@ func isDirty(st *StructType) bool {
 	return false
 }
 
-// spliceDirty builds the output buffer by interleaving original-source spans
-// and synthesized struct bodies. dirty must be in source order (which it is
-// since DecorateFile populates f.structs in source-walk order).
+// spliceDirty assembles the output by walking dirty in source order,
+// alternating verbatim copies of f.source between body-spans with
+// synthesised body content for each dirty struct. The source-order
+// precondition is what makes the monotone cursor safe — filterOutermost
+// guarantees no inner struct is dirty, so the cursor advance past bodyEnd
+// never skips over a span we still need to emit. Pre-allocating the
+// buffer to len(f.source) avoids the regrowth loop on the typical "small
+// reorder of a large file" case.
 func spliceDirty(f *File, dirty []*StructType) []byte {
 	var buf bytes.Buffer
 	buf.Grow(len(f.source))
@@ -628,10 +809,21 @@ func spliceDirty(f *File, dirty []*StructType) []byte {
 	return buf.Bytes()
 }
 
-// synthesizeBodyInto writes a struct body's bytes in the new field order
-// directly into buf. Per design: lead-doc lines, the field's verbatim body
-// span, the field's verbatim trailing span. Between fields, no extra separator
-// (the field's bodyEnd already includes the trailing newline).
+// synthesizeBodyInto emits one struct body in the (possibly-reordered)
+// field sequence, using the decoration-time byte spans for body and
+// trailing-block plus the routed lead-doc lines. The emit order per field
+// is: leadBlanks (whitespace inherited from the previous field's tail),
+// lead-doc comments with the struct's indent re-prepended, verbatim body
+// bytes, trailing block bytes, trailBlanks. No separator is interpolated
+// between fields because every body-span ends in \n (lineEndOffset
+// guarantees) — relying on this saves dstmin from having to reason about
+// what separator the original source used.
+//
+// The dual-attachment design (every field carries both leadBlanks AND
+// trailBlanks, even though they are adjacent neighbours' bytes) is what
+// makes reorder safe: after a swap, both halves of every gap are emitted
+// from the new neighbours' perspective, gofmt coalesces the duplicate
+// blank lines, and the output matches what sirkon/dst would have produced.
 func synthesizeBodyInto(buf *bytes.Buffer, f *File, st *StructType) {
 	for _, fld := range st.Fields.List {
 		if fld.leadBlanksEnd > fld.leadBlanksStart {

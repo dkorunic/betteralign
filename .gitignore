@@ -19,8 +19,9 @@ cmd/betteralign/betteralign
 .fuzztmp/
 
 # go-fuzz output: built zips, workdirs (corpus/, crashers/, suppressions/)
-/fuzz/
+fuzz/
 *-fuzz.zip
+testdata/fuzz-corpus/
 
 ### Intellij ###
 # User-specific stuff:
@@ -53,3 +54,4 @@ token.json
 
 ## Agent Plans
 docs/
+doc/

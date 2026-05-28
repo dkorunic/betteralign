@@ -41,8 +41,19 @@ import (
 	"go/token"
 )
 
-// FuzzDecorateFileIdentity asserts that decoration followed by Fprint with no
-// mutation reproduces the input byte-for-byte.
+// FuzzDecorateFileIdentity asserts the no-mutation round-trip: decorate
+// the input, Fprint without touching any Fields.List, and compare the
+// output to the original source byte-for-byte. Any drift means dstmin's
+// "decorated but unmodified files survive unchanged" promise has broken,
+// which would silently rewrite users' source on a plain analyzer pass.
+//
+// The byte-exact comparison is intentional: dstmin's identity path
+// short-circuits in Fprint to a direct buf.Write(f.source) when no
+// struct is dirty, so drift here means the short-circuit itself is wrong
+// — not gofmt drift, but a decoration-time state leak. Returns 1 on
+// success (always interesting because every accepted input exercises
+// the splice math), -1 only when the parser rejects the input as not
+// being Go at all.
 func FuzzDecorateFileIdentity(data []byte) int {
 	src := string(data)
 	fset := token.NewFileSet()
@@ -62,15 +73,28 @@ func FuzzDecorateFileIdentity(data []byte) int {
 	return 1
 }
 
-// FuzzDecorateFileReorder swaps the first two fields of the first struct with
-// >=2 fields, then checks that the printed output:
+// FuzzDecorateFileReorder is the headline reorder harness — every BUG-NN
+// guard in dstmin's decoration path was either motivated by or
+// regression-tested through this fuzz target. It picks the first
+// decorated struct with at least two fields, swaps fields[0] and
+// fields[1] in place, prints, re-parses, and checks two invariants on
+// the result:
 //
-//   - parses as valid Go
-//   - has the swapped fields in positions [0]/[1] of the same struct,
-//     measured by canonical name+type signature
+//   - the output parses as valid Go (any parse failure is a hard bug —
+//     dstmin must never emit syntactically broken bytes)
+//   - the swapped fields end up at positions [0]/[1] of the same struct,
+//     compared by canonical name+type signature against the same swap
+//     applied to the gofmt-normalised input
 //
-// Inputs that fail Fprint with ErrFormat are kept (return 0) — that's a
-// documented dstmin rejection path, not a bug.
+// The gofmt-normalised comparison side is what makes the harness robust
+// to legitimate gofmt rewrites (spacing, comment alignment) — both
+// sides go through format.Source so any rewrite cancels out.
+//
+// ErrFormat from Fprint returns 0 (keep-uninteresting): the format.Source
+// rejection is a documented dstmin failure path for inputs gofmt won't
+// accept, not a bug. parser-rejected inputs and "no decoratable struct
+// with ≥2 fields" both return -1 (reject) so the fuzzer doesn't keep
+// inputs that exercise nothing.
 func FuzzDecorateFileReorder(data []byte) int {
 	src := string(data)
 	fset := token.NewFileSet()
@@ -162,9 +186,14 @@ func FuzzDecorateFileReorder(data []byte) int {
 	return 1
 }
 
-// fieldSigGoFuzz mirrors fieldSig from fuzz_test.go (unreachable here because
-// it lives in a _test.go file). Canonical name+type signature, stable across
-// gofmt normalizations when both inputs are gofmt'd.
+// fieldSigGoFuzz produces a canonical "name1,name2 type" signature for
+// one ast.Field. Exists as a duplicate of fieldSig from fuzz_test.go
+// because that function lives in a _test.go file and is unreachable from
+// the gofuzz-tag-gated build. The signature is stable across gofmt
+// normalisations as long as both inputs went through format.Source — the
+// printer.Fprint call serialises the type expression in the same form
+// gofmt would, so spacing and alignment differences cancel out. Used by
+// FuzzDecorateFileReorder for per-field equality across the reorder.
 func fieldSigGoFuzz(fset *token.FileSet, f *ast.Field) string {
 	var buf bytes.Buffer
 	for i, name := range f.Names {
@@ -180,8 +209,15 @@ func fieldSigGoFuzz(fset *token.FileSet, f *ast.Field) string {
 	return buf.String()
 }
 
-// nthStructGoFuzz returns the n-th *ast.StructType in preorder walk of file.
-// Mirrors nthStruct from fuzz_test.go.
+// nthStructGoFuzz returns the n-th *ast.StructType in source order, or
+// nil if file has fewer than n+1 structs. Duplicate of nthStruct from
+// fuzz_test.go (same _test.go unreachability rationale as
+// fieldSigGoFuzz). The harness uses it to locate the same target struct
+// across three separately-parsed files (input, dstmin's output, and
+// gofmt-normalised input) without relying on pointer identity, which
+// would not survive separate ParseFile calls. Preorder walk and the
+// `if found != nil { return false }` short-circuit make this O(N) in
+// the AST node count up to the target.
 func nthStructGoFuzz(file *ast.File, n int) *ast.StructType {
 	var found *ast.StructType
 	i := 0

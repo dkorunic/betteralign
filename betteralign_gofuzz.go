@@ -53,14 +53,24 @@ import (
 	"go/types"
 )
 
-// FuzzOptimalOrder is the go-fuzz entry corresponding to the testing.F
-// version in betteralign_fuzz_test.go. Invariants enforced per named struct:
+// FuzzOptimalOrder is the dvyukov/go-fuzz entry corresponding to the
+// testing.F harness in betteralign_fuzz_test.go. The two harnesses share
+// invariant-check helpers via this package-internal layer because the
+// native testing.F path takes *testing.T (which doesn't exist outside
+// _test.go) while the go-fuzz path uses panic for failure reporting.
+// Invariants enforced per named struct in the type-checked input:
 //
 //   - optimalOrder does not panic
 //   - returned indexes are a valid permutation of [0, NumFields)
 //   - returned optSize never exceeds the struct's original Sizeof
 //   - returned optPtrdata never exceeds the struct's original ptrdata
 //   - neither optSize nor optPtrdata go negative
+//
+// Return code follows the go-fuzz protocol: -1 reject (input rejected at
+// parse/type-check, or no inspectable structs), 0 keep-uninteresting (not
+// emitted here), 1 keep-interesting (at least one struct was checked).
+// Invariant violations surface as panics that go-fuzz routes into the
+// workdir's crashers/ directory.
 func FuzzOptimalOrder(data []byte) int {
 	pkg := typeCheckGoFuzz(string(data))
 	if pkg == nil {
@@ -93,13 +103,19 @@ func FuzzOptimalOrder(data []byte) int {
 	return 1
 }
 
-// FuzzGCSizes is the go-fuzz entry corresponding to the testing.F version in
-// betteralign_fuzz_test.go. Invariants enforced per named type:
+// FuzzGCSizes is the dvyukov/go-fuzz entry for the gcSizes layer,
+// mirroring the testing.F harness in betteralign_fuzz_test.go. Targets the
+// arithmetic and overflow saturation in Alignof/Sizeof/ptrdata rather
+// than the higher-level optimalOrder algorithm. Invariants enforced per
+// named type in the type-checked input:
 //
 //   - Sizeof / Alignof / ptrdata do not panic
 //   - Sizeof >= ptrdata (pointer-bearing prefix can't exceed total size)
 //   - Alignof >= 1 (per the language spec)
-//   - neither Sizeof nor ptrdata go negative
+//   - neither Sizeof nor ptrdata go negative (overflow saturation works)
+//
+// Return code follows the go-fuzz protocol; see FuzzOptimalOrder for the
+// shared contract.
 func FuzzGCSizes(data []byte) int {
 	pkg := typeCheckGoFuzz(string(data))
 	if pkg == nil {
@@ -121,10 +137,25 @@ func FuzzGCSizes(data []byte) int {
 	return 1
 }
 
-// typeCheckGoFuzz mirrors typeCheckFuzzInput from betteralign_fuzz_test.go,
-// which is unreachable from non-test files because it takes *testing.T.
-// Returns nil on parser failure, nil package, or upstream go/types panic —
-// each treated by callers as the go-fuzz "uninteresting" signal.
+// typeCheckGoFuzz produces a *types.Package from arbitrary input bytes,
+// or nil for any failure mode the caller should treat as "uninteresting"
+// per the go-fuzz protocol. Exists as a separate function because the
+// testing.F version (typeCheckFuzzInput) takes *testing.T and is
+// therefore unreachable from this build-tag-gated file.
+//
+// Three failure paths funnel into the nil return: parser rejection
+// (deferred discard via the named return), nil *types.Package from
+// go/types when the type-checker rejects everything, and an upstream
+// panic from go/types (which it does on adversarial inputs in rare
+// corner cases). The panic-recovery defer is the load-bearing bit — a
+// panic during type-checking would otherwise terminate go-fuzz's worker
+// process and the input would be saved as a crasher even though the
+// failure is in the type-checker, not the harness invariants.
+//
+// types.Config is configured with a no-op error handler so partial
+// type-check results survive past the first reported error, and with
+// Importer: nil to avoid going to disk for arbitrary import paths the
+// fuzzer might fabricate.
 func typeCheckGoFuzz(src string) (pkg *types.Package) {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "input.go", src, parser.ParseComments|parser.SkipObjectResolution)
@@ -144,6 +175,14 @@ func typeCheckGoFuzz(src string) (pkg *types.Package) {
 	return pkg
 }
 
+// checkOptimalOrderInvariantsGoFuzz panics on any violation of the
+// FuzzOptimalOrder invariants. Centralised so the assertions stay in lock-
+// step with the testing.F path even when the latter grows new checks; the
+// name parameter is interpolated into every panic so go-fuzz crashers
+// point straight at the offending type. Five invariants are checked in
+// order from cheapest (index validity) to most expensive (recomputing
+// sizes.Sizeof on the original struct), so a malformed permutation
+// surfaces before the layout-comparison work even runs.
 func checkOptimalOrderInvariantsGoFuzz(name string, st *types.Struct, sizes *gcSizes) {
 	nf := st.NumFields()
 	indexes, optSize, optPtrdata := optimalOrder(st, sizes)
@@ -176,6 +215,13 @@ func checkOptimalOrderInvariantsGoFuzz(name string, st *types.Struct, sizes *gcS
 	}
 }
 
+// checkGCSizesInvariantsGoFuzz panics on any violation of the FuzzGCSizes
+// invariants. The four checks (sz ≥ 0, pd ≥ 0, al ≥ 1, pd ≤ sz) together
+// confirm the arithmetic primitives (align, mulSize, addSize) saturated
+// rather than wrapped, the spec's Alignof lower bound holds, and the
+// ptrdata-cannot-exceed-Sizeof invariant the GC relies on is preserved.
+// The name parameter is interpolated into every panic so go-fuzz crashers
+// point straight at the offending type.
 func checkGCSizesInvariantsGoFuzz(name string, typ types.Type, sizes *gcSizes) {
 	sz := sizes.Sizeof(typ)
 	al := sizes.Alignof(typ)

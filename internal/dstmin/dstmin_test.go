@@ -428,6 +428,116 @@ func TestDecorateFile_SameLineFieldsViaSemicolonIsSkipped(t *testing.T) {
 	}
 }
 
+// BUG-42 regression. Cases sweep both placement (trailing on carrier, own
+// line, no-args, last-field carrier) and prefix (//go:build, // +build with
+// space, //+build glued) because each triggers gofmt's directive-promotion
+// path via a different recogniser branch. Every form must skip decoration
+// so dstmin re-emits the source untouched; the trailing assertion compares
+// the buffer to the original input byte-for-byte.
+func TestDecorateFile_MidStructBuildConstraintIsSkipped(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+	}{
+		{"go_build_trailing", "package p\n\ntype S struct {\n\ta int //go:build foo\n\tb int\n}\n"},
+		{"go_build_own_line", "package p\n\ntype S struct {\n\ta int\n\t//go:build foo\n\tb int\n}\n"},
+		{"go_build_no_args", "package p\n\ntype S struct {\n\ta int //go:build\n\tb int\n}\n"},
+		{"go_build_last_field", "package p\n\ntype S struct {\n\ta int\n\tb int //go:build foo\n}\n"},
+		{"plus_build_spaced", "package p\n\ntype S struct {\n\ta int // +build foo\n\tb int\n}\n"},
+		{"plus_build_glued", "package p\n\ntype S struct {\n\ta int //+build foo\n\tb int\n}\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fset, f, _ := parseSource(t, tc.src)
+			dec := NewDecorator(fset)
+			df, err := dec.DecorateFile(f)
+			if err != nil {
+				t.Fatalf("DecorateFile: %v", err)
+			}
+			if len(df.structs) != 0 {
+				t.Errorf("len(df.structs) = %d, want 0 (build constraint mid-struct is non-decoratable)", len(df.structs))
+			}
+			var out bytes.Buffer
+			if err := Fprint(&out, df); err != nil {
+				t.Fatalf("Fprint: %v", err)
+			}
+			if out.String() != tc.src {
+				t.Errorf("Fprint changed output for skipped struct:\ngot:\n%s\nwant:\n%s", out.String(), tc.src)
+			}
+		})
+	}
+}
+
+// BUG-43 regression. Each case carries a Go line directive in a different
+// physical shape: block form alone on a line, block form trailing on a
+// field, multi-line block (the form that drives every go-fuzz crasher in
+// fuzz/decoratefilereorder/crashers), and the column-1 //line form. All
+// four must skip decoration since the directive remaps tf.Line() and
+// silently invalidates the per-line guards every other check relies on.
+func TestDecorateFile_MidStructLineDirectiveIsSkipped(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+	}{
+		{"block_form_alone", "package p\n\ntype S struct {\n\ta int\n\t/*line foo.go:42*/\n\tb int\n}\n"},
+		{"block_form_trailing", "package p\n\ntype S struct {\n\ta int /*line foo.go:42*/\n\tb int\n}\n"},
+		{"block_form_multiline", "package p\n\ntype S struct {\n\ta int\n\t/*line \n\t:42*/b int\n}\n"},
+		{"line_form_column1", "package p\n\ntype S struct {\n\ta int\n//line foo.go:42\n\tb int\n}\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fset, f, _ := parseSource(t, tc.src)
+			dec := NewDecorator(fset)
+			df, err := dec.DecorateFile(f)
+			if err != nil {
+				t.Fatalf("DecorateFile: %v", err)
+			}
+			if len(df.structs) != 0 {
+				t.Errorf("len(df.structs) = %d, want 0 (line directive mid-struct is non-decoratable)", len(df.structs))
+			}
+			var out bytes.Buffer
+			if err := Fprint(&out, df); err != nil {
+				t.Fatalf("Fprint: %v", err)
+			}
+			if out.String() != tc.src {
+				t.Errorf("Fprint changed output for skipped struct:\ngot:\n%s\nwant:\n%s", out.String(), tc.src)
+			}
+		})
+	}
+}
+
+// Narrowness check for the BUG-42 / BUG-43 guards. Each case looks like a
+// directive but fails the recogniser the production code defers to: no
+// word boundary after go:build / +build, missing space after //line, or
+// no space before the colon in /*line:..*/. The guards must let these
+// through so betteralign keeps reordering structs that carry incidental
+// comments with directive-like prefixes.
+func TestDecorateFile_NonPromotedDirectivesStillDecoratable(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+	}{
+		{"go_buildtag_glued", "package p\n\ntype S struct {\n\ta int //go:buildtag\n\tb int\n}\n"},
+		{"plus_buildfoo_glued", "package p\n\ntype S struct {\n\ta int //+buildfoo\n\tb int\n}\n"},
+		{"go_nosplit", "package p\n\ntype S struct {\n\ta int //go:nosplit\n\tb int\n}\n"},
+		{"line_no_space", "package p\n\ntype S struct {\n\ta int //line\n\tb int\n}\n"},
+		{"block_line_colon_no_space", "package p\n\ntype S struct {\n\ta int /*line:42*/\n\tb int\n}\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fset, f, _ := parseSource(t, tc.src)
+			dec := NewDecorator(fset)
+			df, err := dec.DecorateFile(f)
+			if err != nil {
+				t.Fatalf("DecorateFile: %v", err)
+			}
+			if len(df.structs) != 1 {
+				t.Errorf("len(df.structs) = %d, want 1 (non-promoted directive must not block decoration)", len(df.structs))
+			}
+		})
+	}
+}
+
 func TestDecorateFile_SingleLineStructIsSkipped(t *testing.T) {
 	src := "package p\n\ntype S struct { b int32; a byte }\n"
 	fset, f, _ := parseSource(t, src)
