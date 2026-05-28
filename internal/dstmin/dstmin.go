@@ -25,6 +25,7 @@ import (
 	"go/token"
 	"io"
 	"os"
+	"strings"
 )
 
 // Sentinel errors classified via errors.Is.
@@ -129,52 +130,36 @@ func (dec *Decorator) DecorateFileSrc(f *ast.File, src []byte) *File {
 	tf := dec.Fset.File(f.Pos())
 	df := &File{ast: f, source: src, tf: tf}
 
-	// Pass 1: register every decoratable struct.
+	// Single preorder walk registers decoratable structs and records nested-range entries
+	// against decorated ancestors. The stack holds every struct visited so far; decoratedSet
+	// filters which ancestors contribute ranges.
+	nestedRanges := make(map[*ast.StructType][]nestedRange)
+	decoratedSet := make(map[*ast.StructType]struct{})
+	var stack []*ast.StructType
 	ast.Inspect(f, func(n ast.Node) bool {
 		st, ok := n.(*ast.StructType)
 		if !ok || st.Fields == nil {
 			return true
 		}
-		dstSt, ok := dec.buildStruct(df, st)
-		if !ok {
-			return true
-		}
-		dec.Dst.Nodes[st] = dstSt
-		df.structs = append(df.structs, dstSt)
-		return true
-	})
-
-	// Pass 2: nested-range lookup. ast.Inspect is preorder, so a stack of
-	// currently-open struct bodies gives O(n*depth) ancestor lookup instead
-	// of the previous O(n*decorated_n) outer-loop. Decorated-set membership
-	// is checked once per ancestor to record only outer structs we kept.
-	nestedRanges := make(map[*ast.StructType][]nestedRange, len(df.structs))
-	decoratedSet := make(map[*ast.StructType]struct{}, len(df.structs))
-	for _, dstSt := range df.structs {
-		decoratedSet[dstSt.ast] = struct{}{}
-	}
-	var stack []*ast.StructType
-	ast.Inspect(f, func(n ast.Node) bool {
-		inner, ok := n.(*ast.StructType)
-		if !ok || inner.Fields == nil {
-			return true
-		}
-		// Pop any stack entries that don't contain inner (preorder siblings).
 		for len(stack) > 0 {
 			top := stack[len(stack)-1]
-			if inner.Fields.Opening > top.Fields.Opening && inner.Fields.Closing < top.Fields.Closing {
+			if st.Fields.Opening > top.Fields.Opening && st.Fields.Closing < top.Fields.Closing {
 				break
 			}
 			stack = stack[:len(stack)-1]
 		}
-		// Remaining stack members are inner's true ancestors.
 		for _, outer := range stack {
-			if _, ok := decoratedSet[outer]; !ok {
+			if _, decorated := decoratedSet[outer]; !decorated {
 				continue
 			}
-			nestedRanges[outer] = append(nestedRanges[outer], nestedRange{lo: inner.Fields.Opening, hi: inner.Fields.Closing})
+			nestedRanges[outer] = append(nestedRanges[outer], nestedRange{lo: st.Fields.Opening, hi: st.Fields.Closing})
 		}
-		stack = append(stack, inner)
+		if dstSt, ok := dec.buildStruct(df, st); ok && !hasUnsafeBlockComment(dec.Fset, st, f.Comments) {
+			dec.Dst.Nodes[st] = dstSt
+			df.structs = append(df.structs, dstSt)
+			decoratedSet[st] = struct{}{}
+		}
+		stack = append(stack, st)
 		return true
 	})
 
@@ -232,6 +217,35 @@ func (dec *Decorator) buildStruct(df *File, st *ast.StructType) (*StructType, bo
 	if len(st.Fields.List) > 0 && df.offsetOf(st.Fields.List[0].Pos()) < lbraceLineEnd {
 		// First field on the { line: spans would overlap the struct header.
 		return nil, false
+	}
+	// BUG-31: last field on } line — bodyEnd would overflow the struct footer.
+	if n := len(st.Fields.List); n > 0 && df.offsetOf(st.Fields.List[n-1].End()) >= rbraceLineStart {
+		return nil, false
+	}
+	// BUG-34/38: consecutive fields must not share a source line.
+	for i := 1; i < len(st.Fields.List); i++ {
+		prevLast := df.tf.Line(st.Fields.List[i-1].End() - 1)
+		curFirst := df.tf.Line(st.Fields.List[i].Pos())
+		if prevLast >= curFirst {
+			return nil, false
+		}
+	}
+	// BUG-35/37: \r breaks comment position math; \f makes gofmt collapse trailing newlines.
+	structStart := df.offsetOf(st.Fields.Opening)
+	structEnd := df.offsetOf(st.Fields.Closing) + 1
+	// Reject in one sweep: \r/\f break splice math (BUG-35/37); *//* and *///
+	// are gofmt-impossible (BUG-40).
+	body := df.source[structStart:structEnd]
+	for i := 0; i < len(body); i++ {
+		switch body[i] {
+		case '\r', '\f':
+			return nil, false
+		case '*':
+			if i+3 < len(body) && body[i+1] == '/' && body[i+2] == '/' &&
+				(body[i+3] == '*' || body[i+3] == '/') {
+				return nil, false
+			}
+		}
 	}
 	dstSt.bodyStart = lbraceLineEnd
 	dstSt.bodyEnd = rbraceLineStart
@@ -349,6 +363,15 @@ func (dec *Decorator) decorateComments(df *File, st *ast.StructType, dstSt *Stru
 		assigned := false
 		for i, fl := range flines {
 			if cgEndLine == fl.first-1 {
+				// BUG-39: cg overlaps previous field's trail — extend trail, don't split.
+				if i > 0 && df.offsetOf(cg.Pos()) < dstSt.Fields.List[i-1].trailEnd {
+					cgEndOff := df.lineEndOffset(df.offsetOf(cg.End() - 1))
+					if cgEndOff > dstSt.Fields.List[i-1].trailEnd {
+						dstSt.Fields.List[i-1].trailEnd = cgEndOff
+					}
+					assigned = true
+					break
+				}
 				for _, c := range cg.List {
 					dstSt.Fields.List[i].lead = append(dstSt.Fields.List[i].lead, c.Text)
 				}
@@ -378,6 +401,12 @@ func (dec *Decorator) decorateComments(df *File, st *ast.StructType, dstSt *Stru
 			}
 			continue
 		}
+		// BUG-36: comment group overlaps next field's body — skip to avoid double-write on reorder.
+		if attachIdx+1 < len(flines) {
+			if df.offsetOf(cg.End()) > dstSt.Fields.List[attachIdx+1].bodyStart {
+				continue
+			}
+		}
 		// Extend trail to cover this comment and any blank lines that follow.
 		cgEndOff := df.lineEndOffset(df.offsetOf(cg.End()))
 		nextFieldStart := len(df.source)
@@ -400,6 +429,55 @@ func (dec *Decorator) decorateComments(df *File, st *ast.StructType, dstSt *Stru
 // same-line cases).
 func insideStructBody(st *ast.StructType, cg *ast.CommentGroup) bool {
 	return cg.Pos() > st.Fields.Opening && cg.End() < st.Fields.Closing
+}
+
+// hasUnsafeBlockComment rejects multi-line block comments whose halves would
+// land in different splice partitions: brace-crossing (BUG-32) or `*/` on a
+// field's first line (BUG-33).
+func hasUnsafeBlockComment(fset *token.FileSet, st *ast.StructType, comments []*ast.CommentGroup) bool {
+	tf := fset.File(st.Fields.Opening)
+	lbraceLine := tf.Line(st.Fields.Opening)
+	rbraceLine := tf.Line(st.Fields.Closing)
+	var fieldFirstLines map[int]bool
+	for _, cg := range comments {
+		if cg.End() <= st.Fields.Opening || cg.Pos() >= st.Fields.Closing {
+			continue
+		}
+		// BUG-41: multi-comment group with any block comment — routing can't keep bytes consistent.
+		if len(cg.List) > 1 {
+			for _, c := range cg.List {
+				if strings.HasPrefix(c.Text, "/*") {
+					return true
+				}
+			}
+		}
+		for _, c := range cg.List {
+			if !strings.HasPrefix(c.Text, "/*") {
+				continue
+			}
+			cgStart := tf.Line(c.Pos())
+			cgEnd := tf.Line(c.End() - 1)
+			if cgStart == cgEnd {
+				continue
+			}
+			if cgStart <= lbraceLine && cgEnd > lbraceLine {
+				return true
+			}
+			if cgStart < rbraceLine && cgEnd >= rbraceLine {
+				return true
+			}
+			if fieldFirstLines == nil {
+				fieldFirstLines = make(map[int]bool, len(st.Fields.List))
+				for _, fld := range st.Fields.List {
+					fieldFirstLines[tf.Line(fld.Pos())] = true
+				}
+			}
+			if fieldFirstLines[cgEnd] {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // offsetOf returns the byte offset of pos within the file df.source belongs
@@ -431,9 +509,9 @@ func (df *File) lineEndOffset(offset int) int {
 	return offset
 }
 
-// consumeBlankLines walks lines from off, returning the offset of the first
-// non-blank line at or before limit. A line is blank if it contains only tab
-// or space characters before its newline.
+// consumeBlankLines returns the offset of the first non-blank line at or before limit.
+// A line is blank if it contains only tabs or spaces before its newline. The advance
+// is clamped to limit so the result never overlaps a following bodyStart.
 func (df *File) consumeBlankLines(off, limit int) int {
 	for off < limit {
 		lineEnd := df.lineEndOffset(off)
@@ -447,6 +525,9 @@ func (df *File) consumeBlankLines(off, limit int) int {
 		}
 		if !blank {
 			return off
+		}
+		if lineEnd > limit {
+			return limit // never overshoot caller's limit, even on mid-line input
 		}
 		off = lineEnd
 	}

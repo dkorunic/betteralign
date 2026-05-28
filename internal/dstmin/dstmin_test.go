@@ -323,6 +323,111 @@ func TestDecorateFile_FieldOnBraceLineIsSkipped(t *testing.T) {
 	}
 }
 
+// BUG-31: last field on } line — symmetric to the existing first-field-on-{ guard.
+func TestDecorateFile_LastFieldOnBraceLineIsSkipped(t *testing.T) {
+	src := "package p\n\ntype S struct {\n\ta int\n\tb byte }\n"
+	fset, f, _ := parseSource(t, src)
+	dec := NewDecorator(fset)
+	df, err := dec.DecorateFile(f)
+	if err != nil {
+		t.Fatalf("DecorateFile: %v", err)
+	}
+	if len(df.structs) != 0 {
+		t.Errorf("len(df.structs) = %d, want 0 (last-field-on-brace-line is non-decoratable)", len(df.structs))
+	}
+	var out bytes.Buffer
+	if err := Fprint(&out, df); err != nil {
+		t.Fatalf("Fprint: %v", err)
+	}
+	if out.String() != src {
+		t.Errorf("Fprint changed output for skipped struct:\ngot:\n%s\nwant:\n%s", out.String(), src)
+	}
+}
+
+// BUG-32: block comment opens on { line, closes inside body — splice halves get separated.
+func TestDecorateFile_OpenBraceCrossingBlockCommentIsSkipped(t *testing.T) {
+	src := "package p\n\ntype S struct { /*\n*/a int\n\tb int\n}\n"
+	fset, f, _ := parseSource(t, src)
+	dec := NewDecorator(fset)
+	df, err := dec.DecorateFile(f)
+	if err != nil {
+		t.Fatalf("DecorateFile: %v", err)
+	}
+	if len(df.structs) != 0 {
+		t.Errorf("len(df.structs) = %d, want 0 (brace-crossing block comment is non-decoratable)", len(df.structs))
+	}
+	var out bytes.Buffer
+	if err := Fprint(&out, df); err != nil {
+		t.Fatalf("Fprint: %v", err)
+	}
+	if out.String() != src {
+		t.Errorf("Fprint changed output for skipped struct:\ngot:\n%s\nwant:\n%s", out.String(), src)
+	}
+}
+
+// BUG-32 symmetric: block comment opens inside body, closes on } line.
+func TestDecorateFile_CloseBraceCrossingBlockCommentIsSkipped(t *testing.T) {
+	src := "package p\n\ntype S struct {\n\ta int\n\tb int /*\n*/ }\n"
+	fset, f, _ := parseSource(t, src)
+	dec := NewDecorator(fset)
+	df, err := dec.DecorateFile(f)
+	if err != nil {
+		t.Fatalf("DecorateFile: %v", err)
+	}
+	if len(df.structs) != 0 {
+		t.Errorf("len(df.structs) = %d, want 0 (close-brace crossing block comment is non-decoratable)", len(df.structs))
+	}
+	var out bytes.Buffer
+	if err := Fprint(&out, df); err != nil {
+		t.Fatalf("Fprint: %v", err)
+	}
+	if out.String() != src {
+		t.Errorf("Fprint changed output for skipped struct:\ngot:\n%s\nwant:\n%s", out.String(), src)
+	}
+}
+
+// BUG-33: multi-line block comment ends on a field's first line — halves cross partition.
+func TestDecorateFile_InBodyMultiLineBlockCommentIsSkipped(t *testing.T) {
+	src := "package p\n\ntype S struct {\n/*\n*/a int\n\tb int\n}\n"
+	fset, f, _ := parseSource(t, src)
+	dec := NewDecorator(fset)
+	df, err := dec.DecorateFile(f)
+	if err != nil {
+		t.Fatalf("DecorateFile: %v", err)
+	}
+	if len(df.structs) != 0 {
+		t.Errorf("len(df.structs) = %d, want 0 (multi-line block comment in body is non-decoratable)", len(df.structs))
+	}
+	var out bytes.Buffer
+	if err := Fprint(&out, df); err != nil {
+		t.Fatalf("Fprint: %v", err)
+	}
+	if out.String() != src {
+		t.Errorf("Fprint changed output for skipped struct:\ngot:\n%s\nwant:\n%s", out.String(), src)
+	}
+}
+
+// BUG-34: `A; B int` — two fields share a source line and a body span.
+func TestDecorateFile_SameLineFieldsViaSemicolonIsSkipped(t *testing.T) {
+	src := "package p\n\ntype S struct {\n\ta int; b int\n}\n"
+	fset, f, _ := parseSource(t, src)
+	dec := NewDecorator(fset)
+	df, err := dec.DecorateFile(f)
+	if err != nil {
+		t.Fatalf("DecorateFile: %v", err)
+	}
+	if len(df.structs) != 0 {
+		t.Errorf("len(df.structs) = %d, want 0 (same-line fields are non-decoratable)", len(df.structs))
+	}
+	var out bytes.Buffer
+	if err := Fprint(&out, df); err != nil {
+		t.Fatalf("Fprint: %v", err)
+	}
+	if out.String() != src {
+		t.Errorf("Fprint changed output for skipped struct:\ngot:\n%s\nwant:\n%s", out.String(), src)
+	}
+}
+
 func TestDecorateFile_SingleLineStructIsSkipped(t *testing.T) {
 	src := "package p\n\ntype S struct { b int32; a byte }\n"
 	fset, f, _ := parseSource(t, src)
@@ -354,6 +459,51 @@ func TestDecorateFile_SingleLineStructIsSkipped(t *testing.T) {
 	}
 	if out.String() != src {
 		t.Errorf("Fprint changed output for clean file:\ngot:\n%s\nwant:\n%s", out.String(), src)
+	}
+}
+
+// TestDecorateFile_IndentDetectedFromSpaces pins indent detection on non-tab whitespace.
+func TestDecorateFile_IndentDetectedFromSpaces(t *testing.T) {
+	src := "package p\n\ntype S struct {\n    a int\n    b int\n}\n"
+	fset, f, _ := parseSource(t, src)
+	dec := NewDecorator(fset)
+	df, err := dec.DecorateFile(f)
+	if err != nil {
+		t.Fatalf("DecorateFile: %v", err)
+	}
+	if len(df.structs) != 1 {
+		t.Fatalf("len(df.structs) = %d, want 1", len(df.structs))
+	}
+	if got := df.structs[0].indent; got != "    " {
+		t.Errorf("indent = %q, want %q (four spaces)", got, "    ")
+	}
+}
+
+// TestDecorateFile_LeadDocIndentPreserved pins indent on lead-doc lines.
+// Inspects the pre-gofmt buffer because gofmt re-indents and masks the bug.
+func TestDecorateFile_LeadDocIndentPreserved(t *testing.T) {
+	src := "package p\n\ntype S struct {\n\t// lead for b\n\ta int\n\tb int\n}\n"
+	fset, f, _ := parseSource(t, src)
+	dec := NewDecorator(fset)
+	df, err := dec.DecorateFile(f)
+	if err != nil {
+		t.Fatalf("DecorateFile: %v", err)
+	}
+	if len(df.structs) != 1 {
+		t.Fatalf("len(df.structs) = %d, want 1", len(df.structs))
+	}
+	st := df.structs[0]
+	st.Fields.List[0], st.Fields.List[1] = st.Fields.List[1], st.Fields.List[0]
+
+	// Inspect raw spliced bytes; gofmt would rewrite indentation post-format.
+	raw := spliceDirty(df, dirtyStructs(df))
+	idx := bytes.Index(raw, []byte("// lead for b"))
+	if idx < 0 {
+		t.Fatalf("lead-doc comment dropped from raw splice:\n%s", string(raw))
+	}
+	if idx == 0 || string(raw[idx-len(st.indent):idx]) != st.indent {
+		t.Errorf("lead-doc indent dropped; indent=%q, raw bytes around comment:\n%s",
+			st.indent, string(raw[max(0, idx-8):min(len(raw), idx+24)]))
 	}
 }
 

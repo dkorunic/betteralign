@@ -9,6 +9,7 @@ package betteralign
 
 import (
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -22,6 +23,7 @@ import (
 
 	dst "github.com/dkorunic/betteralign/internal/dstmin"
 	"golang.org/x/tools/go/analysis"
+	"golang.org/x/tools/go/ast/inspector"
 )
 
 // testSizes64 is the 64-bit gcSizes used by every size/alignment expectation here.
@@ -76,6 +78,18 @@ func TestGcSizesAlignofArray(t *testing.T) {
 	arrBool := types.NewArray(types.Typ[types.Bool], 100)
 	if got := testSizes64.Alignof(arrBool); got != 1 {
 		t.Errorf("Alignof([100]bool) = %d, want 1", got)
+	}
+
+	// Cases where element-size ≠ element-alignment, to distinguish Alignof from Sizeof.
+	arrInt8 := types.NewArray(types.Typ[types.Int8], 8)
+	if got := testSizes64.Alignof(arrInt8); got != 1 {
+		t.Errorf("Alignof([8]int8) = %d, want 1 (Sizeof-mutation would return 8)", got)
+	}
+
+	inner := types.NewArray(types.Typ[types.Int8], 8)
+	outer := types.NewArray(inner, 4)
+	if got := testSizes64.Alignof(outer); got != 1 {
+		t.Errorf("Alignof([4][8]int8) = %d, want 1", got)
 	}
 }
 
@@ -341,6 +355,39 @@ func TestGcSizesArrayOverflowSaturates(t *testing.T) {
 	}
 	if pd > sz {
 		t.Errorf("invariant violation: ptrdata=%d > Sizeof=%d", pd, sz)
+	}
+}
+
+// TestAlignSaturationBoundary pins the `(a-1)` off-by-one in align()'s overflow guard.
+func TestAlignSaturationBoundary(t *testing.T) {
+	cases := []struct {
+		name string
+		x, a int64
+		want int64
+	}{
+		// MaxInt64-3 with a=4: result is MaxInt64-3 (no saturation); off-by-one mutation saturates.
+		{"boundary x=MaxInt64-3 a=4", math.MaxInt64 - 3, 4, math.MaxInt64 - 3},
+		{"saturates x=MaxInt64-2 a=4", math.MaxInt64 - 2, 4, math.MaxInt64},
+		{"already aligned MaxInt64-7 a=8", math.MaxInt64 - 7, 8, math.MaxInt64 - 7},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := align(tc.x, tc.a); got != tc.want {
+				t.Errorf("align(%d, %d) = %d, want %d", tc.x, tc.a, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAddSizeArgOrder pins the operand pairing in addSize's `a > MaxInt64-b` guard.
+// An asymmetric (a, b) distinguishes the baseline from the `MaxInt64-a` typo.
+func TestAddSizeArgOrder(t *testing.T) {
+	const a int64 = math.MaxInt64 - 20
+	const b int64 = 10
+	const want = math.MaxInt64 - 10
+
+	if got := addSize(a, b); got != want {
+		t.Errorf("addSize(%d, %d) = %d, want %d (typo `a > MaxInt64-a` would saturate)", a, b, got, want)
 	}
 }
 
@@ -1689,6 +1736,34 @@ func TestOptimalOrderNoPointers(t *testing.T) {
 	}
 }
 
+// TestOptimalOrderStableWithManyTiedFields forces pdqsort past the insertion-sort
+// threshold and across two alignment classes, so loss of stability shuffles tied fields.
+func TestOptimalOrderStableWithManyTiedFields(t *testing.T) {
+	const pairs = 16 // 32 fields total: clears pdqsort's insertion-sort threshold.
+	fields := make([]*types.Var, 0, pairs*2)
+	for i := 0; i < pairs; i++ {
+		fields = append(fields, types.NewVar(token.NoPos, nil, fmt.Sprintf("u64_%d", i), types.Typ[types.Uint64]))
+		fields = append(fields, types.NewVar(token.NoPos, nil, fmt.Sprintf("u32_%d", i), types.Typ[types.Uint32]))
+	}
+	strType := types.NewStruct(fields, nil)
+	indexes, _, _ := optimalOrder(strType, testSizes64)
+
+	// Stable: uint64s in even-index order first, then uint32s in odd-index order.
+	want := make([]int, 0, pairs*2)
+	for i := 0; i < pairs; i++ {
+		want = append(want, i*2) // uint64 declarations are at even indexes.
+	}
+	for i := 0; i < pairs; i++ {
+		want = append(want, i*2+1) // uint32 declarations are at odd indexes.
+	}
+	for i, idx := range indexes {
+		if idx != want[i] {
+			t.Errorf("indexes[%d] = %d, want %d (stable sort required for tied keys; full got %v want %v)", i, idx, want[i], indexes, want)
+			return
+		}
+	}
+}
+
 // TestOptimalOrderEmptyStructFields verifies optSize and optPtrdata for a
 // struct made entirely of zero-sized fields: stable sort keeps the order
 // unchanged, offset never advances, and the trailing-bump rule does not fire.
@@ -1861,7 +1936,143 @@ func TestNormalizeExcludePathsRejectsEscapingPath(t *testing.T) {
 	}
 }
 
+// TestNormalizeExcludePathsRejectsParentLiteral pins the `rel == ".."` arm,
+// which the prefix check (HasPrefix(rel, ".."+sep)) does not cover.
+func TestNormalizeExcludePathsRejectsParentLiteral(t *testing.T) {
+	wd := filepath.Join(string(filepath.Separator), "proj", "deep")
+	parent := filepath.Join(string(filepath.Separator), "proj") // exactly one level up.
+
+	if rel, err := filepath.Rel(wd, parent); err != nil || rel != ".." {
+		t.Fatalf("test fixture mis-sized: filepath.Rel(%q, %q) = %q, %v; want \"..\"", wd, parent, rel, err)
+	}
+
+	_, err := normalizeExcludePaths(wd, []string{parent})
+	if err == nil {
+		t.Fatal("expected error for exclude path resolving to exactly \"..\", got nil")
+	}
+	if !strings.Contains(err.Error(), "escapes working directory") {
+		t.Errorf("error should explain the escape: %v", err)
+	}
+}
+
 // ─── Layer 23: InitAnalyzer double-registration guard ────────────────────────
+
+// canonicalLoad type-checks src in-memory and returns its *types.Package and fileset.
+func canonicalLoad(t *testing.T, src string) (*types.Package, *token.FileSet) {
+	t.Helper()
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "test.go", src, parser.ParseComments)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	conf := types.Config{}
+	pkg, err := conf.Check("test", fset, []*ast.File{f}, nil)
+	if err != nil {
+		t.Fatalf("type-check: %v", err)
+	}
+	return pkg, fset
+}
+
+// TestCanonicalStructTypeGenericInstantiation pins .Origin(): a generic with T-using
+// fields has a per-instantiation underlying, distinct from the origin's.
+func TestCanonicalStructTypeGenericInstantiation(t *testing.T) {
+	pkg, _ := canonicalLoad(t, `package test
+type Box[T any] struct {
+	x byte
+	y T
+	z byte
+}
+type Inst = Box[int32]
+`)
+
+	box := pkg.Scope().Lookup("Box").Type().(*types.Named)
+	originStruct := box.Origin().Underlying().(*types.Struct)
+
+	// Inst is a type alias to Box[int32]; unaliasing gives the Named instantiation.
+	inst := types.Unalias(pkg.Scope().Lookup("Inst").Type()).(*types.Named)
+	if inst.Origin() != box {
+		t.Fatalf("Inst.Origin() = %v, want %v (fixture broken)", inst.Origin(), box)
+	}
+	instStruct := inst.Underlying().(*types.Struct)
+	if instStruct == originStruct {
+		t.Fatalf("instantiation reused origin's underlying; need a fixture where T appears in fields to force a fresh struct")
+	}
+
+	got := canonicalStructType(inst)
+	if got != originStruct {
+		t.Errorf("canonicalStructType(Box[int32]) = %p, want origin's struct %p (mutation drops .Origin())", got, originStruct)
+	}
+}
+
+// TestCollectPositionalUsersFirstWins pins "first occurrence wins" — the diagnostic must
+// point at the canonical (earliest) positional literal, not the last seen.
+func TestCollectPositionalUsersFirstWins(t *testing.T) {
+	src := `package test
+
+type T struct {
+	x byte
+	y int32
+	z byte
+}
+
+var _ = T{1, 2, 3} // first literal — line 9
+var _ = T{4, 5, 6} // second literal — line 10
+`
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "test.go", src, parser.ParseComments)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	conf := types.Config{}
+	info := &types.Info{
+		Types:      make(map[ast.Expr]types.TypeAndValue),
+		Defs:       make(map[*ast.Ident]types.Object),
+		Uses:       make(map[*ast.Ident]types.Object),
+		Implicits:  make(map[ast.Node]types.Object),
+		Selections: make(map[*ast.SelectorExpr]*types.Selection),
+		Scopes:     make(map[ast.Node]*types.Scope),
+	}
+	pkg, err := conf.Check("test", fset, []*ast.File{f}, info)
+	if err != nil {
+		t.Fatalf("type-check: %v", err)
+	}
+	insp := inspector.New([]*ast.File{f})
+	pass := &analysis.Pass{Fset: fset, Pkg: pkg, TypesInfo: info, Files: []*ast.File{f}}
+
+	users := collectPositionalUsers(insp, pass)
+	tStruct := pkg.Scope().Lookup("T").Type().(*types.Named).Underlying().(*types.Struct)
+
+	pos, ok := users[tStruct]
+	if !ok {
+		t.Fatal("collectPositionalUsers did not record T at all")
+	}
+	gotLine := fset.Position(pos).Line
+	if gotLine != 9 {
+		t.Errorf("users[T] line = %d, want 9 (first literal); a last-wins mutation would report line 10", gotLine)
+	}
+}
+
+// TestCanonicalStructTypeAlias pins types.Unalias: a `type A = T` alias must
+// collapse to T's underlying so positional literals through A pin the layout.
+func TestCanonicalStructTypeAlias(t *testing.T) {
+	pkg, _ := canonicalLoad(t, `package test
+type T struct {
+	x byte
+	y int32
+	z byte
+}
+type A = T
+`)
+
+	tNamed := pkg.Scope().Lookup("T").Type().(*types.Named)
+	underT := tNamed.Underlying().(*types.Struct)
+
+	aTyp := pkg.Scope().Lookup("A").Type() // an Alias wrapping T.
+	got := canonicalStructType(aTyp)
+	if got != underT {
+		t.Errorf("canonicalStructType(A) = %p, want T's struct %p (mutation drops types.Unalias)", got, underT)
+	}
+}
 
 // TestInitAnalyzerDoubleRegistrationIsNoop verifies that calling InitAnalyzer
 // twice on the same *analysis.Analyzer does not panic. flag.FlagSet.BoolVar

@@ -36,16 +36,23 @@ func main() {
 	undo, _ := maxprocs.Set()
 	defer undo()
 
-	// Intercept version flags before singlechecker; stop at first non-flag arg.
-	for _, arg := range os.Args[1:] {
-		if arg == "--" || len(arg) == 0 || arg[0] != '-' {
-			break
-		}
-		if arg == "-V" || arg == "-version" || arg == "--version" {
-			fmt.Println(getVersionString())
-			os.Exit(0)
-		}
+	if wantsVersion(os.Args[1:]) {
+		fmt.Println(getVersionString())
+		os.Exit(0)
 	}
 
 	singlechecker.Main(betteralign.Analyzer)
+}
+
+// wantsVersion reports whether args carry a version flag before the first positional arg or `--`.
+func wantsVersion(args []string) bool {
+	for _, arg := range args {
+		if arg == "--" || len(arg) == 0 || arg[0] != '-' {
+			return false
+		}
+		if arg == "-V" || arg == "-version" || arg == "--version" {
+			return true
+		}
+	}
+	return false
 }

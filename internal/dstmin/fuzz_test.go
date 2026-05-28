@@ -8,8 +8,10 @@ package dstmin
 import (
 	"bytes"
 	"errors"
+	"go/ast"
+	"go/format"
 	"go/parser"
-	"go/scanner"
+	"go/printer"
 	"go/token"
 	"io/fs"
 	"os"
@@ -114,7 +116,6 @@ func FuzzDecorateFileReorder(f *testing.F) {
 		}
 		dec := NewDecorator(fset)
 		df := dec.DecorateFileSrc(file, []byte(src))
-		// Find the first struct with >=2 fields. Skip if none.
 		var target *StructType
 		for _, st := range df.structs {
 			if len(st.Fields.List) >= 2 {
@@ -125,84 +126,118 @@ func FuzzDecorateFileReorder(f *testing.F) {
 		if target == nil {
 			t.Skip("no struct with >=2 fields")
 		}
-
-		// Capture pre-mutation field bytes; each must survive in the reordered output.
-		origFields := make([]string, len(target.Fields.List))
-		for i, fld := range target.Fields.List {
-			body := string(df.source[fld.bodyStart:fld.bodyEnd])
-			if fld.trailEnd > fld.trailStart {
-				body += string(df.source[fld.trailStart:fld.trailEnd])
-			}
-			origFields[i] = body
+		// Target's ordinal among all *ast.StructType nodes — used to locate it in gofmt'd input and output.
+		targetIdx := -1
+		{
+			i := 0
+			ast.Inspect(file, func(n ast.Node) bool {
+				if targetIdx >= 0 {
+					return false
+				}
+				if s, ok := n.(*ast.StructType); ok {
+					if s == target.ast {
+						targetIdx = i
+					}
+					i++
+				}
+				return true
+			})
+		}
+		if targetIdx < 0 {
+			t.Fatal("target struct not found in source AST")
 		}
 
 		target.Fields.List[0], target.Fields.List[1] = target.Fields.List[1], target.Fields.List[0]
 
 		var buf bytes.Buffer
 		if err := Fprint(&buf, df); err != nil {
-			// ErrFormat is the safety-net path; not a fuzzer-flagged bug.
 			if errors.Is(err, ErrFormat) {
 				return
 			}
 			t.Fatalf("Fprint (reorder): %v", err)
 		}
-		// The output MUST be valid Go.
-		if _, err := parser.ParseFile(token.NewFileSet(), "out.go", buf.Bytes(), parser.ParseComments|parser.SkipObjectResolution); err != nil {
+		outFset := token.NewFileSet()
+		outFile, err := parser.ParseFile(outFset, "out.go", buf.Bytes(), parser.ParseComments|parser.SkipObjectResolution)
+		if err != nil {
 			t.Errorf("reorder produced invalid Go:\n=== OUTPUT ===\n%s\n=== PARSE ERROR ===\n%v\n=== INPUT ===\n%s", buf.String(), err, src)
+			return
 		}
-		// Token-level match tolerates gofmt whitespace normalizations.
-		outToks := goTokens(buf.Bytes())
-		for i, body := range origFields {
-			needle := goTokens([]byte(body))
-			if len(needle) == 0 {
-				continue
-			}
-			if !containsTokenSeq(outToks, needle) {
-				t.Errorf("field %d token sequence missing from reordered output\nNEEDLE: %v\nOUTPUT:\n%s\nINPUT:\n%s", i, needle, buf.String(), src)
+
+		// Baseline expected: gofmt(input) with the same swap. Both sides go through
+		// format.Source, so gofmt normalizations apply equally and cancel out.
+		gofmtSrc, err := format.Source([]byte(src))
+		if err != nil {
+			t.Skip("input not formattable")
+		}
+		expFset := token.NewFileSet()
+		expFile, err := parser.ParseFile(expFset, "gofmt.go", gofmtSrc, parser.ParseComments|parser.SkipObjectResolution)
+		if err != nil {
+			t.Skip("gofmt'd input doesn't parse")
+		}
+		expStruct := nthStruct(expFile, targetIdx)
+		if expStruct == nil || expStruct.Fields == nil || len(expStruct.Fields.List) < 2 {
+			t.Skip("gofmt'd input lost the target struct")
+		}
+		expFields := append([]*ast.Field(nil), expStruct.Fields.List...)
+		expFields[0], expFields[1] = expFields[1], expFields[0]
+
+		outStruct := nthStruct(outFile, targetIdx)
+		if outStruct == nil || outStruct.Fields == nil {
+			t.Errorf("output lost the target struct\n=== OUTPUT ===\n%s\n=== INPUT ===\n%s", buf.String(), src)
+			return
+		}
+		if len(outStruct.Fields.List) != len(expFields) {
+			t.Errorf("field count: got %d, want %d\n=== OUTPUT ===\n%s\n=== INPUT ===\n%s",
+				len(outStruct.Fields.List), len(expFields), buf.String(), src)
+			return
+		}
+		for i, want := range expFields {
+			got := outStruct.Fields.List[i]
+			wantSig := fieldSig(expFset, want)
+			gotSig := fieldSig(outFset, got)
+			if wantSig != gotSig {
+				t.Errorf("field %d signature mismatch\nWANT: %q\nGOT:  %q\n=== OUTPUT ===\n%s\n=== INPUT ===\n%s",
+					i, wantSig, gotSig, buf.String(), src)
 			}
 		}
 	})
 }
 
-// goTokens tokenizes src, skipping comments and semicolons (gofmt rewrites
-// both independently of dstmin).
-func goTokens(src []byte) []string {
-	var s scanner.Scanner
-	fset := token.NewFileSet()
-	file := fset.AddFile("", -1, len(src))
-	s.Init(file, src, nil, 0) // don't ScanComments
-	var toks []string
-	for {
-		_, tok, lit := s.Scan()
-		if tok == token.EOF {
-			return toks
+// fieldSig is a canonical name+type signature; stable across gofmt normalizations when both inputs are gofmt'd.
+func fieldSig(fset *token.FileSet, f *ast.Field) string {
+	var buf bytes.Buffer
+	for i, name := range f.Names {
+		if i > 0 {
+			buf.WriteByte(',')
 		}
-		if tok == token.SEMICOLON {
-			continue
-		}
-		if lit != "" {
-			toks = append(toks, lit)
-			continue
-		}
-		toks = append(toks, tok.String())
+		buf.WriteString(name.Name)
 	}
+	if len(f.Names) > 0 {
+		buf.WriteByte(' ')
+	}
+	_ = printer.Fprint(&buf, fset, f.Type)
+	return buf.String()
 }
 
-func containsTokenSeq(hay, needle []string) bool {
-	if len(needle) > len(hay) {
-		return false
-	}
-	for i := 0; i <= len(hay)-len(needle); i++ {
-		match := true
-		for j, n := range needle {
-			if hay[i+j] != n {
-				match = false
-				break
-			}
+// nthStruct returns the n-th *ast.StructType in preorder walk of file.
+func nthStruct(file *ast.File, n int) *ast.StructType {
+	var found *ast.StructType
+	i := 0
+	ast.Inspect(file, func(node ast.Node) bool {
+		if found != nil {
+			return false
 		}
-		if match {
+		s, ok := node.(*ast.StructType)
+		if !ok {
 			return true
 		}
-	}
-	return false
+		if i == n {
+			found = s
+			return false
+		}
+		i++
+		return true
+	})
+	return found
 }
+

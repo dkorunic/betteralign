@@ -64,3 +64,14 @@ type NestedSliceOfPtr struct { // want `struct of size 12 could be 8; reorder sk
 }
 
 var _ = []*NestedSliceOfPtr{{1, 2, 3}}
+
+// Alias must collapse to T's underlying so the positional literal pins T.
+type Aliased struct { // want `struct of size 12 could be 8; reorder skipped: positional composite literal`
+	x byte
+	y int32
+	z byte
+}
+
+type AliasName = Aliased
+
+var _ = AliasName{1, 2, 3}

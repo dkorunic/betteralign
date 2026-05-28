@@ -30,7 +30,11 @@ func fillFromBuildInfo() {
 	if !ok {
 		return
 	}
+	fillFromBuildInfoData(info)
+}
 
+// fillFromBuildInfoData is fillFromBuildInfo with the BuildInfo injected; testable without runtime/debug.
+func fillFromBuildInfoData(info *debug.BuildInfo) {
 	if Version == defaultDevVersion {
 		if v := info.Main.Version; v != "" && v != "(devel)" {
 			Version = v

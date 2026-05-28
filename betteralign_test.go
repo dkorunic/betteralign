@@ -137,6 +137,64 @@ func TestApply(t *testing.T) {
 	}
 }
 
+// TestApplyViaFixAlias pins `-fix` propagating into `apply` (host-registered flag → analyzer).
+func TestApplyViaFixAlias(t *testing.T) {
+	srcDir := filepath.Join("testdata", "src")
+	workDir := filepath.Join(srcDir, "a")
+
+	tmpDir, err := os.MkdirTemp(srcDir, "fix-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	tmpWorkDir := filepath.Join(tmpDir, "a")
+	if err := os.Mkdir(tmpWorkDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	paths, err := filepath.Glob(filepath.Join(workDir, "*.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths = removeOtherArches(paths)
+
+	for _, path := range paths {
+		testBasename := filepath.Base(path)
+		testTmpname := filepath.Join(tmpWorkDir, testBasename)
+		src, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(testTmpname, src, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	testdata := analysistest.TestData()
+
+	analyzer := NewTestAnalyzer()
+	// singlechecker/multichecker would register -fix; without a real host, register it ourselves.
+	var fix bool
+	analyzer.Flags.BoolVar(&fix, "fix", false, "alias for -apply (test harness only)")
+	_ = analyzer.Flags.Set("fix", "true")
+
+	analysistest.Run(t, testdata, analyzer, filepath.Join(filepath.Base(tmpDir), "a"))
+
+	for _, path := range paths {
+		testBasename := filepath.Base(path)
+		testTmpname := filepath.Join(tmpWorkDir, testBasename)
+
+		testResult, err := os.ReadFile(testTmpname)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		goldenFilename := filepath.Join("src", "a", strings.Join([]string{testBasename, ".golden"}, ""))
+		golden.Assert(t, string(testResult), goldenFilename)
+	}
+}
+
 func TestFlagExcludeDirs(t *testing.T) {
 	t.Run("exclude none", func(t *testing.T) {
 		testdata := analysistest.TestData()
@@ -227,6 +285,14 @@ func TestFlagTestFiles(t *testing.T) {
 	})
 }
 
+// TestCurrentSkipResetsPerFile pins the per-file `currentSkip = false` reset:
+// a skipped file (generated header) must not leak its skip onto later files.
+func TestCurrentSkipResetsPerFile(t *testing.T) {
+	testdata := analysistest.TestData()
+	analyzer := NewTestAnalyzer()
+	analysistest.Run(t, testdata, analyzer, "skipcarry")
+}
+
 func TestFlagGeneratedFiles(t *testing.T) {
 	t.Run("generated files excluded by default", func(t *testing.T) {
 		testdata := analysistest.TestData()
@@ -239,6 +305,20 @@ func TestFlagGeneratedFiles(t *testing.T) {
 		analyzer := NewTestAnalyzer()
 		_ = analyzer.Flags.Set("generated_files", "true")
 		analysistest.Run(t, testdata, analyzer, "generated/b")
+	})
+
+	// Subtests above cover the comment-based path; these cover the filename-suffix path.
+	t.Run("generated suffix _gen.go excluded by default", func(t *testing.T) {
+		testdata := analysistest.TestData()
+		analyzer := NewTestAnalyzer()
+		analysistest.Run(t, testdata, analyzer, "generated_suffix/a")
+	})
+
+	t.Run("generated suffix _gen.go included with flag", func(t *testing.T) {
+		testdata := analysistest.TestData()
+		analyzer := NewTestAnalyzer()
+		_ = analyzer.Flags.Set("generated_files", "true")
+		analysistest.Run(t, testdata, analyzer, "generated_suffix/b")
 	})
 }
 

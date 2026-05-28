@@ -1,0 +1,2 @@
+go test fuzz v1
+string("package A\ntype(A struct{\nA\nA/*\n*//*\n*/\nA\n})")
