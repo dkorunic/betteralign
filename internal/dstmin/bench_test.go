@@ -30,6 +30,24 @@ func buildLargeSource(numStructs, fieldsPerStruct int) []byte {
 	return []byte(sb.String())
 }
 
+// buildCommentedSource synthesises a Go file with numStructs top-level
+// structs, each carrying a type doc comment and a lead-doc comment on every
+// field. Unlike buildLargeSource it populates f.Comments, so it exercises the
+// comment-routing path (the three guards + decorateComments) that scales with
+// the comment count — the quadratic-risk surface that commentRun narrows.
+func buildCommentedSource(numStructs, fieldsPerStruct int) []byte {
+	var sb strings.Builder
+	sb.WriteString("package bench\n\n")
+	for s := 0; s < numStructs; s++ {
+		fmt.Fprintf(&sb, "// S%d is a doc comment.\ntype S%d struct {\n", s, s)
+		for f := 0; f < fieldsPerStruct; f++ {
+			fmt.Fprintf(&sb, "\t// f%d doc\n\tf%d int\n", f, f)
+		}
+		sb.WriteString("}\n\n")
+	}
+	return []byte(sb.String())
+}
+
 // buildNestedSource synthesises a Go file with deeply nested struct types
 // — useful for exercising the ancestor-stack walk.
 func buildNestedSource(depth int) []byte {
@@ -83,6 +101,20 @@ func BenchmarkDecorateFileSrc_Medium(b *testing.B) {
 
 func BenchmarkDecorateFileSrc_Large(b *testing.B) {
 	fset, f, src := parseBenchSource(b, buildLargeSource(500, 30))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		dec := NewDecorator(fset)
+		_ = dec.DecorateFileSrc(f, src)
+	}
+}
+
+// BenchmarkDecorateFileSrc_Commented mirrors the Medium comment-free case in
+// struct/field count but adds a doc comment per type and per field, so it
+// drives the comment-routing path. Compare against _Medium to see the cost of
+// comment handling; track it across changes to commentRun.
+func BenchmarkDecorateFileSrc_Commented(b *testing.B) {
+	fset, f, src := parseBenchSource(b, buildCommentedSource(100, 20))
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

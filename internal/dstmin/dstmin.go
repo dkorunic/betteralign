@@ -26,6 +26,7 @@ import (
 	"go/token"
 	"io"
 	"os"
+	"sort"
 	"strings"
 )
 
@@ -146,10 +147,12 @@ func (dec *Decorator) DecorateFile(f *ast.File) (*File, error) {
 // the *File. The decoration runs in four passes against the AST: (1) a
 // single preorder walk that filters structs through buildStruct + the
 // safety guards (hasUnsafeBlockComment, hasBuildConstraintComment,
-// hasLineDirectiveComment) and records nested-struct ranges for the next
+// hasLineDirectiveComment), each fed the per-struct commentRun rather than
+// the whole f.Comments slice, and records nested-struct ranges for the next
 // pass; (2) implicit during the walk — registering decorated structs in
-// dec.Dst.Nodes; (3) per-struct comment routing via decorateComments,
-// using the precomputed nested ranges to avoid re-walking the AST; (4)
+// dec.Dst.Nodes; (3) per-struct comment routing via decorateComments, over
+// the same narrowed run and using the precomputed nested ranges to avoid
+// re-walking the AST; (4)
 // per-field lead/trail blank spans so Fprint can dual-emit boundary
 // whitespace and let gofmt coalesce duplicates. Never errors — inputs
 // that would corrupt splicing are silently filtered out and their
@@ -182,21 +185,25 @@ func (dec *Decorator) DecorateFileSrc(f *ast.File, src []byte) *File {
 			}
 			nestedRanges[outer] = append(nestedRanges[outer], nestedRange{lo: st.Fields.Opening, hi: st.Fields.Closing})
 		}
-		if dstSt, ok := dec.buildStruct(df, st); ok &&
-			!hasUnsafeBlockComment(dec.Fset, st, f.Comments) &&
-			!hasBuildConstraintComment(st, f.Comments) &&
-			!hasLineDirectiveComment(st, f.Comments) {
-			dec.Dst.Nodes[st] = dstSt
-			df.structs = append(df.structs, dstSt)
-			decoratedSet[st] = struct{}{}
+		if dstSt, ok := dec.buildStruct(df, st); ok {
+			// Narrow once, shared by all guards, to avoid per-struct rescans.
+			run := commentRun(f.Comments, st.Fields.Opening, st.Fields.Closing)
+			if !hasUnsafeBlockComment(dec.Fset, st, run) &&
+				!hasBuildConstraintComment(st, run) &&
+				!hasLineDirectiveComment(st, run) {
+				dec.Dst.Nodes[st] = dstSt
+				df.structs = append(df.structs, dstSt)
+				decoratedSet[st] = struct{}{}
+			}
 		}
 		stack = append(stack, st)
 		return true
 	})
 
-	// Pass 3: route comments per struct.
+	// Pass 3: route each struct's comments over its narrowed run.
 	for _, dstSt := range df.structs {
-		dec.decorateComments(df, dstSt.ast, dstSt, f.Comments, nestedRanges[dstSt.ast])
+		run := commentRun(f.Comments, dstSt.ast.Fields.Opening, dstSt.ast.Fields.Closing)
+		dec.decorateComments(df, dstSt.ast, dstSt, run, nestedRanges[dstSt.ast])
 	}
 
 	// Pass 4: per-field leadBlanks and trailBlanks for dual-attachment emit.
@@ -330,12 +337,17 @@ func (dec *Decorator) buildStruct(df *File, st *ast.StructType) (*StructType, bo
 // decorateComments routes each in-body comment group to one of four
 // attachment slots (Opening, lead-doc of a field, trailing block of a field,
 // or none) so that reorder can move comments together with their owning
-// field. nested is the precomputed slice of descendant struct body ranges
-// for st — comments inside an inner struct are routed by that inner
-// struct's own decorateComments call, not by the outer one. Hoisting the
-// nested list out of an ast.Inspect re-walk per struct turns the whole
-// pass from O(N²) into O(N+C) where N is struct count and C is comment
-// count.
+// field. fileComments is the caller-narrowed run for st (see commentRun),
+// not the whole file's comment list — every entry already overlaps st's
+// body, so the insideStructBody re-filter below only has to discard the
+// boundary-touching edge cases. nested is the precomputed slice of
+// descendant struct body ranges for st — comments inside an inner struct
+// are routed by that inner struct's own decorateComments call, not by the
+// outer one. Two changes keep this off the O(structs × comments) quadratic:
+// hoisting the nested list out of an ast.Inspect re-walk per struct, and
+// the commentRun binary-search narrowing at the call site. Together the
+// pass is O(structs × log C + Σ run lengths); for the common flat,
+// non-nested layout the run lengths sum to ~C, giving O(N log C + C).
 //
 // The four rules are applied in order; the first match wins:
 //
@@ -498,6 +510,32 @@ func (dec *Decorator) decorateComments(df *File, st *ast.StructType, dstSt *Stru
 // the verbatim splice copies it without dstmin needing to attach it.
 func insideStructBody(st *ast.StructType, cg *ast.CommentGroup) bool {
 	return cg.Pos() > st.Fields.Opening && cg.End() < st.Fields.Closing
+}
+
+// commentRun returns the contiguous sub-slice of comments whose byte range
+// overlaps the open struct-body interval (opening, closing). It exists to
+// kill the per-struct full rescan of f.Comments that the comment-based
+// guards and decorateComments would otherwise each perform: that made
+// decoration O(structs × comments), quadratic on large well-commented files.
+//
+// The optimisation is sound because of two ast invariants: f.Comments is
+// sorted by Pos, and Go comment groups never overlap, so both Pos() and
+// End() grow monotonically across the slice. The overlapping groups are
+// therefore one contiguous run that two binary searches isolate in
+// O(log C): the lower bound is the first group whose End passes opening, the
+// upper bound is the first group that starts at or after closing. Comments
+// inside a nested struct still overlap the outer body and so stay in the
+// outer's run — decorateComments routes them away via its nested-range skip,
+// preserving the pre-optimisation behaviour exactly. The returned slice
+// aliases comments; callers must not mutate it.
+func commentRun(comments []*ast.CommentGroup, opening, closing token.Pos) []*ast.CommentGroup {
+	n := len(comments)
+	lo := sort.Search(n, func(i int) bool { return comments[i].End() > opening })
+	hi := sort.Search(n, func(i int) bool { return comments[i].Pos() >= closing })
+	if lo >= hi {
+		return nil
+	}
+	return comments[lo:hi]
 }
 
 // hasUnsafeBlockComment rejects structs whose body holds a block comment
