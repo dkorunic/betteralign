@@ -112,112 +112,122 @@ func FuzzDecorateFileReorder(f *testing.F) {
 		f.Add(s)
 	}
 
-	f.Fuzz(func(t *testing.T, src string) {
-		fset := token.NewFileSet()
-		file, err := parser.ParseFile(fset, "input.go", src, parser.ParseComments|parser.SkipObjectResolution)
-		if err != nil {
-			t.Skip("input not valid Go")
+	f.Fuzz(reorderInvariant)
+}
+
+// reorderInvariant is the shared body of the reorder fuzz target, factored
+// out so the seed/fuzz driver (FuzzDecorateFileReorder) and the saved-crasher
+// replay (TestReorderCrashersDoNotPanic) exercise byte-for-byte the same
+// mutation and oracle. It reverses the first decoratable struct's fields,
+// reprints, and asserts the output (a) parses, (b) preserves the comment
+// multiset, and (c) places each field — by name+type signature — where the
+// same reversal of the gofmt-normalised input would. Early-outs the fuzzer
+// treats as "uninteresting" (unparseable input, no struct with >=2 fields,
+// ErrFormat, gofmt rejecting the input) skip rather than fail.
+//
+// The dvyukov-tagged twin in dstmin_gofuzz.go must mirror this logic by hand:
+// it lives under the gofuzz build tag and so cannot reach these _test.go
+// helpers.
+func reorderInvariant(t *testing.T, src string) {
+	t.Helper()
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "input.go", src, parser.ParseComments|parser.SkipObjectResolution)
+	if err != nil {
+		t.Skip("input not valid Go")
+	}
+	dec := NewDecorator(fset)
+	df := dec.DecorateFileSrc(file, []byte(src))
+	var target *StructType
+	for _, st := range df.structs {
+		if len(st.Fields.List) >= 2 {
+			target = st
+			break
 		}
-		dec := NewDecorator(fset)
-		df := dec.DecorateFileSrc(file, []byte(src))
-		var target *StructType
-		for _, st := range df.structs {
-			if len(st.Fields.List) >= 2 {
-				target = st
-				break
+	}
+	if target == nil {
+		t.Skip("no struct with >=2 fields")
+	}
+	// Ordinal locates the same struct across the re-parsed files.
+	targetIdx := -1
+	{
+		i := 0
+		ast.Inspect(file, func(n ast.Node) bool {
+			if targetIdx >= 0 {
+				return false
 			}
-		}
-		if target == nil {
-			t.Skip("no struct with >=2 fields")
-		}
-		// Target's ordinal among all *ast.StructType nodes — used to locate it in gofmt'd input and output.
-		targetIdx := -1
-		{
-			i := 0
-			ast.Inspect(file, func(n ast.Node) bool {
-				if targetIdx >= 0 {
-					return false
+			if s, ok := n.(*ast.StructType); ok {
+				if s == target.ast {
+					targetIdx = i
 				}
-				if s, ok := n.(*ast.StructType); ok {
-					if s == target.ast {
-						targetIdx = i
-					}
-					i++
-				}
-				return true
-			})
-		}
-		if targetIdx < 0 {
-			t.Fatal("target struct not found in source AST")
-		}
-
-		// Reverse rather than swap [0]/[1]: touches every position and the
-		// interior lead/trail-blank dual-attachment paths, not just the first two.
-		slices.Reverse(target.Fields.List)
-
-		var buf bytes.Buffer
-		if err := Fprint(&buf, df); err != nil {
-			if errors.Is(err, ErrFormat) {
-				return
+				i++
 			}
-			t.Fatalf("Fprint (reorder): %v", err)
-		}
-		outFset := token.NewFileSet()
-		outFile, err := parser.ParseFile(outFset, "out.go", buf.Bytes(), parser.ParseComments|parser.SkipObjectResolution)
-		if err != nil {
-			t.Errorf("reorder produced invalid Go:\n=== OUTPUT ===\n%s\n=== PARSE ERROR ===\n%v\n=== INPUT ===\n%s", buf.String(), err, src)
+			return true
+		})
+	}
+	if targetIdx < 0 {
+		t.Fatal("target struct not found in source AST")
+	}
+
+	// Reverse exercises every position and both blank-attachment paths.
+	slices.Reverse(target.Fields.List)
+
+	var buf bytes.Buffer
+	if err := Fprint(&buf, df); err != nil {
+		if errors.Is(err, ErrFormat) {
 			return
 		}
+		t.Fatalf("Fprint (reorder): %v", err)
+	}
+	outFset := token.NewFileSet()
+	outFile, err := parser.ParseFile(outFset, "out.go", buf.Bytes(), parser.ParseComments|parser.SkipObjectResolution)
+	if err != nil {
+		t.Errorf("reorder produced invalid Go:\n=== OUTPUT ===\n%s\n=== PARSE ERROR ===\n%v\n=== INPUT ===\n%s", buf.String(), err, src)
+		return
+	}
 
-		// Baseline expected: gofmt(input) with the same swap. Both sides go through
-		// format.Source, so gofmt normalizations apply equally and cancel out.
-		gofmtSrc, err := format.Source([]byte(src))
-		if err != nil {
-			t.Skip("input not formattable")
-		}
-		expFset := token.NewFileSet()
-		expFile, err := parser.ParseFile(expFset, "gofmt.go", gofmtSrc, parser.ParseComments|parser.SkipObjectResolution)
-		if err != nil {
-			t.Skip("gofmt'd input doesn't parse")
-		}
+	// gofmt'd baseline: both sides run format.Source, so normalizations cancel.
+	gofmtSrc, err := format.Source([]byte(src))
+	if err != nil {
+		t.Skip("input not formattable")
+	}
+	expFset := token.NewFileSet()
+	expFile, err := parser.ParseFile(expFset, "gofmt.go", gofmtSrc, parser.ParseComments|parser.SkipObjectResolution)
+	if err != nil {
+		t.Skip("gofmt'd input doesn't parse")
+	}
 
-		// Reorder is a permutation: it must neither drop nor duplicate
-		// comments, which fieldSig (name+type only) cannot see. Both sides are
-		// gofmt'd so file-level normalizations cancel, and whitespace is
-		// stripped so gofmt's context-dependent "// x" vs "//x" spacing can't
-		// false-positive.
-		if got, want := commentTexts(outFile), commentTexts(expFile); !slices.Equal(got, want) {
-			t.Errorf("reorder changed the comment multiset\nWANT: %q\nGOT:  %q\n=== OUTPUT ===\n%s\n=== INPUT ===\n%s",
-				want, got, buf.String(), src)
-		}
+	// Reorder must not drop or duplicate comments; fieldSig can't see that.
+	if got, want := commentTexts(outFile), commentTexts(expFile); !slices.Equal(got, want) {
+		t.Errorf("reorder changed the comment multiset\nWANT: %q\nGOT:  %q\n=== OUTPUT ===\n%s\n=== INPUT ===\n%s",
+			want, got, buf.String(), src)
+	}
 
-		expStruct := nthStruct(expFile, targetIdx)
-		if expStruct == nil || expStruct.Fields == nil || len(expStruct.Fields.List) < 2 {
-			t.Skip("gofmt'd input lost the target struct")
-		}
-		expFields := append([]*ast.Field(nil), expStruct.Fields.List...)
-		slices.Reverse(expFields)
+	expStruct := nthStruct(expFile, targetIdx)
+	if expStruct == nil || expStruct.Fields == nil || len(expStruct.Fields.List) < 2 {
+		t.Skip("gofmt'd input lost the target struct")
+	}
+	expFields := append([]*ast.Field(nil), expStruct.Fields.List...)
+	slices.Reverse(expFields)
 
-		outStruct := nthStruct(outFile, targetIdx)
-		if outStruct == nil || outStruct.Fields == nil {
-			t.Errorf("output lost the target struct\n=== OUTPUT ===\n%s\n=== INPUT ===\n%s", buf.String(), src)
-			return
+	outStruct := nthStruct(outFile, targetIdx)
+	if outStruct == nil || outStruct.Fields == nil {
+		t.Errorf("output lost the target struct\n=== OUTPUT ===\n%s\n=== INPUT ===\n%s", buf.String(), src)
+		return
+	}
+	if len(outStruct.Fields.List) != len(expFields) {
+		t.Errorf("field count: got %d, want %d\n=== OUTPUT ===\n%s\n=== INPUT ===\n%s",
+			len(outStruct.Fields.List), len(expFields), buf.String(), src)
+		return
+	}
+	for i, want := range expFields {
+		got := outStruct.Fields.List[i]
+		wantSig := fieldSig(expFset, want)
+		gotSig := fieldSig(outFset, got)
+		if wantSig != gotSig {
+			t.Errorf("field %d signature mismatch\nWANT: %q\nGOT:  %q\n=== OUTPUT ===\n%s\n=== INPUT ===\n%s",
+				i, wantSig, gotSig, buf.String(), src)
 		}
-		if len(outStruct.Fields.List) != len(expFields) {
-			t.Errorf("field count: got %d, want %d\n=== OUTPUT ===\n%s\n=== INPUT ===\n%s",
-				len(outStruct.Fields.List), len(expFields), buf.String(), src)
-			return
-		}
-		for i, want := range expFields {
-			got := outStruct.Fields.List[i]
-			wantSig := fieldSig(expFset, want)
-			gotSig := fieldSig(outFset, got)
-			if wantSig != gotSig {
-				t.Errorf("field %d signature mismatch\nWANT: %q\nGOT:  %q\n=== OUTPUT ===\n%s\n=== INPUT ===\n%s",
-					i, wantSig, gotSig, buf.String(), src)
-			}
-		}
-	})
+	}
 }
 
 // fieldSig is a canonical name+type signature; stable across gofmt normalizations when both inputs are gofmt'd.
@@ -246,6 +256,16 @@ func fieldSig(fset *token.FileSet, f *ast.Field) string {
 // reasons unrelated to preservation. Stripping markers+whitespace collapses
 // the spacing variants, and dropping empty contents ignores informationless
 // comments whose survival is immaterial.
+//
+// It also undoes gofmt's go/doc/comment typographic substitution: a pair
+// of backticks becomes U+201C and a pair of apostrophes becomes U+201D,
+// but only for comments gofmt treats as documentation. Because reorder
+// can move a comment between a doc-comment role and a floating role, the
+// same comment can serialise with curly quotes on one side of the oracle
+// and the bare ASCII pair on the other; mapping the curly quotes back to
+// their ASCII source keeps the fingerprint stable across that role
+// change. These are the only two character-level rewrites go/doc/comment
+// performs (dashes and the like are left verbatim).
 func commentTexts(file *ast.File) []string {
 	var out []string
 	for _, cg := range file.Comments {
@@ -257,6 +277,7 @@ func commentTexts(file *ast.File) []string {
 			case strings.HasPrefix(t, "/*") && strings.HasSuffix(t, "*/"):
 				t = t[2 : len(t)-2]
 			}
+			t = smartQuoteUndo.Replace(t)
 			if t = strings.Join(strings.Fields(t), ""); t != "" {
 				out = append(out, t)
 			}
@@ -264,6 +285,38 @@ func commentTexts(file *ast.File) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// smartQuoteUndo reverses gofmt's go/doc/comment curly-quote substitution
+// so commentTexts compares comment content, not gofmt's position-dependent
+// styling. See commentTexts for why this matters across a reorder.
+var smartQuoteUndo = strings.NewReplacer("“", "``", "”", "''")
+
+// TestCommentTextsImmuneToSmartQuotes pins the contract that commentTexts
+// must ignore gofmt's go/doc/comment typographic substitution. gofmt
+// rewrites a backtick pair to U+201C and an apostrophe pair to U+201D,
+// but only for comments it treats as documentation; a free-floating
+// comment is left verbatim. Reorder can move a comment between a
+// doc-comment role and a floating role, so the same comment legitimately
+// serialises with the bare ASCII pair on one side of the oracle and the
+// curly quote on the other — a difference of style, not of content.
+// Without normalisation commentTexts reports that mismatch as a spurious
+// "comment multiset changed", which is exactly crasher ed9d03123442f076
+// (an apostrophe-pair comment that gofmt smart-quotes in the unreordered
+// baseline but not in dstmin's reordered output).
+func TestCommentTextsImmuneToSmartQuotes(t *testing.T) {
+	parse := func(src string) *ast.File {
+		f, err := parser.ParseFile(token.NewFileSet(), "x.go", src, parser.ParseComments|parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %q: %v", src, err)
+		}
+		return f
+	}
+	bare := parse("package p\n\n// a ''b'' and ``c``\ntype T int\n")
+	smart := parse("package p\n\n// a ”b” and “c“\ntype T int\n")
+	if got, want := commentTexts(bare), commentTexts(smart); !slices.Equal(got, want) {
+		t.Errorf("smart-quote substitution leaked into comment multiset\n bare:  %q\n smart: %q", got, want)
+	}
 }
 
 // nthStruct returns the n-th *ast.StructType in preorder walk of file.

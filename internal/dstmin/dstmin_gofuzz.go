@@ -39,6 +39,9 @@ import (
 	"go/parser"
 	"go/printer"
 	"go/token"
+	"slices"
+	"sort"
+	"strings"
 )
 
 // FuzzDecorateFileIdentity asserts the no-mutation round-trip: decorate
@@ -76,19 +79,25 @@ func FuzzDecorateFileIdentity(data []byte) int {
 // FuzzDecorateFileReorder is the headline reorder harness — every BUG-NN
 // guard in dstmin's decoration path was either motivated by or
 // regression-tested through this fuzz target. It picks the first
-// decorated struct with at least two fields, swaps fields[0] and
-// fields[1] in place, prints, re-parses, and checks two invariants on
-// the result:
+// decorated struct with at least two fields, reverses its field order in
+// place (touching every position, not just the first two), prints,
+// re-parses, and checks three invariants on the result:
 //
 //   - the output parses as valid Go (any parse failure is a hard bug —
 //     dstmin must never emit syntactically broken bytes)
-//   - the swapped fields end up at positions [0]/[1] of the same struct,
-//     compared by canonical name+type signature against the same swap
-//     applied to the gofmt-normalised input
+//   - the comment multiset is preserved — reorder is a permutation and
+//     must neither drop nor duplicate comments (see commentTextsGoFuzz
+//     for why gofmt's position-dependent styling is normalised out)
+//   - each field ends up where the same reversal of the gofmt-normalised
+//     input would place it, compared by canonical name+type signature
 //
 // The gofmt-normalised comparison side is what makes the harness robust
 // to legitimate gofmt rewrites (spacing, comment alignment) — both
 // sides go through format.Source so any rewrite cancels out.
+//
+// This mirrors reorderInvariant in fuzz_test.go by hand; the gofuzz build
+// tag keeps that _test.go helper out of reach, so the two must be kept in
+// sync deliberately.
 //
 // ErrFormat from Fprint returns 0 (keep-uninteresting): the format.Source
 // rejection is a documented dstmin failure path for inputs gofmt won't
@@ -134,7 +143,7 @@ func FuzzDecorateFileReorder(data []byte) int {
 		panic("target struct not found in source AST")
 	}
 
-	target.Fields.List[0], target.Fields.List[1] = target.Fields.List[1], target.Fields.List[0]
+	slices.Reverse(target.Fields.List)
 
 	var buf bytes.Buffer
 	if err := Fprint(&buf, df); err != nil {
@@ -159,12 +168,19 @@ func FuzzDecorateFileReorder(data []byte) int {
 	if err != nil {
 		return -1
 	}
+
+	// Reorder must not drop or duplicate comments; signatures can't see that.
+	if got, want := commentTextsGoFuzz(outFile), commentTextsGoFuzz(expFile); !slices.Equal(got, want) {
+		panic(fmt.Sprintf("reorder changed the comment multiset\nWANT: %q\nGOT:  %q\n=== OUTPUT ===\n%s\n=== INPUT ===\n%s",
+			want, got, buf.String(), src))
+	}
+
 	expStruct := nthStructGoFuzz(expFile, targetIdx)
 	if expStruct == nil || expStruct.Fields == nil || len(expStruct.Fields.List) < 2 {
 		return -1
 	}
 	expFields := append([]*ast.Field(nil), expStruct.Fields.List...)
-	expFields[0], expFields[1] = expFields[1], expFields[0]
+	slices.Reverse(expFields)
 
 	outStruct := nthStructGoFuzz(outFile, targetIdx)
 	if outStruct == nil || outStruct.Fields == nil {
@@ -238,3 +254,41 @@ func nthStructGoFuzz(file *ast.File, n int) *ast.StructType {
 	})
 	return found
 }
+
+// commentTextsGoFuzz returns the sorted multiset of non-empty comment
+// contents in file, with markers and all whitespace stripped and gofmt's
+// go/doc/comment curly-quote substitution undone — a permutation-invariant
+// fingerprint for drop/duplication detection. Duplicate of commentTexts
+// from fuzz_test.go (same _test.go unreachability rationale as
+// fieldSigGoFuzz). Stripping markers+whitespace collapses gofmt's
+// position-dependent spacing ("// x" vs "//x"); smartQuoteUndoGoFuzz
+// collapses its position-dependent styling (a backtick pair -> U+201C, an
+// apostrophe pair -> U+201D), which gofmt applies only to comments in a
+// doc-comment role. A reorder can move a comment between a doc-comment
+// role and a floating role, so without both normalisations the same
+// comment would falsely read as dropped/duplicated.
+func commentTextsGoFuzz(file *ast.File) []string {
+	var out []string
+	for _, cg := range file.Comments {
+		for _, c := range cg.List {
+			t := c.Text
+			switch {
+			case strings.HasPrefix(t, "//"):
+				t = t[2:]
+			case strings.HasPrefix(t, "/*") && strings.HasSuffix(t, "*/"):
+				t = t[2 : len(t)-2]
+			}
+			t = smartQuoteUndoGoFuzz.Replace(t)
+			if t = strings.Join(strings.Fields(t), ""); t != "" {
+				out = append(out, t)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// smartQuoteUndoGoFuzz reverses gofmt's go/doc/comment curly-quote
+// substitution so commentTextsGoFuzz compares comment content, not gofmt's
+// position-dependent styling. Duplicate of smartQuoteUndo from fuzz_test.go.
+var smartQuoteUndoGoFuzz = strings.NewReplacer("“", "``", "”", "''")
