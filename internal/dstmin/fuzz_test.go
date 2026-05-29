@@ -18,6 +18,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -149,7 +151,9 @@ func FuzzDecorateFileReorder(f *testing.F) {
 			t.Fatal("target struct not found in source AST")
 		}
 
-		target.Fields.List[0], target.Fields.List[1] = target.Fields.List[1], target.Fields.List[0]
+		// Reverse rather than swap [0]/[1]: touches every position and the
+		// interior lead/trail-blank dual-attachment paths, not just the first two.
+		slices.Reverse(target.Fields.List)
 
 		var buf bytes.Buffer
 		if err := Fprint(&buf, df); err != nil {
@@ -176,12 +180,23 @@ func FuzzDecorateFileReorder(f *testing.F) {
 		if err != nil {
 			t.Skip("gofmt'd input doesn't parse")
 		}
+
+		// Reorder is a permutation: it must neither drop nor duplicate
+		// comments, which fieldSig (name+type only) cannot see. Both sides are
+		// gofmt'd so file-level normalizations cancel, and whitespace is
+		// stripped so gofmt's context-dependent "// x" vs "//x" spacing can't
+		// false-positive.
+		if got, want := commentTexts(outFile), commentTexts(expFile); !slices.Equal(got, want) {
+			t.Errorf("reorder changed the comment multiset\nWANT: %q\nGOT:  %q\n=== OUTPUT ===\n%s\n=== INPUT ===\n%s",
+				want, got, buf.String(), src)
+		}
+
 		expStruct := nthStruct(expFile, targetIdx)
 		if expStruct == nil || expStruct.Fields == nil || len(expStruct.Fields.List) < 2 {
 			t.Skip("gofmt'd input lost the target struct")
 		}
 		expFields := append([]*ast.Field(nil), expStruct.Fields.List...)
-		expFields[0], expFields[1] = expFields[1], expFields[0]
+		slices.Reverse(expFields)
 
 		outStruct := nthStruct(outFile, targetIdx)
 		if outStruct == nil || outStruct.Fields == nil {
@@ -219,6 +234,36 @@ func fieldSig(fset *token.FileSet, f *ast.Field) string {
 	}
 	_ = printer.Fprint(&buf, fset, f.Type)
 	return buf.String()
+}
+
+// commentTexts returns the sorted multiset of non-empty comment contents in
+// file, with markers and all whitespace stripped — a permutation-invariant
+// fingerprint for drop/duplication detection that is immune to gofmt's
+// role-dependent comment handling. gofmt treats a comment differently by
+// position: a doc comment "//0" gains a space ("// 0") and an empty doc
+// comment is dropped, while the same comments floating between fields are
+// left untouched. Reorder changes those roles, so raw text would diverge for
+// reasons unrelated to preservation. Stripping markers+whitespace collapses
+// the spacing variants, and dropping empty contents ignores informationless
+// comments whose survival is immaterial.
+func commentTexts(file *ast.File) []string {
+	var out []string
+	for _, cg := range file.Comments {
+		for _, c := range cg.List {
+			t := c.Text
+			switch {
+			case strings.HasPrefix(t, "//"):
+				t = t[2:]
+			case strings.HasPrefix(t, "/*") && strings.HasSuffix(t, "*/"):
+				t = t[2 : len(t)-2]
+			}
+			if t = strings.Join(strings.Fields(t), ""); t != "" {
+				out = append(out, t)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // nthStruct returns the n-th *ast.StructType in preorder walk of file.
