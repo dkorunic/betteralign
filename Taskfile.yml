@@ -16,6 +16,10 @@ vars:
     sh: echo "{{.GIT_MODIFIED1}}{{.GIT_MODIFIED2}}"
   BUILD_DATE:
     sh: date -u '+%Y-%m-%dT%H:%M:%SZ'
+  GOSENTRY: '{{.GOSENTRY | default "/usr/local/bin/gosentry"}}'
+  FUZZTIME: '{{.FUZZTIME | default "3600s"}}'
+  CLEAN: '{{.CLEAN | default "false"}}'
+  LIBAFL_FLAGS: '--use-libafl --focus-on-new-code=false --catch-races=false --catch-leaks=false'
 
 env:
   CGO_ENABLED: 0
@@ -69,7 +73,6 @@ tasks:
     desc: Build the betteralign CLI with release ldflags (static, stripped, version-stamped, PGO).
     cmds:
       - task: generate
-      - task: fmt
       - go build -trimpath -pgo=auto -ldflags="-s -w -extldflags '-static' -X main.Version={{.GIT_LAST_TAG}}{{.GIT_MODIFIED}} -X main.Commit={{.GIT_HEAD_COMMIT}} -X main.Date={{.BUILD_DATE}}" -o {{.TARGET}} ./cmd/betteralign
 
   build-debug:
@@ -79,14 +82,12 @@ tasks:
     cmds:
       - task: update
       - task: generate
-      - task: fmt
       - go build -ldflags="-X main.Version={{.GIT_LAST_TAG}}{{.GIT_MODIFIED}} -X main.Commit={{.GIT_HEAD_COMMIT}} -X main.Date={{.BUILD_DATE}}" -race -o {{.TARGET}} ./cmd/betteralign
 
   lint:
     desc: Run golangci-lint (5m timeout) after regenerate + format.
     cmds:
       - task: generate
-      - task: fmt
       - golangci-lint run --timeout 5m
 
   release:
@@ -94,44 +95,70 @@ tasks:
     cmds:
       - goreleaser release --clean -p 4
 
-  fuzz:
-    desc: 'Run all native Go fuzz targets (testing.F) sequentially. Override with: task fuzz FUZZTIME=5m (default 30s per target).'
-    vars:
-      FUZZTIME: '{{.FUZZTIME | default "30s"}}'
-    cmds:
-      - task: fuzz-optimalorder
-        vars: { FUZZTIME: '{{.FUZZTIME}}' }
-      - task: fuzz-gcsizes
-        vars: { FUZZTIME: '{{.FUZZTIME}}' }
-      - task: fuzz-decoratefileidentity
-        vars: { FUZZTIME: '{{.FUZZTIME}}' }
-      - task: fuzz-decoratefilereorder
-        vars: { FUZZTIME: '{{.FUZZTIME}}' }
-
   fuzz-optimalorder:
-    desc: 'Run native FuzzOptimalOrder. Override: task fuzz-optimalorder FUZZTIME=2m (default 30s).'
-    vars:
-      FUZZTIME: '{{.FUZZTIME | default "30s"}}'
+    desc: 'Run native FuzzOptimalOrder. Override: task fuzz-optimalorder FUZZTIME=2h (default 3600s). CLEAN=true clears the coverage cache first.'
     cmds:
+      - task: _clean-fuzz
       - go test -run='^$' -fuzz=^FuzzOptimalOrder$ -fuzztime={{.FUZZTIME}} .
 
   fuzz-gcsizes:
-    desc: 'Run native FuzzGCSizes. Override: task fuzz-gcsizes FUZZTIME=2m (default 30s).'
-    vars:
-      FUZZTIME: '{{.FUZZTIME | default "30s"}}'
+    desc: 'Run native FuzzGCSizes. Override: task fuzz-gcsizes FUZZTIME=2h (default 3600s). CLEAN=true clears the coverage cache first.'
     cmds:
+      - task: _clean-fuzz
       - go test -run='^$' -fuzz=^FuzzGCSizes$ -fuzztime={{.FUZZTIME}} .
 
   fuzz-decoratefileidentity:
-    desc: 'Run native FuzzDecorateFileIdentity. Override: task fuzz-decoratefileidentity FUZZTIME=2m (default 30s).'
-    vars:
-      FUZZTIME: '{{.FUZZTIME | default "30s"}}'
+    desc: 'Run native FuzzDecorateFileIdentity. Override: task fuzz-decoratefileidentity FUZZTIME=2h (default 3600s). CLEAN=true clears the coverage cache first.'
     cmds:
+      - task: _clean-fuzz
       - go test -run='^$' -fuzz=^FuzzDecorateFileIdentity$ -fuzztime={{.FUZZTIME}} ./internal/dstmin
 
   fuzz-decoratefilereorder:
-    desc: 'Run native FuzzDecorateFileReorder. Override: task fuzz-decoratefilereorder FUZZTIME=2m (default 30s).'
-    vars:
-      FUZZTIME: '{{.FUZZTIME | default "30s"}}'
+    desc: 'Run native FuzzDecorateFileReorder. Override: task fuzz-decoratefilereorder FUZZTIME=2h (default 3600s). CLEAN=true clears the coverage cache first.'
     cmds:
+      - task: _clean-fuzz
       - go test -run='^$' -fuzz=^FuzzDecorateFileReorder$ -fuzztime={{.FUZZTIME}} ./internal/dstmin
+
+  afl-fuzz-optimalorder:
+    desc: 'Run FuzzOptimalOrder under gosentry/LibAFL (runs until Ctrl+C).'
+    env:
+      CGO_ENABLED: 1
+    cmds:
+      - task: _clean-fuzz-sentry
+      - '{{.GOSENTRY}} test -run=''^$'' -fuzz=^FuzzOptimalOrder$ {{.LIBAFL_FLAGS}} .'
+
+  afl-fuzz-gcsizes:
+    desc: 'Run FuzzGCSizes under gosentry/LibAFL (runs until Ctrl+C).'
+    env:
+      CGO_ENABLED: 1
+    cmds:
+      - task: _clean-fuzz-sentry
+      - '{{.GOSENTRY}} test -run=''^$'' -fuzz=^FuzzGCSizes$ {{.LIBAFL_FLAGS}} .'
+
+  afl-fuzz-decoratefileidentity:
+    desc: 'Run FuzzDecorateFileIdentity under gosentry/LibAFL (runs until Ctrl+C).'
+    env:
+      CGO_ENABLED: 1
+    cmds:
+      - task: _clean-fuzz-sentry
+      - '{{.GOSENTRY}} test -run=''^$'' -fuzz=^FuzzDecorateFileIdentity$ {{.LIBAFL_FLAGS}} ./internal/dstmin'
+
+  afl-fuzz-decoratefilereorder:
+    desc: 'Run FuzzDecorateFileReorder under gosentry/LibAFL (runs until Ctrl+C).'
+    env:
+      CGO_ENABLED: 1
+    cmds:
+      - task: _clean-fuzz-sentry
+      - '{{.GOSENTRY}} test -run=''^$'' -fuzz=^FuzzDecorateFileReorder$ {{.LIBAFL_FLAGS}} ./internal/dstmin'
+
+  _clean-fuzz:
+    internal: true
+    desc: Clear the Go fuzz coverage cache only when CLEAN=true (preserves corpus by default).
+    cmds:
+      - '{{if eq .CLEAN "true"}}go clean -fuzzcache{{else}}true{{end}}'
+
+  _clean-fuzz-sentry:
+    internal: true
+    desc: Clear the gosentry fuzz coverage cache only when CLEAN=true (preserves corpus by default).
+    cmds:
+      - '{{if eq .CLEAN "true"}}{{.GOSENTRY}} clean -fuzzcache{{else}}true{{end}}'
