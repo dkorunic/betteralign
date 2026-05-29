@@ -75,3 +75,23 @@ type Aliased struct { // want `struct of size 12 could be 8; reorder skipped: po
 type AliasName = Aliased
 
 var _ = AliasName{1, 2, 3}
+
+// Generic instantiation pins the origin: canonicalStructType must collapse
+// Box[int] onto the generic origin's *types.Struct via Origin().Underlying().
+type Box[T any] struct { // want `struct of size 12 could be 8; reorder skipped: positional composite literal`
+	x byte
+	y int32
+	z byte
+}
+
+var _ = Box[int]{1, 2, 3}
+
+// Elided positional inside a slice of pointer to a generic instantiation:
+// exercises the *types.Pointer unwrap together with Origin().
+type GenPtr[T any] struct { // want `struct of size 12 could be 8; reorder skipped: positional composite literal`
+	x byte
+	y int32
+	z byte
+}
+
+var _ = []*GenPtr[int]{{1, 2, 3}}

@@ -350,3 +350,38 @@ func TestPositionalLiteralSuppressesReorder(t *testing.T) {
 	analyzer := NewTestAnalyzer()
 	analysistest.Run(t, testdata, analyzer, "positional")
 }
+
+// TestSingleLineStructReported pins that a misaligned struct whose source
+// shape dstmin cannot decorate (a single-line `type S struct { ... }`) still
+// produces the size diagnostic in report-only mode. Reporting is decoupled
+// from rewritability: only the -apply rewrite needs the DST node, so a
+// non-decoratable struct is reported and simply not rewritten — not silently
+// dropped with a stderr warning, as it was before.
+//
+// The source is written to a temp package at runtime rather than committed:
+// gofmt (via `task fmt`'s gofumpt -w .) would expand the single-line struct
+// to multi-line, which is decoratable and would silently void the regression
+// guard. Generating it on the fly keeps the un-formattable shape intact.
+func TestSingleLineStructReported(t *testing.T) {
+	srcDir := filepath.Join("testdata", "src")
+	tmpDir, err := os.MkdirTemp(srcDir, "singleline-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	pkgDir := filepath.Join(tmpDir, "singleline")
+	if err := os.Mkdir(pkgDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	src := "package singleline\n\n" +
+		"// Single-line struct: dstmin cannot decorate it, but the diagnostic must still fire.\n" +
+		"type S struct { a bool; b int64; c bool } // want `struct of size 24 could be 16`\n"
+	if err := os.WriteFile(filepath.Join(pkgDir, "singleline.go"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	testdata := analysistest.TestData()
+	analyzer := NewTestAnalyzer()
+	analysistest.Run(t, testdata, analyzer, filepath.Join(filepath.Base(tmpDir), "singleline"))
+}

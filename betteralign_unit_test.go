@@ -703,6 +703,59 @@ func TestHasIgnoreCommentPrefixGuard(t *testing.T) {
 	})
 }
 
+// ─── Layer 8b: hasIgnoreCommentAST (DST-independent ignore) ──────────────────
+
+// firstStructType parses src (with comments) and returns its fileset, file,
+// and the first *ast.StructType in preorder.
+func firstStructType(t *testing.T, src string) (*token.FileSet, *ast.File, *ast.StructType) {
+	t.Helper()
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "test.go", src, parser.ParseComments)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var st *ast.StructType
+	ast.Inspect(f, func(n ast.Node) bool {
+		if s, ok := n.(*ast.StructType); ok && st == nil {
+			st = s
+			return false
+		}
+		return true
+	})
+	if st == nil {
+		t.Fatal("no struct type in fixture")
+	}
+	return fset, f, st
+}
+
+// TestHasIgnoreCommentAST pins the DST-independent ignore check: it honors the
+// directive only on the opening-brace line (matching hasIgnoreComment's
+// Opening routing), so it agrees with the DST path on decoratable structs
+// while still working for shapes dstmin cannot decorate.
+func TestHasIgnoreCommentAST(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+		want bool
+	}{
+		{"brace-line directive", "package p\ntype S struct { // betteralign:ignore\n\ta byte\n\tb int64\n}\n", true},
+		{"directive on first-field line (lead-doc, not Opening)", "package p\ntype S struct {\n\t// betteralign:ignore\n\ta byte\n\tb int64\n}\n", false},
+		{"unrelated brace-line comment", "package p\ntype S struct { // hello\n\ta byte\n\tb int64\n}\n", false},
+		{"no comment", "package p\ntype S struct {\n\ta byte\n\tb int64\n}\n", false},
+		{"block comment does not trigger", "package p\ntype S struct { /* betteralign:ignore */\n\ta byte\n\tb int64\n}\n", false},
+		// Trailing comment is after the brace, outside the body: not honored.
+		{"single-line trailing directive not honored", "package p\ntype S struct { a byte; b int64 } // betteralign:ignore\n", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fset, f, st := firstStructType(t, tc.src)
+			if got := hasIgnoreCommentAST(fset, f, st); got != tc.want {
+				t.Errorf("hasIgnoreCommentAST = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // ─── Layer 9: optimalOrder direct size/ptrdata (P5) ──────────────────────────
 
 // TestOptimalOrderSizeAndPtrdata verifies that the size and ptrdata returned

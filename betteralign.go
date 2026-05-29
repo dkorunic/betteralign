@@ -219,9 +219,13 @@ func init() {
 // package. It rides the *inspector.Inspector that inspect.Analyzer
 // already built for this pass, so the traversal cost is shared across
 // any other analyzers participating in the same suite (vet, gopls, etc).
-// Lazy DST decoration is the load-bearing invariant: a pass on a clean
-// codebase only does AST work, never reads source bytes from disk and
-// never builds DST trees.
+// Reporting is decoupled from rewriting: diagnostics (including the
+// betteralign:ignore opt-out and the positional-literal check) come purely
+// from AST + type info, so report-only mode never reads source bytes from
+// disk and never builds DST trees, and a clean codebase does only AST work.
+// DST decoration is built lazily and only under -apply, since only the
+// rewrite needs it; a misaligned struct dstmin cannot decorate is therefore
+// still reported, just not rewritten.
 //
 // The diagnostic-only path runs even when -apply is unset, so editors and
 // linters get the report; -apply (and its legacy alias -fix) gates the
@@ -259,7 +263,14 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 
 	inspect := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 
-	positionalUsers := collectPositionalUsers(inspect, pass)
+	// Built lazily so clean packages skip the composite-literal walk.
+	var positionalUsers map[*types.Struct]token.Pos
+	ensurePositionalUsers := func() map[*types.Struct]token.Pos {
+		if positionalUsers == nil {
+			positionalUsers = collectPositionalUsers(inspect, pass)
+		}
+		return positionalUsers
+	}
 
 	// Lazy: nil until the first misaligned struct.
 	var dec *dst.Decorator
@@ -387,6 +398,37 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 			return
 		}
 
+		// AST-based so ignore works even for shapes dstmin can't decorate.
+		if hasIgnoreCommentAST(pass.Fset, currentASTFile, s) {
+			return
+		}
+
+		// Positional literal pins layout: safe to report, unsafe to mutate.
+		if litPos, blocked := ensurePositionalUsers()[typ]; blocked {
+			pass.Report(analysis.Diagnostic{
+				Pos: s.Pos(),
+				End: s.Pos() + structKeywordLen,
+				Message: fmt.Sprintf(
+					"%s; reorder skipped: positional composite literal at %s would break, convert to keyed form first",
+					message, pass.Fset.Position(litPos),
+				),
+				SuggestedFixes: nil,
+			})
+			return
+		}
+
+		pass.Report(analysis.Diagnostic{
+			Pos:            s.Pos(),
+			End:            s.Pos() + structKeywordLen,
+			Message:        message,
+			SuggestedFixes: nil,
+		})
+
+		// Rewrite path: only -apply runs it, and only it needs DST.
+		if !apply {
+			return
+		}
+
 		// Decorate this file once; never retry on failure.
 		if _, failed := decorationFailed[currentFn]; failed {
 			return
@@ -408,39 +450,7 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 
 		dNode, ok := dec.Dst.Nodes[s].(*dst.StructType)
 		if !ok {
-			fmt.Fprintf(os.Stderr, "betteralign: missing DST mapping for struct at %s; skipping\n",
-				pass.Fset.Position(s.Pos()))
-			return
-		}
-
-		// Skip if // betteralign:ignore appears inside the struct body.
-		if hasIgnoreComment(dNode.Fields) {
-			return
-		}
-
-		// Positional literal pins layout: reporting is safe, mutation is not.
-		if litPos, blocked := positionalUsers[typ]; blocked {
-			pass.Report(analysis.Diagnostic{
-				Pos: s.Pos(),
-				End: s.Pos() + structKeywordLen,
-				Message: fmt.Sprintf(
-					"%s; reorder skipped: positional composite literal at %s would break, convert to keyed form first",
-					message, pass.Fset.Position(litPos),
-				),
-				SuggestedFixes: nil,
-			})
-			return
-		}
-
-		pass.Report(analysis.Diagnostic{
-			Pos:            s.Pos(),
-			End:            s.Pos() + structKeywordLen,
-			Message:        message,
-			SuggestedFixes: nil,
-		})
-
-		// Skip DST mutation when only emitting diagnostics.
-		if !apply {
+			// Shape dstmin can't rewrite; already reported, so skip.
 			return
 		}
 
@@ -1280,6 +1290,34 @@ func hasIgnoreComment(node *dst.FieldList) bool {
 	for _, opening := range node.Decs.Opening.All() {
 		if commentHasDirective(opening, ignoreStruct) {
 			return true
+		}
+	}
+
+	return false
+}
+
+// hasIgnoreCommentAST is the DST-independent twin of hasIgnoreComment, used so
+// the betteralign:ignore directive is honored even for structs dstmin cannot
+// decorate (single-line forms, etc.) where no DST node exists. It mirrors the
+// decoration's Opening routing: a group on the opening-brace line, inside the
+// body, is the directive's canonical home (`type S struct { // betteralign:ignore`).
+// Both paths share commentHasDirective, so the recognition rules can't drift;
+// only the comment-selection differs. file.Comments is position-sorted, so the
+// scan stops once it reaches the closing brace. Pure predicate.
+func hasIgnoreCommentAST(fset *token.FileSet, file *ast.File, s *ast.StructType) bool {
+	open := s.Fields.Opening
+	openLine := fset.Position(open).Line
+	for _, cg := range file.Comments {
+		if cg.Pos() >= s.Fields.Closing {
+			break
+		}
+		if cg.Pos() <= open || fset.Position(cg.Pos()).Line != openLine {
+			continue
+		}
+		for _, c := range cg.List {
+			if commentHasDirective(c.Text, ignoreStruct) {
+				return true
+			}
 		}
 	}
 
