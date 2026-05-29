@@ -11,7 +11,6 @@ require (
 )
 
 require (
-	github.com/dvyukov/go-fuzz v0.0.0-20240924070022-e577bee5275c // indirect
 	github.com/google/go-cmp v0.6.0 // indirect
 	github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58 // indirect
 	github.com/stretchr/testify v1.8.4 // indirect

@@ -3,8 +3,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 Dinko Korunic <dinko.korunic@gmail.com>
 // SPDX-License-Identifier: BSD-3-Clause
 
-//go:build !gofuzz
-
 package dstmin
 
 import (
@@ -22,6 +20,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"unicode"
 )
 
 // handCraftedSeeds covers edge cases the testdata corpus does not exercise.
@@ -124,10 +123,6 @@ func FuzzDecorateFileReorder(f *testing.F) {
 // same reversal of the gofmt-normalised input would. Early-outs the fuzzer
 // treats as "uninteresting" (unparseable input, no struct with >=2 fields,
 // ErrFormat, gofmt rejecting the input) skip rather than fail.
-//
-// The dvyukov-tagged twin in dstmin_gofuzz.go must mirror this logic by hand:
-// it lives under the gofuzz build tag and so cannot reach these _test.go
-// helpers.
 func reorderInvariant(t *testing.T, src string) {
 	t.Helper()
 	fset := token.NewFileSet()
@@ -246,39 +241,24 @@ func fieldSig(fset *token.FileSet, f *ast.Field) string {
 	return buf.String()
 }
 
-// commentTexts returns the sorted multiset of non-empty comment contents in
-// file, with markers and all whitespace stripped — a permutation-invariant
-// fingerprint for drop/duplication detection that is immune to gofmt's
-// role-dependent comment handling. gofmt treats a comment differently by
-// position: a doc comment "//0" gains a space ("// 0") and an empty doc
-// comment is dropped, while the same comments floating between fields are
-// left untouched. Reorder changes those roles, so raw text would diverge for
-// reasons unrelated to preservation. Stripping markers+whitespace collapses
-// the spacing variants, and dropping empty contents ignores informationless
-// comments whose survival is immaterial.
-//
-// It also undoes gofmt's go/doc/comment typographic substitution: a pair
-// of backticks becomes U+201C and a pair of apostrophes becomes U+201D,
-// but only for comments gofmt treats as documentation. Because reorder
-// can move a comment between a doc-comment role and a floating role, the
-// same comment can serialise with curly quotes on one side of the oracle
-// and the bare ASCII pair on the other; mapping the curly quotes back to
-// their ASCII source keeps the fingerprint stable across that role
-// change. These are the only two character-level rewrites go/doc/comment
-// performs (dashes and the like are left verbatim).
+// commentTexts returns the sorted multiset of each comment's word characters
+// (letters and digits only) — a permutation-invariant fingerprint for
+// drop/duplication detection that is immune to gofmt's role-dependent comment
+// handling. gofmt reformats comment text by position: it adjusts spacing,
+// reindents block-comment continuation lines, smart-quotes paired backticks
+// and apostrophes, and normalizes plus/star list bullets to a dash, but only
+// for comments it treats as documentation. Reorder moves comments between doc
+// and floating roles, so any
+// of those rewrites would make a faithfully-preserved comment look changed.
+// Keeping only word characters discards every punctuation/whitespace rewrite
+// at once while still detecting any word-bearing comment that is dropped or
+// duplicated; punctuation-only comments collapse to "" and are ignored as
+// informationless.
 func commentTexts(file *ast.File) []string {
 	var out []string
 	for _, cg := range file.Comments {
 		for _, c := range cg.List {
-			t := c.Text
-			switch {
-			case strings.HasPrefix(t, "//"):
-				t = t[2:]
-			case strings.HasPrefix(t, "/*") && strings.HasSuffix(t, "*/"):
-				t = t[2 : len(t)-2]
-			}
-			t = smartQuoteUndo.Replace(t)
-			if t = strings.Join(strings.Fields(t), ""); t != "" {
+			if t := wordChars(c.Text); t != "" {
 				out = append(out, t)
 			}
 		}
@@ -287,10 +267,17 @@ func commentTexts(file *ast.File) []string {
 	return out
 }
 
-// smartQuoteUndo reverses gofmt's go/doc/comment curly-quote substitution
-// so commentTexts compares comment content, not gofmt's position-dependent
-// styling. See commentTexts for why this matters across a reorder.
-var smartQuoteUndo = strings.NewReplacer("“", "``", "”", "''")
+// wordChars reduces s to its letters and digits, dropping every other rune
+// (markers, punctuation, whitespace, control bytes). See commentTexts for why
+// this is the fingerprint that survives gofmt's reformatting.
+func wordChars(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			return r
+		}
+		return -1
+	}, s)
+}
 
 // TestCommentTextsImmuneToSmartQuotes pins the contract that commentTexts
 // must ignore gofmt's go/doc/comment typographic substitution. gofmt
@@ -316,6 +303,53 @@ func TestCommentTextsImmuneToSmartQuotes(t *testing.T) {
 	smart := parse("package p\n\n// a ”b” and “c“\ntype T int\n")
 	if got, want := commentTexts(bare), commentTexts(smart); !slices.Equal(got, want) {
 		t.Errorf("smart-quote substitution leaked into comment multiset\n bare:  %q\n smart: %q", got, want)
+	}
+}
+
+// TestCommentTextsImmuneToBlockCommentReindent pins the contract that
+// commentTexts must ignore gofmt's block-comment reindentation. gofmt
+// reflows a /* */ comment's continuation lines by stripping their common
+// leading prefix, and its commonPrefix predicate (c <= ' ' || c == '*')
+// treats any byte at or below space — control characters included — as
+// strippable indentation. Which run it absorbs is position-dependent, so a
+// reorder that relocates a block comment can drop a leading control byte on
+// one side of the oracle but not the other. That is crasher
+// c909a0fd0249d7c6: a continuation line led by U+0019 that gofmt keeps in
+// the floating baseline but folds into indentation in dstmin's reordered
+// output.
+func TestCommentTextsImmuneToBlockCommentReindent(t *testing.T) {
+	parse := func(src string) *ast.File {
+		f, err := parser.ParseFile(token.NewFileSet(), "x.go", src, parser.ParseComments|parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %q: %v", src, err)
+		}
+		return f
+	}
+	withCtrl := parse("package p\n\n/* a\n\x19  b */\ntype T int\n")
+	plain := parse("package p\n\n/* a\n  b */\ntype T int\n")
+	if got, want := commentTexts(withCtrl), commentTexts(plain); !slices.Equal(got, want) {
+		t.Errorf("control char leaked into comment multiset\n withCtrl: %q\n plain:    %q", got, want)
+	}
+}
+
+// TestCommentTextsImmuneToListBullets pins the contract that commentTexts
+// must ignore gofmt's go/doc/comment list-bullet normalization, which
+// rewrites "+" and "*" item markers to "-" but only for comments in a
+// doc-comment role. A reorder can move a list comment between a doc and a
+// floating role, so the same comment serialises with a "+" bullet on one
+// side of the oracle and "-" on the other. That is crasher e6acc7a2ace9d346.
+func TestCommentTextsImmuneToListBullets(t *testing.T) {
+	parse := func(src string) *ast.File {
+		f, err := parser.ParseFile(token.NewFileSet(), "x.go", src, parser.ParseComments|parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %q: %v", src, err)
+		}
+		return f
+	}
+	plus := parse("package p\n\n//\t+\titem\ntype T int\n")
+	dash := parse("package p\n\n//\t- item\ntype T int\n")
+	if got, want := commentTexts(plus), commentTexts(dash); !slices.Equal(got, want) {
+		t.Errorf("list bullet leaked into comment multiset\n plus: %q\n dash: %q", got, want)
 	}
 }
 

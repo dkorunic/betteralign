@@ -3,8 +3,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 Dinko Korunic <dinko.korunic@gmail.com>
 // SPDX-License-Identifier: BSD-3-Clause
 
-//go:build !gofuzz
-
 package dstmin
 
 import (
@@ -21,9 +19,9 @@ import (
 // per-field signature). Acts as the regression net for crashes already
 // fixed under fuzz/decoratefilereorder/ — any future change that
 // reintroduces one will fail the corresponding subtest. Inputs are read
-// from ../../fuzz/decoratefilereorder/crashers, which is populated by
-// `task fuzz-go-decoratefilereorder`; the test skips silently when that
-// directory is absent so CI without the fuzz workdir stays green. Each
+// from ../../fuzz/decoratefilereorder/crashers, populated by a fuzz workdir
+// (a gosentry/LibAFL or `go test -fuzz` run); the test skips silently when
+// that directory is absent so CI without the fuzz workdir stays green. Each
 // subtest is named after the crasher's hash so failures point straight
 // back at the offending input.
 func TestReorderCrashersDoNotPanic(t *testing.T) {

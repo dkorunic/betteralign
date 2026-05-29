@@ -470,7 +470,7 @@ func TestDecorateFile_MidStructBuildConstraintIsSkipped(t *testing.T) {
 
 // BUG-43 regression. Each case carries a Go line directive in a different
 // physical shape: block form alone on a line, block form trailing on a
-// field, multi-line block (the form that drives every go-fuzz crasher in
+// field, multi-line block (the form that drives every fuzz crasher in
 // fuzz/decoratefilereorder/crashers), and the column-1 //line form. All
 // four must skip decoration since the directive remaps tf.Line() and
 // silently invalidates the per-line guards every other check relies on.

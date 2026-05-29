@@ -3,8 +3,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 Dinko Korunic <dinko.korunic@gmail.com>
 // SPDX-License-Identifier: BSD-3-Clause
 
-//go:build !gofuzz
-
 package betteralign
 
 import (
@@ -16,16 +14,15 @@ import (
 	"time"
 )
 
-// TestOptimalOrderCrashersDoNotHang replays every saved go-fuzz crasher
-// from fuzz/optimalorder/crashers/ through the same logic
-// FuzzOptimalOrder runs and asserts each input completes well under the
-// 10 s go-fuzz watchdog. Acts as the regression net for BUG-44: an
-// adversarial float-exponent literal in a function body (134291756e
-// 439044200 - 4 - 5 - …) pushed go/types constant folding to 8.5 s
-// before IgnoreFuncBodies: true was wired into typeCheckFuzzInput. The
-// per-subtest deadline of 2 s is conservative — the fix brings the
-// pathological input down to microseconds. Skipped silently when the
-// crashers directory is absent.
+// TestOptimalOrderCrashersDoNotHang replays every saved crasher from
+// fuzz/optimalorder/crashers/ through the same logic FuzzOptimalOrder
+// runs and asserts each input completes well under a fuzzing watchdog.
+// Acts as the regression net for BUG-44: an adversarial float-exponent
+// literal in a function body (134291756e439044200 - 4 - 5 - …) pushed
+// go/types constant folding to 8.5 s before IgnoreFuncBodies: true was
+// wired into typeCheckFuzzInput. The per-subtest deadline of 2 s is
+// conservative — the fix brings the pathological input down to
+// microseconds. Skipped silently when the crashers directory is absent.
 func TestOptimalOrderCrashersDoNotHang(t *testing.T) {
 	replayHarnessCrashers(t, "fuzz/optimalorder/crashers", runOptimalOrderInvariant)
 }
@@ -37,8 +34,8 @@ func TestGCSizesCrashersDoNotHang(t *testing.T) {
 }
 
 // replayHarnessCrashers walks dir for raw crasher inputs (files with no
-// extension, paired with .output and .quoted siblings go-fuzz produces),
-// runs each through fn under a 2 s deadline, and reports per-input
+// extension; sibling metadata files such as .output/.quoted/.metadata are
+// skipped), runs each through fn under a 2 s deadline, and reports per-input
 // failures so the failing hash is easy to map back to the offending
 // input. Skips when the directory does not exist so CI without a fuzz
 // workdir stays green.

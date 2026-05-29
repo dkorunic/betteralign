@@ -3,8 +3,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 Dinko Korunic <dinko.korunic@gmail.com>
 // SPDX-License-Identifier: BSD-3-Clause
 
-//go:build !gofuzz
-
 package betteralign
 
 import (
@@ -81,7 +79,7 @@ func addFuzzCorpus(f *testing.F, root string) {
 // (BUG-44). Adversarial inputs like `134291756e439044200-4-5-…` produce
 // multi-million-digit rationals through go/constant's exact arithmetic;
 // without the flag, one such 119-byte input pushed type-checking to 8.5 s
-// and tripped go-fuzz's 10 s watchdog. The fuzz invariants only look at
+// and tripped a fuzzing watchdog. The fuzz invariants only look at
 // package-scope named types via pkg.Scope().Names(), so skipping bodies
 // is invisible to every assertion the harness makes.
 func typeCheckFuzzInput(t *testing.T, src string) (pkg *types.Package) {
