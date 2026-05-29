@@ -153,9 +153,13 @@ func FuzzGCSizes(data []byte) int {
 // failure is in the type-checker, not the harness invariants.
 //
 // types.Config is configured with a no-op error handler so partial
-// type-check results survive past the first reported error, and with
-// Importer: nil to avoid going to disk for arbitrary import paths the
-// fuzzer might fabricate.
+// type-check results survive past the first reported error, Importer: nil
+// to avoid going to disk for arbitrary import paths the fuzzer might
+// fabricate, and IgnoreFuncBodies: true so function-body constant folding
+// can't hang the harness (BUG-44: 134291756e439044200 minus a sequence of
+// small ints produced an 8.5 s type-check on a 119-byte input; the
+// harness only inspects package-scope named types, so skipping bodies is
+// invisible to its checks).
 func typeCheckGoFuzz(src string) (pkg *types.Package) {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "input.go", src, parser.ParseComments|parser.SkipObjectResolution)
@@ -168,8 +172,9 @@ func typeCheckGoFuzz(src string) (pkg *types.Package) {
 		}
 	}()
 	conf := types.Config{
-		Error:    func(error) {},
-		Importer: nil,
+		Error:            func(error) {},
+		Importer:         nil,
+		IgnoreFuncBodies: true,
 	}
 	pkg, _ = conf.Check("fuzz", fset, []*ast.File{file}, nil)
 	return pkg

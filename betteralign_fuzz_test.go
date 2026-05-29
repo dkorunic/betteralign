@@ -76,6 +76,14 @@ func addFuzzCorpus(f *testing.F, root string) {
 // hammer the disk. Panics from go/types itself (malformed generics, recursive
 // alias chains — known upstream defects) are recovered and reported as Skip
 // so the fuzzer keeps hunting for real betteralign bugs.
+//
+// IgnoreFuncBodies: true bypasses constant folding inside function bodies
+// (BUG-44). Adversarial inputs like `134291756e439044200-4-5-…` produce
+// multi-million-digit rationals through go/constant's exact arithmetic;
+// without the flag, one such 119-byte input pushed type-checking to 8.5 s
+// and tripped go-fuzz's 10 s watchdog. The fuzz invariants only look at
+// package-scope named types via pkg.Scope().Names(), so skipping bodies
+// is invisible to every assertion the harness makes.
 func typeCheckFuzzInput(t *testing.T, src string) (pkg *types.Package) {
 	t.Helper()
 	fset := token.NewFileSet()
@@ -84,8 +92,9 @@ func typeCheckFuzzInput(t *testing.T, src string) (pkg *types.Package) {
 		t.Skip("input not valid Go")
 	}
 	conf := types.Config{
-		Error:    func(error) {}, // swallow type errors; partial info is enough
-		Importer: nil,            // imports resolve to errors; struct internals still type-check
+		Error:            func(error) {}, // swallow type errors; partial info is enough
+		Importer:         nil,            // imports resolve to errors; struct internals still type-check
+		IgnoreFuncBodies: true,           // BUG-44: skip constant folding inside function bodies — saw 8.5s hang on huge float exponent
 	}
 	defer func() {
 		if r := recover(); r != nil {
