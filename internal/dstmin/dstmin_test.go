@@ -434,6 +434,74 @@ func TestDecorateFile_BlockCommentOnCloseBraceLineIsSkipped(t *testing.T) {
 	}
 }
 
+// BUG-41: a comment group holding more than one comment where any of them
+// is a block comment (here a line comment immediately followed by a block
+// comment, with no blank line, so the parser fuses them into one group).
+// Routing assigns the group as a unit, so the trailing/lead bytes can't be
+// kept consistent once reorder moves the anchor — reject the struct instead.
+func TestDecorateFile_MultiCommentGroupWithBlockIsSkipped(t *testing.T) {
+	src := "package p\n\ntype S struct {\n\ta int\n\t// c\n\t/* d */\n\tb int\n}\n"
+	fset, f, _ := parseSource(t, src)
+	dec := NewDecorator(fset)
+	df, err := dec.DecorateFile(f)
+	if err != nil {
+		t.Fatalf("DecorateFile: %v", err)
+	}
+	if len(df.structs) != 0 {
+		t.Errorf("len(df.structs) = %d, want 0 (multi-comment group with block is non-decoratable)", len(df.structs))
+	}
+	var out bytes.Buffer
+	if err := Fprint(&out, df); err != nil {
+		t.Fatalf("Fprint: %v", err)
+	}
+	if out.String() != src {
+		t.Errorf("Fprint changed output for skipped struct:\ngot:\n%s\nwant:\n%s", out.String(), src)
+	}
+}
+
+// BUG-39: a floating comment that ends on the line just before a field but
+// starts inside the *previous* field's already-extended trailing span — here
+// `a`'s multi-line trailing block, on whose closing `*/` line a `//x` line
+// comment also sits. Routing `//x` as `b`'s lead-doc would emit it twice on
+// reorder; it must extend `a`'s trail instead. The struct stays decoratable,
+// so assert that and that the field-reversed reprint preserves the comment
+// multiset and field count (which it does not if the BUG-39 branch is gone).
+func TestReorder_FloatingCommentOverlappingPrevFieldTrail(t *testing.T) {
+	src := "package p\n\ntype S struct {\n\ta int /*\n\t*/ //x\n\tb int\n}\n"
+	assertDecoratedThenReorderFaithful(t, src)
+}
+
+// BUG-36: a floating block comment whose end overshoots the next field's body
+// start. Attaching it to the previous field's trail would double-write the
+// overlapping bytes on reorder, so comment routing skips it. The shape is
+// degenerate by nature — a clean layout that puts a comment past a field
+// boundary is already rejected by the brace/field-line guards — so this is a
+// reduced fuzz input; the `*/*/` run is what positions the comment across the
+// boundary. reorderInvariant fails here if the skip is removed (the comment
+// is duplicated and the field count changes).
+func TestReorder_FloatingCommentOverlappingNextFieldBody(t *testing.T) {
+	src := "package p\ntype S struct{\nd\n*/*/\n*/d//x\n}\n"
+	assertDecoratedThenReorderFaithful(t, src)
+}
+
+// assertDecoratedThenReorderFaithful pins that src yields a decoratable
+// struct (so the comment-routing path under test is actually exercised, not
+// silently skipped) and that reversing its fields and reprinting stays
+// faithful, reusing the FuzzDecorateFileReorder oracle.
+func assertDecoratedThenReorderFaithful(t *testing.T, src string) {
+	t.Helper()
+	fset, f, _ := parseSource(t, src)
+	dec := NewDecorator(fset)
+	df, err := dec.DecorateFile(f)
+	if err != nil {
+		t.Fatalf("DecorateFile: %v", err)
+	}
+	if len(df.structs) == 0 {
+		t.Fatalf("struct was not decorated; comment-routing path not exercised")
+	}
+	reorderInvariant(t, src)
+}
+
 // BUG-34: `A; B int` — two fields share a source line and a body span.
 func TestDecorateFile_SameLineFieldsViaSemicolonIsSkipped(t *testing.T) {
 	src := "package p\n\ntype S struct {\n\ta int; b int\n}\n"

@@ -18,11 +18,6 @@ cmd/betteralign/betteralign
 # Project-local GOTMPDIR and fuzz forensic logs
 .fuzztmp/
 
-# go-fuzz output: built zips, workdirs (corpus/, crashers/, suppressions/)
-fuzz/
-*-fuzz.zip
-testdata/fuzz-corpus/
-
 ### Intellij ###
 # User-specific stuff:
 .idea/
