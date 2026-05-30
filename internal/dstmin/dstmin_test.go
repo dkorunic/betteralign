@@ -407,6 +407,33 @@ func TestDecorateFile_InBodyMultiLineBlockCommentIsSkipped(t *testing.T) {
 	}
 }
 
+// BUG-44: a block comment on the } line (before the brace). Routed to a
+// field's trail, the trail span runs to lineEndOffset of the } line and
+// swallows the closing brace; on reorder the brace is emitted mid-body and
+// the struct closes early, dropping a field. The single-line /* */ case
+// slips past the cgStart==cgEnd skip and the multi-line brace-cross check in
+// hasUnsafeBlockComment, so it must be rejected explicitly. Source from
+// gosentry/LibAFL crasher 5330502779b79821, reduced.
+func TestDecorateFile_BlockCommentOnCloseBraceLineIsSkipped(t *testing.T) {
+	src := "package p\n\ntype S struct {\n\ta int\n\tb int\n\t/* note */ }\n"
+	fset, f, _ := parseSource(t, src)
+	dec := NewDecorator(fset)
+	df, err := dec.DecorateFile(f)
+	if err != nil {
+		t.Fatalf("DecorateFile: %v", err)
+	}
+	if len(df.structs) != 0 {
+		t.Errorf("len(df.structs) = %d, want 0 (block comment on } line is non-decoratable)", len(df.structs))
+	}
+	var out bytes.Buffer
+	if err := Fprint(&out, df); err != nil {
+		t.Fatalf("Fprint: %v", err)
+	}
+	if out.String() != src {
+		t.Errorf("Fprint changed output for skipped struct:\ngot:\n%s\nwant:\n%s", out.String(), src)
+	}
+}
+
 // BUG-34: `A; B int` — two fields share a source line and a body span.
 func TestDecorateFile_SameLineFieldsViaSemicolonIsSkipped(t *testing.T) {
 	src := "package p\n\ntype S struct {\n\ta int; b int\n}\n"

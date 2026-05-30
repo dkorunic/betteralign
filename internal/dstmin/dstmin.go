@@ -543,9 +543,16 @@ func commentRun(comments []*ast.CommentGroup, opening, closing token.Pos) []*ast
 // modes are covered together because all three are queries against the
 // same iterator over comments — separating them would re-scan three times:
 //
-//   - BUG-32: a /* ... */ that spans the { or } boundary. The two halves
-//     would land in different splice partitions (struct-body vs surrounding
-//     source) and reorder would split the comment in two.
+//   - BUG-32: a /* ... */ that spans the { boundary (opens on the { line,
+//     closes inside the body). The two halves would land in different
+//     splice partitions (struct-body vs surrounding source) and reorder
+//     would split the comment in two.
+//   - BUG-44: a block comment whose closing */ lands on the } line, before
+//     the brace. decorateComments routes it to a field's trail, whose span
+//     then reaches lineEndOffset of the } line and swallows the brace;
+//     reorder emits } mid-body and the struct closes early, dropping a
+//     field. Covers both the multi-line close-brace cross and the
+//     single-line /* */-on-the-}-line case.
 //   - BUG-33: a multi-line block comment whose closing */ lands on a
 //     field's first line. The header bytes and the field bytes share a
 //     line, so there's no clean per-field byte cut.
@@ -581,13 +588,16 @@ func hasUnsafeBlockComment(fset *token.FileSet, st *ast.StructType, comments []*
 			}
 			cgStart := tf.Line(c.Pos())
 			cgEnd := tf.Line(c.End() - 1)
+			// BUG-44: comment closing on the } line; its trail swallows } on reorder.
+			// Checked before the single-line skip, which would otherwise let it pass.
+			if cgEnd == rbraceLine {
+				return true
+			}
 			if cgStart == cgEnd {
 				continue
 			}
+			// BUG-32: block comment crossing the { line — splits across splice partitions.
 			if cgStart <= lbraceLine && cgEnd > lbraceLine {
-				return true
-			}
-			if cgStart < rbraceLine && cgEnd >= rbraceLine {
 				return true
 			}
 			if fieldFirstLines == nil {
