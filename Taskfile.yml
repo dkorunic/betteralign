@@ -17,9 +17,9 @@ vars:
   BUILD_DATE:
     sh: date -u '+%Y-%m-%dT%H:%M:%SZ'
   GOSENTRY: '{{.GOSENTRY | default "/usr/local/bin/gosentry"}}'
+  LIBAFL_FLAGS: '{{.LIBAFL_FLAGS | default "--use-libafl --focus-on-new-code=false --catch-races=false --catch-leaks=false"}}'
   FUZZTIME: '{{.FUZZTIME | default "3600s"}}'
   CLEAN: '{{.CLEAN | default "false"}}'
-  LIBAFL_FLAGS: '--use-libafl --focus-on-new-code=false --catch-races=false --catch-leaks=false'
 
 env:
   CGO_ENABLED: 0
