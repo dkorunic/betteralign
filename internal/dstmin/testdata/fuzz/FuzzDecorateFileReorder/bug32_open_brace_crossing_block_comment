@@ -1,0 +1,2 @@
+go test fuzz v1
+string("package p\n\ntype S struct { /*\n*/a int\n\tb int\n}\n")
