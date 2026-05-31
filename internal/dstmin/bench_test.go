@@ -145,3 +145,34 @@ func BenchmarkFprint_NoDirty(b *testing.B) {
 		_ = Fprint(&buf, df)
 	}
 }
+
+// BenchmarkDecorateFileSrc_CommentScaling isolates decorateComments' per-comment
+// field scans. Each case decorates a SINGLE struct with F fields so the
+// comment-run length scales with F; decorateComments runs an O(F) rule sweep
+// per comment, making the routing O(F^2) for one struct. The commented/ cases
+// carry a lead-doc on every field (run length ~= F); the commentfree/ cases are
+// the same field count with no comments (the O(F) baseline from buildStruct +
+// Pass 4). If routing is the quadratic, commented/ grows ~4x per doubling while
+// commentfree/ stays ~linear, and their gap widens with F.
+func BenchmarkDecorateFileSrc_CommentScaling(b *testing.B) {
+	for _, fpf := range []int{100, 200, 400, 800} {
+		commented := buildCommentedSource(1, fpf)
+		bare := buildLargeSource(1, fpf)
+		b.Run(fmt.Sprintf("commented/fields=%d", fpf), func(b *testing.B) {
+			fset, f, src := parseBenchSource(b, commented)
+			b.ReportAllocs()
+			for b.Loop() {
+				dec := NewDecorator(fset)
+				_ = dec.DecorateFileSrc(f, src)
+			}
+		})
+		b.Run(fmt.Sprintf("commentfree/fields=%d", fpf), func(b *testing.B) {
+			fset, f, src := parseBenchSource(b, bare)
+			b.ReportAllocs()
+			for b.Loop() {
+				dec := NewDecorator(fset)
+				_ = dec.DecorateFileSrc(f, src)
+			}
+		})
+	}
+}

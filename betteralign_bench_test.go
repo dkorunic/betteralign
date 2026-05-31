@@ -7,8 +7,11 @@ package betteralign
 
 import (
 	"fmt"
+	"go/ast"
+	"go/parser"
 	"go/token"
 	"go/types"
+	"strings"
 	"testing"
 )
 
@@ -147,5 +150,62 @@ func BenchmarkDecisionPath_Suboptimal_FastPath(b *testing.B) {
 		ptrs := sizes.ptrdata(str)
 		_ = sz == optsz
 		_ = ptrs == optptrs
+	}
+}
+
+// buildIgnoreScanSource builds a file with numStructs top-level structs, each
+// carrying a type doc comment plus a lead comment on every field, so
+// file.Comments scales with numStructs*(fieldsPerStruct+1). That is the
+// worst-case surface for hasIgnoreCommentAST, which rescans file.Comments from
+// the top on every call.
+func buildIgnoreScanSource(numStructs, fieldsPerStruct int) []byte {
+	var sb strings.Builder
+	sb.WriteString("package bench\n\n")
+	for s := range numStructs {
+		fmt.Fprintf(&sb, "// S%d doc comment line.\ntype S%d struct {\n", s, s)
+		for f := range fieldsPerStruct {
+			fmt.Fprintf(&sb, "\t// f%d comment\n\tf%d int\n", f, f)
+		}
+		sb.WriteString("}\n\n")
+	}
+	return []byte(sb.String())
+}
+
+// collectStructTypes parses src and returns every *ast.StructType in source
+// order, so a benchmark can replay the analyzer's per-struct calls.
+func collectStructTypes(tb testing.TB, src []byte) (*token.FileSet, *ast.File, []*ast.StructType) {
+	tb.Helper()
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "bench.go", src, parser.ParseComments|parser.SkipObjectResolution)
+	if err != nil {
+		tb.Fatalf("parse: %v", err)
+	}
+	var sts []*ast.StructType
+	ast.Inspect(f, func(n ast.Node) bool {
+		if st, ok := n.(*ast.StructType); ok {
+			sts = append(sts, st)
+		}
+		return true
+	})
+	return fset, f, sts
+}
+
+// BenchmarkHasIgnoreCommentAST_Scaling reproduces the analyzer's worst case:
+// hasIgnoreCommentAST is called once per misaligned struct, and each call
+// rescans file.Comments from the top until it reaches that struct's closing
+// brace. Total work is therefore O(structs x comments). The fields-per-struct
+// is fixed at 4 and only the struct count is swept, so if the quadratic
+// dominates, doubling structs= should roughly quadruple ns/op.
+func BenchmarkHasIgnoreCommentAST_Scaling(b *testing.B) {
+	for _, n := range []int{50, 100, 200, 400} {
+		fset, f, sts := collectStructTypes(b, buildIgnoreScanSource(n, 4))
+		b.Run(fmt.Sprintf("structs=%d", n), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				for _, st := range sts {
+					_ = hasIgnoreCommentAST(fset, f, st)
+				}
+			}
+		})
 	}
 }

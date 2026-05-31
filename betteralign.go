@@ -39,7 +39,6 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
-	"go/parser"
 	"go/token"
 	"go/types"
 	"math"
@@ -474,6 +473,10 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 			}
 		}
 
+		// Guard malformed type info: mismatched lengths would panic at flat[idx].
+		if len(flat) != len(indexes) {
+			return
+		}
 		reordered := make([]*dst.Field, 0, len(dNode.Fields.List))
 		for _, idx := range indexes {
 			fld := flat[idx]
@@ -498,13 +501,9 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 		for _, fn := range fns {
 			buf.Reset()
 			df := dirtyFiles[fn]
+			// Fprint already validates its output parses; no second parse needed.
 			if err := dst.Fprint(&buf, df); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to print %s: %v\n", fn, err)
-				continue
-			}
-			// Refuse to overwrite source with unparseable bytes.
-			if _, err := parser.ParseFile(token.NewFileSet(), fn, buf.Bytes(), parser.SkipObjectResolution); err != nil {
-				fmt.Fprintf(os.Stderr, "betteralign: refusing to write %s: rewritten output failed to parse: %v\n", fn, err)
 				continue
 			}
 			if err := applyToFile(fn, buf.Bytes()); err != nil {
@@ -944,8 +943,8 @@ func (s *gcSizes) sizeofUncached(T types.Type) int64 {
 	case *types.Basic:
 		k := t.Kind()
 		if int(k) < len(basicSizes) {
-			if s := basicSizes[k]; s > 0 {
-				return int64(s)
+			if sz := basicSizes[k]; sz > 0 {
+				return int64(sz)
 			}
 		}
 		if k == types.String {

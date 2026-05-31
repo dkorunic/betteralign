@@ -19,38 +19,54 @@ caller diff to two import lines and two call-site renames.
 
 ## Implementation outline
 
-1. **DecorateFile (`*ast.File` → `*File`)** runs in four passes:
-   - Pass 1: walk the AST and register every decoratable `*ast.StructType`.
-   - Pass 2: collect every nested struct body range (including rejected
-     ones — single-line braces or field-on-`{`-line layouts that can't
-     be safely span-decorated), so their comments don't leak into the
-     enclosing struct's classification.
-   - Pass 3: classify every comment group inside each struct body via
-     five rules (opening-brace, trailing-line, lead-doc, multi-line block
-     extension, floating). The full rule set lives in `decorateComments`.
-   - Pass 4: compute per-field `leadBlanks` and `trailBlanks` byte ranges
+1. **`DecorateFileSrc` (`*ast.File` + source → `*File`)** does the decoration;
+   `DecorateFile` is a thin wrapper that reads the file from disk first. It
+   never errors — any layout that can't be safely span-decorated is dropped
+   from the result and simply left unrewritten. The work is:
+   - A **single preorder walk** registers every decoratable `*ast.StructType`
+     and, in the same pass, records the body ranges of nested structs (even
+     rejected ones) against their decorated ancestors, so inner-struct comments
+     don't leak into the enclosing struct's classification. Each candidate is
+     filtered through `buildStruct` plus three safety guards, each consulting a
+     per-struct comment run narrowed by binary search (`commentRun`) rather than
+     the whole `f.Comments` slice:
+     - `hasUnsafeBlockComment` — unsafe block-comment layouts: crossing the `{`
+       line, on the `}` line, multi-line on a field line, or in a multi-comment
+       group (BUG-32/33/41/44);
+     - `hasBuildConstraintComment` — mid-body `//go:build` constraints (BUG-42);
+     - `hasLineDirectiveComment` — `//line` / `/*line*/` directives (BUG-43).
+   - **Comment routing** (`decorateComments`) classifies each comment group in a
+     surviving struct body with four rules: opening-brace (1), lead-doc (2),
+     trailing-line / multi-line-block extension (3), and floating block (4).
+   - A final per-field pass computes `leadBlanks` / `trailBlanks` byte ranges
      for the dual-attachment emit.
 
-2. **Fprint** short-circuits to `w.Write(f.source)` when no struct was
+2. **`Fprint`** short-circuits to `w.Write(f.source)` when no struct was
    mutated. For dirty files, it splices the original source around
    synthesized struct bodies, runs `go/format.Source` for column
    alignment, and re-parses to validate before writing.
 
 ## Testing
 
-- 12 decoration-level test functions covering corner cases (nested
-  structs, rejected layouts, comment classification, lead/trail
-  attachment), a table-driven `TestFprint` with 9 scenarios from
-  identity to multi-blank-line reorder, and a separate regression for
-  the form-feed-in-import-path gofmt corruption case.
-- Go-native fuzz targets `FuzzDecorateFileIdentity` and
-  `FuzzDecorateFileReorder` seeded with hand-crafted edge cases and
-  every `.go` / `.go.golden` file from the project's testdata.
-- One regression seed committed under
-  `testdata/fuzz/FuzzDecorateFileReorder/400aebff9b202cec` for the
-  form-feed-in-import gofmt-corruption case the fuzzer found early on.
-- 24 hours of fuzzing on the final code (12 h identity, 12 h reorder,
-  ~1.27 billion execs combined) produced zero new failures.
+- ~30 decoration-level unit tests (`TestDecorateFile_*`, `TestReorder_*`)
+  covering corner cases: nested structs, rejected layouts (single-line braces,
+  field-on-`{`-line, unsafe block comments, mid-body build constraints and line
+  directives), comment classification, and lead/trail attachment.
+- A table-driven `TestFprint` with 12 scenarios from identity to
+  multi-blank-line reorder, plus `TestFprint_GofmtCorruptedOutputIsRejected`,
+  a regression for the form-feed-in-import-path gofmt corruption case.
+- `TestCommentRun_MatchesBruteForceForEveryStruct` cross-checks the
+  binary-search comment-run narrowing against a brute-force scan, and
+  `TestReorderCrashersDoNotPanic` replays the committed crash corpus.
+- Go-native fuzz targets `FuzzDecorateFileIdentity` and `FuzzDecorateFileReorder`,
+  seeded with hand-crafted edge cases and every `.go` / `.go.golden` file from
+  the project's testdata; the reorder oracle is itself guarded by the
+  `TestCommentTextsImmune*` invariant tests.
+- A committed reorder regression corpus (~34 seeds) under
+  `testdata/fuzz/FuzzDecorateFileReorder/`, including named cases for the
+  BUG-31..44 reorder issues surfaced by later fuzzing and targeted analysis:
+  genuine splice bugs (since fixed), unsafe layouts the decorator now rejects,
+  and fuzz-oracle false positives pinned as regressions.
 
 ## Performance vs `github.com/sirkon/dst`
 
