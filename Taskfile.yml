@@ -17,7 +17,9 @@ vars:
   BUILD_DATE:
     sh: date -u '+%Y-%m-%dT%H:%M:%SZ'
   GOSENTRY: '{{.GOSENTRY | default "/usr/local/bin/gosentry"}}'
-  LIBAFL_FLAGS: '{{.LIBAFL_FLAGS | default "--use-libafl --focus-on-new-code=false --catch-races=false --catch-leaks=false"}}'
+  GRAMMAR: '{{.GRAMMAR | default "false"}}'
+  GRAMMAR_FLAGS: '--use-grammar --grammar=golang-nautilus-grammar.json'
+  LIBAFL_FLAGS: '{{.LIBAFL_FLAGS | default "--use-libafl --focus-on-new-code=false --catch-races=false --catch-leaks=false"}}{{if eq .GRAMMAR "true"}} {{.GRAMMAR_FLAGS}}{{end}}'
   FUZZTIME: '{{.FUZZTIME | default "3600s"}}'
   CLEAN: '{{.CLEAN | default "false"}}'
 

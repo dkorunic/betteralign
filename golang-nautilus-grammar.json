@@ -160,6 +160,9 @@
   ["StructType", "struct \\{\n{FieldDeclList}\n\\}"],
   ["FieldDeclList", "{FieldDecl}"],
   ["FieldDeclList", "{FieldDecl}\n{FieldDeclList}"],
+  ["FieldDeclList", "{FieldDecl}\r\n{FieldDeclList}"],
+  ["FieldDeclList", "{FieldDecl}\t\n{FieldDeclList}"],
+  ["FieldDeclList", "{FieldDecl}  \n{FieldDeclList}"],
   ["FieldDecl", "{IdentifierList} {Type}"],
   ["FieldDecl", "{IdentifierList} {Type} {Tag}"],
   ["FieldDecl", "{IdentifierList} {Type} {LineComment}"],
@@ -576,6 +579,11 @@
   ["LineText", "go:generate stringer -type=T"],
   ["LineText", "nolint:all"],
   ["LineText", "line foo.go:1"],
+  ["LineText", " cr\rsplit byte"],
+  ["LineText", " ff\fsplit byte"],
+  ["LineText", " ctrl\u0019byte"],
+  ["LineText", " starslashes *//* x"],
+  ["LineText", " starslashes *///x"],
 
   ["GeneralComment", "/**/"],
   ["GeneralComment", "/*{GeneralText}*/"],
@@ -585,10 +593,17 @@
   ["GeneralText", " has /* opener but no closer "],
   ["GeneralText", " multi\nline\ncomment "],
   ["GeneralText", "\nleading and trailing newline\n"],
+  ["GeneralText", " cr\rin block "],
+  ["GeneralText", " ff\fin block "],
+  ["GeneralText", " ctrl\u0019in block "],
+  ["GeneralText", " reindent\n\u0019 continuation "],
+  ["GeneralText", " star *//* in block "],
 
   ["InlineComment", "/*{InlineText}*/"],
   ["InlineText", " c "],
   ["InlineText", " inline "],
   ["InlineText", "*"],
-  ["InlineText", " note "]
+  ["InlineText", " note "],
+  ["InlineText", " cr\rin "],
+  ["InlineText", " ctrl\u0019 "]
 ]
