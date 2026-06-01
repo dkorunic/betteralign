@@ -818,12 +818,13 @@ func dirtyStructs(f *File) []*StructType {
 	return out
 }
 
-// isDirty is the per-struct half of dirtyStructs. Pointer-sequence
-// equality means a callers that creates new *Field values would falsely
-// appear dirty, but the dstmin API exposes no constructor for *Field —
-// the only legitimate mutation is reorder of the existing slice, which
-// keeps the pointers intact. Length divergence is the cheap early-out for
-// hypothetical add/remove.
+// isDirty reports whether st's field list has diverged from the snapshot
+// taken at decoration time, by pointer-sequence comparison rather than deep
+// equality. A caller that creates new *Field values would falsely appear
+// dirty, but the dstmin API exposes no constructor for *Field — the only
+// legitimate mutation is reorder of the existing slice, which keeps the
+// pointers intact. Length divergence is the cheap early-out for hypothetical
+// add/remove.
 func isDirty(st *StructType) bool {
 	if len(st.Fields.List) != len(st.origList) {
 		return true

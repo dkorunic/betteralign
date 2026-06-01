@@ -33,7 +33,9 @@ func fillFromBuildInfo() {
 	fillFromBuildInfoData(info)
 }
 
-// fillFromBuildInfoData is fillFromBuildInfo with the BuildInfo injected; testable without runtime/debug.
+// fillFromBuildInfoData is fillFromBuildInfo with the BuildInfo injected;
+// testable without runtime/debug. Only fields still at their default sentinel
+// are overwritten, so values stamped via -ldflags always take precedence.
 func fillFromBuildInfoData(info *debug.BuildInfo) {
 	if Version == defaultDevVersion {
 		if v := info.Main.Version; v != "" && v != "(devel)" {
@@ -59,6 +61,8 @@ func fillFromBuildInfoData(info *debug.BuildInfo) {
 //
 //	betteralign version X.Y.Z (commit short-SHA) built on YYYY-MM-DD
 //
+// As a side effect it first calls fillFromBuildInfo, populating the
+// package-level Version/Commit/Date from build info when -ldflags did not.
 // The commit and build-date segments are omitted when their corresponding
 // ldflags were not provided (still equal to defaultUnknownInfo). Commit hashes
 // longer than seven characters are truncated to their short form. Build
