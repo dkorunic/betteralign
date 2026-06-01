@@ -121,6 +121,24 @@ tasks:
       - task: _clean-fuzz
       - go test -run='^$' -fuzz=^FuzzDecorateFileReorder$ -fuzztime={{.FUZZTIME}} ./internal/dstmin
 
+  fuzz-decoratefilereorderall:
+    desc: 'Run native FuzzDecorateFileReorderAll. Override: task fuzz-decoratefilereorderall FUZZTIME=2h (default 3600s). CLEAN=true clears the coverage cache first.'
+    cmds:
+      - task: _clean-fuzz
+      - go test -run='^$' -fuzz=^FuzzDecorateFileReorderAll$ -fuzztime={{.FUZZTIME}} ./internal/dstmin
+
+  fuzz-commentrun:
+    desc: 'Run native FuzzCommentRun. Override: task fuzz-commentrun FUZZTIME=2h (default 3600s). CLEAN=true clears the coverage cache first.'
+    cmds:
+      - task: _clean-fuzz
+      - go test -run='^$' -fuzz=^FuzzCommentRun$ -fuzztime={{.FUZZTIME}} ./internal/dstmin
+
+  fuzz-generatedbymatcher:
+    desc: 'Run native FuzzGeneratedByMatcher. Override: task fuzz-generatedbymatcher FUZZTIME=2h (default 3600s). CLEAN=true clears the coverage cache first.'
+    cmds:
+      - task: _clean-fuzz
+      - go test -run='^$' -fuzz=^FuzzGeneratedByMatcher$ -fuzztime={{.FUZZTIME}} .
+
   afl-fuzz-optimalorder:
     desc: 'Run FuzzOptimalOrder under gosentry/LibAFL (runs until Ctrl+C).'
     env:
@@ -152,6 +170,30 @@ tasks:
     cmds:
       - task: _clean-fuzz-sentry
       - '{{.GOSENTRY}} test -run=''^$'' -fuzz=^FuzzDecorateFileReorder$ {{.LIBAFL_FLAGS}} ./internal/dstmin'
+
+  afl-fuzz-decoratefilereorderall:
+    desc: 'Run FuzzDecorateFileReorderAll under gosentry/LibAFL (runs until Ctrl+C).'
+    env:
+      CGO_ENABLED: 1
+    cmds:
+      - task: _clean-fuzz-sentry
+      - '{{.GOSENTRY}} test -run=''^$'' -fuzz=^FuzzDecorateFileReorderAll$ {{.LIBAFL_FLAGS}} ./internal/dstmin'
+
+  afl-fuzz-commentrun:
+    desc: 'Run FuzzCommentRun under gosentry/LibAFL (runs until Ctrl+C).'
+    env:
+      CGO_ENABLED: 1
+    cmds:
+      - task: _clean-fuzz-sentry
+      - '{{.GOSENTRY}} test -run=''^$'' -fuzz=^FuzzCommentRun$ {{.LIBAFL_FLAGS}} ./internal/dstmin'
+
+  afl-fuzz-generatedbymatcher:
+    desc: 'Run FuzzGeneratedByMatcher under gosentry/LibAFL (runs until Ctrl+C).'
+    env:
+      CGO_ENABLED: 1
+    cmds:
+      - task: _clean-fuzz-sentry
+      - '{{.GOSENTRY}} test -run=''^$'' -fuzz=^FuzzGeneratedByMatcher$ {{.LIBAFL_FLAGS}} .'
 
   _clean-fuzz:
     internal: true

@@ -290,7 +290,7 @@ func (dec *Decorator) buildStruct(df *File, st *ast.StructType) (*StructType, bo
 	// Reject in one sweep: \r/\f break splice math (BUG-35/37); *//* and *///
 	// are gofmt-impossible (BUG-40).
 	body := df.source[structStart:structEnd]
-	for i := 0; i < len(body); i++ {
+	for i := range body {
 		switch body[i] {
 		case '\r', '\f':
 			return nil, false

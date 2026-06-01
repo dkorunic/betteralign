@@ -374,3 +374,177 @@ func nthStruct(file *ast.File, n int) *ast.StructType {
 	})
 	return found
 }
+
+// FuzzDecorateFileReorderAll reverses the field list of every NON-NESTED
+// decoratable struct with >=2 fields, not just the first. With two or more
+// such mutually non-nested structs this dirties several at once, driving
+// spliceDirty's multi-splice cursor — the path FuzzDecorateFileReorder's
+// single-struct reverse never reaches. Nested structs are deliberately left
+// alone: betteralign never reorders an anonymous field-type struct, and doing
+// so would permute a struct that another field prints inline, changing that
+// field's signature and tripping the oracle. The oracle is order-independent —
+// a reversal permutes fields but must preserve both the comment multiset and
+// the file-wide field-signature multiset — so it holds however many structs
+// were spliced.
+func FuzzDecorateFileReorderAll(f *testing.F) {
+	seeds := []string{
+		"package p\n\ntype A struct {\n\ta int\n\tb int\n}\n\ntype B struct {\n\tc int\n\td int\n}\n",
+		"package p\n\ntype A struct {\n\ta byte\n\tb int64\n}\n\ntype B struct {\n\t// doc c\n\tc int8 // trail c\n\td int64\n}\n\ntype C struct {\n\te int\n\tf int\n}\n",
+		// Regression: a non-nested struct with an anonymous-struct field type
+		// (inner) plus a sibling. inner must NOT be reversed, so its printed
+		// signature stays stable on both sides of the oracle.
+		"package p\n\ntype T struct {\n\tinner struct {\n\t\tx int\n\t\ty int\n\t}\n\tb int\n\ta int\n}\n\ntype U struct {\n\tc int\n\td int\n}\n",
+	}
+	for _, s := range seeds {
+		f.Add(s)
+	}
+	for _, s := range loadTestdataSeeds(f) {
+		f.Add(s)
+	}
+
+	f.Fuzz(reorderAllInvariant)
+}
+
+// reorderAllInvariant is FuzzDecorateFileReorderAll's fuzz body. It reverses
+// every non-nested decoratable >=2-field struct (nested ones are skipped — see
+// FuzzDecorateFileReorderAll), requires at least two reversed so the multi-dirty
+// splice path is actually exercised, and asserts the reprint parses and
+// preserves the comment and field-signature multisets. Skips uninteresting
+// inputs (unparseable, <2 reversible structs, ErrFormat, gofmt rejecting the
+// input) rather than failing.
+func reorderAllInvariant(t *testing.T, src string) {
+	t.Helper()
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "input.go", src, parser.ParseComments|parser.SkipObjectResolution)
+	if err != nil {
+		t.Skip("input not valid Go")
+	}
+	dec := NewDecorator(fset)
+	df := dec.DecorateFileSrc(file, []byte(src))
+
+	// Only reverse structs not nested inside another struct. Reversing a struct
+	// that is a field's anonymous type permutes a body another field prints
+	// inline, changing that field's signature and breaking the order-independent
+	// oracle below — and betteralign never reorders such a struct. Mutually
+	// non-nested structs are exactly the siblings that drive the multi-splice
+	// cursor.
+	var allStructs []*ast.StructType
+	ast.Inspect(file, func(n ast.Node) bool {
+		if s, ok := n.(*ast.StructType); ok && s.Fields != nil {
+			allStructs = append(allStructs, s)
+		}
+		return true
+	})
+	nested := func(c *ast.StructType) bool {
+		for _, o := range allStructs {
+			if o != c && o.Fields.Opening < c.Fields.Opening && c.Fields.Closing < o.Fields.Closing {
+				return true
+			}
+		}
+		return false
+	}
+
+	reversed := 0
+	for _, st := range df.structs {
+		if len(st.Fields.List) >= 2 && !nested(st.ast) {
+			slices.Reverse(st.Fields.List)
+			reversed++
+		}
+	}
+	if reversed < 2 {
+		t.Skip("fewer than two non-nested decoratable >=2-field structs")
+	}
+
+	var buf bytes.Buffer
+	if err := Fprint(&buf, df); err != nil {
+		if errors.Is(err, ErrFormat) {
+			return
+		}
+		t.Fatalf("Fprint (reorder-all): %v", err)
+	}
+	outFset := token.NewFileSet()
+	outFile, err := parser.ParseFile(outFset, "out.go", buf.Bytes(), parser.ParseComments|parser.SkipObjectResolution)
+	if err != nil {
+		t.Errorf("reorder-all produced invalid Go:\n=== OUTPUT ===\n%s\n=== PARSE ERROR ===\n%v\n=== INPUT ===\n%s", buf.String(), err, src)
+		return
+	}
+
+	gofmtSrc, err := format.Source([]byte(src))
+	if err != nil {
+		t.Skip("input not formattable")
+	}
+	expFset := token.NewFileSet()
+	expFile, err := parser.ParseFile(expFset, "gofmt.go", gofmtSrc, parser.ParseComments|parser.SkipObjectResolution)
+	if err != nil {
+		t.Skip("gofmt'd input doesn't parse")
+	}
+
+	// Both fingerprints are order-independent: reversal permutes fields but
+	// must never drop, duplicate, or byte-garble a comment or a field.
+	if got, want := commentTexts(outFile), commentTexts(expFile); !slices.Equal(got, want) {
+		t.Errorf("reorder-all changed the comment multiset\nWANT: %q\nGOT:  %q\n=== OUTPUT ===\n%s\n=== INPUT ===\n%s",
+			want, got, buf.String(), src)
+	}
+	if got, want := allFieldSigs(outFset, outFile), allFieldSigs(expFset, expFile); !slices.Equal(got, want) {
+		t.Errorf("reorder-all changed the field-signature multiset\nWANT: %q\nGOT:  %q\n=== OUTPUT ===\n%s\n=== INPUT ===\n%s",
+			want, got, buf.String(), src)
+	}
+}
+
+// allFieldSigs returns the sorted multiset of every struct field's signature
+// in file. Reversing field lists permutes fields but must leave this exact
+// multiset unchanged, so a field dropped, duplicated, or byte-garbled by a bad
+// splice shows up as a multiset difference regardless of position.
+func allFieldSigs(fset *token.FileSet, file *ast.File) []string {
+	var out []string
+	ast.Inspect(file, func(n ast.Node) bool {
+		if st, ok := n.(*ast.StructType); ok && st.Fields != nil {
+			for _, fld := range st.Fields.List {
+				out = append(out, fieldSig(fset, fld))
+			}
+		}
+		return true
+	})
+	sort.Strings(out)
+	return out
+}
+
+// FuzzCommentRun differential-tests commentRun's binary-search narrowing
+// against the bruteCommentRun linear reference on arbitrary parser-accepted
+// source, extending TestCommentRun_MatchesBruteForceForEveryStruct past its
+// fixed fixtures. The two must agree for every struct body: go/parser
+// guarantees f.Comments is position-sorted and non-overlapping, the invariant
+// commentRun's two binary searches rely on.
+func FuzzCommentRun(f *testing.F) {
+	for _, s := range handCraftedSeeds {
+		f.Add(s)
+	}
+	for _, s := range loadTestdataSeeds(f) {
+		f.Add(s)
+	}
+
+	f.Fuzz(func(t *testing.T, src string) {
+		fset := token.NewFileSet()
+		file, err := parser.ParseFile(fset, "input.go", src, parser.ParseComments|parser.SkipObjectResolution)
+		if err != nil {
+			t.Skip("input not valid Go")
+		}
+		ast.Inspect(file, func(n ast.Node) bool {
+			st, ok := n.(*ast.StructType)
+			if !ok || st.Fields == nil {
+				return true
+			}
+			got := commentRun(file.Comments, st.Fields.Opening, st.Fields.Closing)
+			want := bruteCommentRun(file.Comments, st.Fields.Opening, st.Fields.Closing)
+			if len(got) != len(want) {
+				t.Fatalf("commentRun len=%d want=%d\nSRC:\n%s", len(got), len(want), src)
+			}
+			for i := range want {
+				if got[i] != want[i] {
+					t.Errorf("commentRun[%d]=%p want %p\nSRC:\n%s", i, got[i], want[i], src)
+				}
+			}
+			return true
+		})
+	})
+}

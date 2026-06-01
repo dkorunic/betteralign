@@ -20,9 +20,9 @@ import (
 func buildLargeSource(numStructs, fieldsPerStruct int) []byte {
 	var sb strings.Builder
 	sb.WriteString("package bench\n\n")
-	for s := 0; s < numStructs; s++ {
+	for s := range numStructs {
 		fmt.Fprintf(&sb, "type S%d struct {\n", s)
-		for f := 0; f < fieldsPerStruct; f++ {
+		for f := range fieldsPerStruct {
 			fmt.Fprintf(&sb, "\tf%d int\n", f)
 		}
 		sb.WriteString("}\n\n")
@@ -38,9 +38,9 @@ func buildLargeSource(numStructs, fieldsPerStruct int) []byte {
 func buildCommentedSource(numStructs, fieldsPerStruct int) []byte {
 	var sb strings.Builder
 	sb.WriteString("package bench\n\n")
-	for s := 0; s < numStructs; s++ {
+	for s := range numStructs {
 		fmt.Fprintf(&sb, "// S%d is a doc comment.\ntype S%d struct {\n", s, s)
-		for f := 0; f < fieldsPerStruct; f++ {
+		for f := range fieldsPerStruct {
 			fmt.Fprintf(&sb, "\t// f%d doc\n\tf%d int\n", f, f)
 		}
 		sb.WriteString("}\n\n")
@@ -53,7 +53,7 @@ func buildCommentedSource(numStructs, fieldsPerStruct int) []byte {
 func buildNestedSource(depth int) []byte {
 	var sb strings.Builder
 	sb.WriteString("package bench\n\ntype Nest struct {\n")
-	for i := 0; i < depth; i++ {
+	for i := range depth {
 		sb.WriteString(strings.Repeat("\t", i+1))
 		fmt.Fprintf(&sb, "Level%d struct {\n", i)
 	}

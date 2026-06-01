@@ -1794,7 +1794,7 @@ func TestOptimalOrderNoPointers(t *testing.T) {
 func TestOptimalOrderStableWithManyTiedFields(t *testing.T) {
 	const pairs = 16 // 32 fields total: clears pdqsort's insertion-sort threshold.
 	fields := make([]*types.Var, 0, pairs*2)
-	for i := 0; i < pairs; i++ {
+	for i := range pairs {
 		fields = append(fields, types.NewVar(token.NoPos, nil, fmt.Sprintf("u64_%d", i), types.Typ[types.Uint64]))
 		fields = append(fields, types.NewVar(token.NoPos, nil, fmt.Sprintf("u32_%d", i), types.Typ[types.Uint32]))
 	}
@@ -1803,10 +1803,10 @@ func TestOptimalOrderStableWithManyTiedFields(t *testing.T) {
 
 	// Stable: uint64s in even-index order first, then uint32s in odd-index order.
 	want := make([]int, 0, pairs*2)
-	for i := 0; i < pairs; i++ {
+	for i := range pairs {
 		want = append(want, i*2) // uint64 declarations are at even indexes.
 	}
-	for i := 0; i < pairs; i++ {
+	for i := range pairs {
 		want = append(want, i*2+1) // uint32 declarations are at odd indexes.
 	}
 	for i, idx := range indexes {
