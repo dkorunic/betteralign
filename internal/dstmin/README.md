@@ -70,34 +70,36 @@ caller diff to two import lines and two call-site renames.
 
 ## Performance vs `github.com/sirkon/dst`
 
-Measured on Xeon E5-1630 v3 @ 3.70GHz, Go 1.26.3, Linux.
+Measured on Xeon E5-1630 v3 @ 3.70GHz, Go 1.26.3, Linux — re-collected for the
+v0.12.0 release. The `sirkon/dst` column is the pre-migration commit (`v0.26.4`).
 
 ### Microbenchmark (`go test -bench=. -benchmem -count=10`)
 
-Same parser-prepared `*ast.File` reused across all iterations. Parsing is
-outside the timer. Benchstat with `n=10`; all deltas significant at
+One documented struct (lead-doc, trailing line comments, a struct tag, and a
+floating trailing block), parser-prepared once and reused across iterations;
+parsing is outside the timer. Benchstat with `n=10`; all deltas significant at
 `p=0.000`.
 
 | Operation | `sirkon/dst` | `internal/dstmin` | Δ wall-clock | Δ B/op | Δ allocs/op |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `DecorateFile` | 55.05 µs | 8.91 µs | **−83.81%** (6.2×) | −71.91% | −88.93% |
-| `FprintIdentity` (clean-file pass-through) | 27.73 µs | 24.66 ns | **−99.91%** (~1100×) | −100% | −100% |
-| `DecorateReorderPrint` (decorate + swap two fields + print) | 93.53 µs | 56.91 µs | **−39.15%** (1.64×) | −44.31% | −29.93% |
-| geomean | 52.27 µs | 2.32 µs | **−95.56%** | | |
+| `DecorateFile` | 40.39 µs | 3.836 µs | **−90.50%** (10.5×) | −72.80% | −88.69% |
+| `FprintIdentity` (clean-file pass-through) | 20.58 µs | 21.37 ns | **−99.90%** (~960×) | −100% | −100% |
+| `DecorateReorderPrint` (decorate + reorder fields + print) | 69.24 µs | 32.24 µs | **−53.44%** (2.15×) | −52.95% | −30.92% |
+| geomean | 38.61 µs | 1.383 µs | **−96.42%** | | |
 
 ### Macro benchmark (end-to-end `betteralign -apply ./...`)
 
-Synthetic corpus: 500 misaligned structs across 50 files in 10 packages
-(248 KB total source). Each struct has lead-doc, trailing line comments,
-a struct tag, and a floating blank-line-separated trailing comment block —
-exercising every classifier rule. `hyperfine` with 3 warmup + 20 timed
-runs per binary, alternating, fresh corpus copied for every run.
+Synthetic corpus: 500 misaligned structs across 50 files in 10 packages. Each
+struct has lead-doc, trailing line comments, a struct tag, and a floating
+blank-line-separated trailing comment block — exercising every classifier
+rule. `hyperfine` with 3 warmup + 20 timed runs per binary, fresh corpus
+copied for every run.
 
 | Implementation | Wall-clock mean | Min | Max | User CPU mean |
 | --- | ---: | ---: | ---: | ---: |
-| `sirkon/dst` (pre-migration) | 782.3 ± 127.0 ms | 584.0 ms | 1124.7 ms | 240.4 ms |
-| `internal/dstmin` (HEAD) | **698.0 ± 70.0 ms** | 582.6 ms | 894.3 ms | **105.2 ms** |
-| ratio | **1.12× faster** | | | **2.29× less CPU** |
+| `sirkon/dst` (pre-migration) | 772.8 ± 85.2 ms | 622.6 ms | 905.0 ms | 213.7 ms |
+| `internal/dstmin` (v0.12.0) | **657.7 ± 79.6 ms** | 515.8 ms | 788.9 ms | **102.0 ms** |
+| ratio | **1.17× faster** | | | **2.1× less CPU** |
 
 Both binaries produce **byte-identical output** on the corpus (verified
 with `diff -r` between the two reordered trees).
@@ -106,31 +108,31 @@ with `diff -r` between the two reordered trees).
 
 | Implementation | Stripped binary | Δ |
 | --- | ---: | ---: |
-| `sirkon/dst` (pre-migration) | 7,696,546 B (7.34 MB) | — |
-| `internal/dstmin` (HEAD) | **7,270,562 B (6.93 MB)** | **−5.5%** |
+| `sirkon/dst` (pre-migration) | 7,696,546 B (7.34 MiB) | — |
+| `internal/dstmin` (v0.12.0) | **7,278,754 B (6.94 MiB)** | **−5.4%** |
 
 ### Dependency footprint
 
 | Implementation | Direct deps in `go.mod` |
 | --- | ---: |
 | `sirkon/dst` (pre-migration) | 6 |
-| `internal/dstmin` (HEAD) | **5** (no `sirkon/dst`) |
+| `internal/dstmin` (v0.12.0) | **5** (no `sirkon/dst`) |
 
 ## Why dstmin wins
 
 - **The clean-file fast path is essentially free.** Most files in a real
   codebase do not have a misaligned struct. `Fprint` on a clean file is
-  literally `w.Write(f.source)` — one syscall, zero allocations, ~25 ns.
+  literally `w.Write(f.source)` — one syscall, zero allocations, ~21 ns.
   `sirkon/dst` always reconstructs the AST through its restorer and runs
-  `go/printer` regardless, paying ~28 µs and 148 allocations on every
+  `go/printer` regardless, paying ~21 µs and 130 allocations on every
   no-op. For betteralign's typical workload (analyze many files,
   mutate few) this dominates the wall-clock savings.
 
-- **Decoration is 6.2× cheaper.** `sirkon/dst` materialises one fragment
+- **Decoration is ~10× cheaper.** `sirkon/dst` materialises one fragment
   object (`commentFragment`, `newlineFragment`, `tokenFragment`, ...) for
   every comment and token in the file, sorts them by position, then walks
-  the result. dstmin walks the AST once and records byte offsets — 28
-  allocations vs 253 for the same input.
+  the result. dstmin walks the AST once and records byte offsets — 25
+  allocations vs 221 for the same input.
 
 - **Mutation reuses the existing source.** dstmin synthesizes only the
   modified struct body and byte-splices it back into the original source,
@@ -139,16 +141,15 @@ with `diff -r` between the two reordered trees).
   reprints the whole file through `go/printer`.
 
 - **The macro speedup is muted by I/O.** The end-to-end analyzer wall-clock
-  improvement (~12%) is smaller than the per-operation improvement because
+  improvement (~15%) is smaller than the per-operation improvement because
   process startup, AST parsing, type-checking, and atomic file writes are
   shared between the implementations. The User CPU time is a cleaner
-  signal (2.29× less) — that is where dstmin pays back.
+  signal (~2.1× less) — that is where dstmin pays back.
 
-- **Allocation pressure is much lower, so GC pauses are rarer.** In the
-  macro run, `sirkon/dst`'s upper tail reached 1.12 s (1.44× its own mean)
-  while dstmin's max was 894 ms (1.28× its mean). The tight dstmin
-  distribution is consistent with fewer transient allocations and less
-  GC work during the per-file pipeline.
+- **Allocation pressure is much lower.** Per-operation allocations drop
+  sharply (`DecorateFile` 25 vs 221, `FprintIdentity` 0 vs 130), and the
+  end-to-end run does ~2× less user-CPU work — fewer transient allocations
+  mean less GC during the per-file pipeline.
 
 ## Reproducing the benchmarks
 
