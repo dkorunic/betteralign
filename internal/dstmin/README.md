@@ -80,12 +80,12 @@ floating trailing block), parser-prepared once and reused across iterations;
 parsing is outside the timer. Benchstat with `n=10`; all deltas significant at
 `p=0.000`.
 
-| Operation | `sirkon/dst` | `internal/dstmin` | Δ wall-clock | Δ B/op | Δ allocs/op |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `DecorateFile` | 40.39 µs | 3.836 µs | **−90.50%** (10.5×) | −72.80% | −88.69% |
-| `FprintIdentity` (clean-file pass-through) | 20.58 µs | 21.37 ns | **−99.90%** (~960×) | −100% | −100% |
-| `DecorateReorderPrint` (decorate + reorder fields + print) | 69.24 µs | 32.24 µs | **−53.44%** (2.15×) | −52.95% | −30.92% |
-| geomean | 38.61 µs | 1.383 µs | **−96.42%** | | |
+| Operation                                                  | `sirkon/dst` | `internal/dstmin` |        Δ wall-clock |  Δ B/op | Δ allocs/op |
+| ---------------------------------------------------------- | -----------: | ----------------: | ------------------: | ------: | ----------: |
+| `DecorateFile`                                             |     40.39 µs |          3.836 µs | **−90.50%** (10.5×) | −72.80% |     −88.69% |
+| `FprintIdentity` (clean-file pass-through)                 |     20.58 µs |          21.37 ns | **−99.90%** (~960×) |   −100% |       −100% |
+| `DecorateReorderPrint` (decorate + reorder fields + print) |     69.24 µs |          32.24 µs | **−53.44%** (2.15×) | −52.95% |     −30.92% |
+| geomean                                                    |     38.61 µs |          1.383 µs |         **−96.42%** |         |             |
 
 ### Macro benchmark (end-to-end `betteralign -apply ./...`)
 
@@ -95,28 +95,28 @@ blank-line-separated trailing comment block — exercising every classifier
 rule. `hyperfine` with 3 warmup + 20 timed runs per binary, fresh corpus
 copied for every run.
 
-| Implementation | Wall-clock mean | Min | Max | User CPU mean |
-| --- | ---: | ---: | ---: | ---: |
-| `sirkon/dst` (pre-migration) | 772.8 ± 85.2 ms | 622.6 ms | 905.0 ms | 213.7 ms |
-| `internal/dstmin` (v0.12.0) | **657.7 ± 79.6 ms** | 515.8 ms | 788.9 ms | **102.0 ms** |
-| ratio | **1.17× faster** | | | **2.1× less CPU** |
+| Implementation               |     Wall-clock mean |      Min |      Max |     User CPU mean |
+| ---------------------------- | ------------------: | -------: | -------: | ----------------: |
+| `sirkon/dst` (pre-migration) |     772.8 ± 85.2 ms | 622.6 ms | 905.0 ms |          213.7 ms |
+| `internal/dstmin` (v0.12.0)  | **657.7 ± 79.6 ms** | 515.8 ms | 788.9 ms |      **102.0 ms** |
+| ratio                        |    **1.17× faster** |          |          | **2.1× less CPU** |
 
 Both binaries produce **byte-identical output** on the corpus (verified
 with `diff -r` between the two reordered trees).
 
 ### Binary size
 
-| Implementation | Stripped binary | Δ |
-| --- | ---: | ---: |
-| `sirkon/dst` (pre-migration) | 7,696,546 B (7.34 MiB) | — |
-| `internal/dstmin` (v0.12.0) | **7,278,754 B (6.94 MiB)** | **−5.4%** |
+| Implementation               |            Stripped binary |         Δ |
+| ---------------------------- | -------------------------: | --------: |
+| `sirkon/dst` (pre-migration) |     7,696,546 B (7.34 MiB) |         — |
+| `internal/dstmin` (v0.12.0)  | **7,278,754 B (6.94 MiB)** | **−5.4%** |
 
 ### Dependency footprint
 
-| Implementation | Direct deps in `go.mod` |
-| --- | ---: |
-| `sirkon/dst` (pre-migration) | 6 |
-| `internal/dstmin` (v0.12.0) | **5** (no `sirkon/dst`) |
+| Implementation               | Direct deps in `go.mod` |
+| ---------------------------- | ----------------------: |
+| `sirkon/dst` (pre-migration) |                       6 |
+| `internal/dstmin` (v0.12.0)  | **5** (no `sirkon/dst`) |
 
 ## Why dstmin wins
 

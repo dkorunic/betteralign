@@ -1,6 +1,6 @@
 # betteralign
 
-[![GitHub license](https://img.shields.io/github/license/dkorunic/betteralign)](https://github.com/dkorunic/betteralign/blob/master/LICENSE)
+[![GitHub license](https://img.shields.io/github/license/dkorunic/betteralign)](https://github.com/dkorunic/betteralign/blob/main/LICENSE)
 [![GitHub release](https://img.shields.io/github/release/dkorunic/betteralign)](https://github.com/dkorunic/betteralign/releases/latest)
 [![go-recipes](https://raw.githubusercontent.com/nikolaydubina/go-recipes/main/badge.svg?raw=true)](https://github.com/nikolaydubina/go-recipes)
 
@@ -88,30 +88,30 @@ Environment: Intel Xeon E5-1630 v3 @ 3.70GHz, amd64/Linux, Go 1.26.3. Re-collect
 
 **sec/op**
 
-| Benchmark | v0.6.0 | v0.8.0 | v0.11.0 | Δ v0.11 | v0.12.0 | Δ v0.12 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `OptimalOrder_Small` | 1148 ns ± 1% | 1132 ns ± 1% | 508.1 ns ± 3% | **−55.1%** | 501.6 ns ± 1% | ~ |
-| `OptimalOrder_Medium` | 5.823 µs ± 1% | 5.793 µs ± 1% | 2.329 µs ± 2% | **−59.8%** | 2.368 µs ± 2% | ~ |
-| `OptimalOrder_Large` | 35.72 µs ± 1% | 35.46 µs ± 1% | 14.26 µs ± 1% | **−59.8%** | 14.38 µs ± 1% | ~ |
-| geomean | 6.203 µs | 6.148 µs | 2.565 µs | **−58.3%** | 2.575 µs | ~ |
+| Benchmark             |        v0.6.0 |        v0.8.0 |       v0.11.0 |    Δ v0.11 |       v0.12.0 | Δ v0.12 |
+| --------------------- | ------------: | ------------: | ------------: | ---------: | ------------: | ------: |
+| `OptimalOrder_Small`  |  1148 ns ± 1% |  1132 ns ± 1% | 508.1 ns ± 3% | **−55.1%** | 501.6 ns ± 1% |       ~ |
+| `OptimalOrder_Medium` | 5.823 µs ± 1% | 5.793 µs ± 1% | 2.329 µs ± 2% | **−59.8%** | 2.368 µs ± 2% |       ~ |
+| `OptimalOrder_Large`  | 35.72 µs ± 1% | 35.46 µs ± 1% | 14.26 µs ± 1% | **−59.8%** | 14.38 µs ± 1% |       ~ |
+| geomean               |      6.203 µs |      6.148 µs |      2.565 µs | **−58.3%** |      2.575 µs |       ~ |
 
 **B/op**
 
-| Benchmark | v0.6.0 | v0.8.0 | v0.11.0 | Δ v0.11 | v0.12.0 | Δ v0.12 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `OptimalOrder_Small` | 764 B | 764 B | 48 B | **−93.72%** | 48 B | ~ |
-| `OptimalOrder_Medium` | 3,360 B | 3,360 B | 160 B | **−95.24%** | 160 B | ~ |
-| `OptimalOrder_Large` | 15,056 B | 15,056 B | 896 B | **−94.05%** | 896 B | ~ |
-| geomean | 3.302 KiB | 3.302 KiB | 190.2 B | **−94.37%** | 190.2 B | ~ |
+| Benchmark             |    v0.6.0 |    v0.8.0 | v0.11.0 |     Δ v0.11 | v0.12.0 | Δ v0.12 |
+| --------------------- | --------: | --------: | ------: | ----------: | ------: | ------: |
+| `OptimalOrder_Small`  |     764 B |     764 B |    48 B | **−93.72%** |    48 B |       ~ |
+| `OptimalOrder_Medium` |   3,360 B |   3,360 B |   160 B | **−95.24%** |   160 B |       ~ |
+| `OptimalOrder_Large`  |  15,056 B |  15,056 B |   896 B | **−94.05%** |   896 B |       ~ |
+| geomean               | 3.302 KiB | 3.302 KiB | 190.2 B | **−94.37%** | 190.2 B |       ~ |
 
 **allocs/op**
 
-| Benchmark | v0.6.0 | v0.8.0 | v0.11.0 | Δ v0.11 | v0.12.0 | Δ v0.12 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `OptimalOrder_Small` | 14 | 14 | 1 | **−92.86%** | 1 | ~ |
-| `OptimalOrder_Medium` | 34 | 34 | 1 | **−97.06%** | 1 | ~ |
-| `OptimalOrder_Large` | 118 | 118 | 1 | **−99.15%** | 1 | ~ |
-| geomean | 38.30 | 38.30 | 1.000 | **−97.39%** | 1.000 | ~ |
+| Benchmark             | v0.6.0 | v0.8.0 | v0.11.0 |     Δ v0.11 | v0.12.0 | Δ v0.12 |
+| --------------------- | -----: | -----: | ------: | ----------: | ------: | ------: |
+| `OptimalOrder_Small`  |     14 |     14 |       1 | **−92.86%** |       1 |       ~ |
+| `OptimalOrder_Medium` |     34 |     34 |       1 | **−97.06%** |       1 |       ~ |
+| `OptimalOrder_Large`  |    118 |    118 |       1 | **−99.15%** |       1 |       ~ |
+| geomean               |  38.30 |  38.30 |   1.000 | **−97.39%** |   1.000 |       ~ |
 
 On this machine v0.6.0 and v0.8.0 are within noise (the original ~12% small-struct speedup was Apple-silicon–specific). v0.11.0 refactored `optimalOrder` to return an index permutation (`[]int`) instead of reconstructing a full `*types.Struct`, cutting allocations from O(n) down to a single allocation regardless of struct size — a ~58% speedup and ~94% memory reduction across all struct sizes. **v0.12.0 leaves `optimalOrder` itself untouched**, so its layout-sorting numbers match v0.11.0.
 
@@ -119,11 +119,11 @@ On this machine v0.6.0 and v0.8.0 are within noise (the original ~12% small-stru
 
 Three scenarios measured on a 20-field struct with a fresh `gcSizes` (cold caches) per call, collected with `go test -bench=^BenchmarkDecisionPath -benchmem -count=10`.
 
-| Benchmark | v0.11.0 | v0.12.0 | Δ | Description |
-| --- | ---: | ---: | ---: | --- |
-| `DecisionPath_Optimal_NoFastPath` | 4.463 µs | 4.924 µs | +10.3% | `optimalOrder` + `Sizeof` + `ptrdata` walk, no identity check |
-| `DecisionPath_Optimal_FastPath` | 2.100 µs | 2.452 µs | +16.7% | identity check fires → `Sizeof`/`ptrdata` skipped |
-| `DecisionPath_Suboptimal_FastPath` | 5.316 µs | 6.823 µs | +28.3% | identity check misses → full walk proceeds |
+| Benchmark                          |  v0.11.0 |  v0.12.0 |      Δ | Description                                                   |
+| ---------------------------------- | -------: | -------: | -----: | ------------------------------------------------------------- |
+| `DecisionPath_Optimal_NoFastPath`  | 4.463 µs | 4.924 µs | +10.3% | `optimalOrder` + `Sizeof` + `ptrdata` walk, no identity check |
+| `DecisionPath_Optimal_FastPath`    | 2.100 µs | 2.452 µs | +16.7% | identity check fires → `Sizeof`/`ptrdata` skipped             |
+| `DecisionPath_Suboptimal_FastPath` | 5.316 µs | 6.823 µs | +28.3% | identity check misses → full walk proceeds                    |
 
 The fast path still pays off: on an already-optimal struct it skips the `Sizeof`/`ptrdata` tree walks, roughly halving the per-struct decision cost (2.452 µs vs 4.924 µs). v0.12.0 runs the decision path ~18% slower than v0.11.0 (geomean), and the suboptimal full walk now allocates 1,072 B / 7 allocs (vs 160 B / 1) — the deliberate cost of v0.12.0's `gcSizes` hardening: overflow saturation in `align`/`mulSize`/`addSize` and recursion sentinels in `Sizeof`/`Alignof`/`ptrdata` (BUG-29/BUG-30) that keep the analyzer robust against adversarial or malformed types.
 
