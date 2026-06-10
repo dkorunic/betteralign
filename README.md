@@ -127,6 +127,19 @@ Three scenarios measured on a 20-field struct with a fresh `gcSizes` (cold cache
 
 The fast path still pays off: on an already-optimal struct it skips the `Sizeof`/`ptrdata` tree walks, roughly halving the per-struct decision cost (2.452 µs vs 4.924 µs). v0.12.0 runs the decision path ~18% slower than v0.11.0 (geomean), and the suboptimal full walk now allocates 1,072 B / 7 allocs (vs 160 B / 1) — the deliberate cost of v0.12.0's `gcSizes` hardening: overflow saturation in `align`/`mulSize`/`addSize` and recursion sentinels in `Sizeof`/`Alignof`/`ptrdata` (BUG-29/BUG-30) that keep the analyzer robust against adversarial or malformed types.
 
+### Runtime tuning with `GOGC`
+
+The analyzer itself is allocation-light, but loading and type-checking a package graph (`go/types`, the AST inspector, and the parser) produces a large volume of short-lived garbage — on a real-world run, well over 1 GiB of churn against only a few MiB of live heap at exit. Because `betteralign` is a short-lived batch process, the default `GOGC=100` spends CPU collecting garbage that would be freed at exit anyway. Running with garbage collection disabled trades that work for higher peak memory:
+
+```sh
+GOGC=off betteralign ./...
+```
+
+On a large warm-cache run this measured roughly a **15–16% wall-clock improvement** (and `GOGC=400` about **13%**), since most of the runtime's GC work simply disappears.
+
+> [!CAUTION]
+> `GOGC=off` lets the heap grow unbounded for the duration of the run. In memory-constrained containers (e.g. a Kubernetes pod with a low memory limit) this can trigger an **OOM kill** on a large package graph. `betteralign` already sets a soft `GOMEMLIMIT` (90% of the cgroup/system memory) which acts as a backstop, but on tight limits prefer a high finite value such as `GOGC=400` over fully disabling collection, or leave the default.
+
 ## Installation
 
 **Manual:** Download the appropriate binary from [the releases page](https://github.com/dkorunic/betteralign/releases) and place it in your `PATH`, typically `/usr/local/bin/betteralign`.
