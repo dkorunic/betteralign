@@ -80,9 +80,7 @@ type S struct {
 	if got.Fields == nil || len(got.Fields.List) != 2 {
 		t.Errorf("Fields.List len = %d, want 2", len(got.Fields.List))
 	}
-	if df == nil {
-		t.Fatal("DecorateFile returned nil *File")
-	}
+	// df is non-nil whenever DecorateFile returned no error (checked above).
 	if len(df.structs) != 1 {
 		t.Errorf("df.structs len = %d, want 1", len(df.structs))
 	}

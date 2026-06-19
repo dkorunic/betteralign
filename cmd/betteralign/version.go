@@ -22,9 +22,7 @@ var (
 )
 
 // fillFromBuildInfo populates Version/Commit/Date from runtime build info when
-// ldflags were not used (e.g. `go install module@version`). Go embeds the
-// module version in info.Main.Version and, for VCS-aware builds, the revision
-// and commit time in info.Settings.
+// ldflags weren't used (e.g. `go install module@version`).
 func fillFromBuildInfo() {
 	info, ok := debug.ReadBuildInfo()
 	if !ok {
@@ -33,9 +31,9 @@ func fillFromBuildInfo() {
 	fillFromBuildInfoData(info)
 }
 
-// fillFromBuildInfoData is fillFromBuildInfo with the BuildInfo injected;
-// testable without runtime/debug. Only fields still at their default sentinel
-// are overwritten, so values stamped via -ldflags always take precedence.
+// fillFromBuildInfoData is fillFromBuildInfo with BuildInfo injected for tests.
+// Only fields still at their default sentinel are overwritten, so -ldflags
+// values take precedence.
 func fillFromBuildInfoData(info *debug.BuildInfo) {
 	if Version == defaultDevVersion {
 		if v := info.Main.Version; v != "" && v != "(devel)" {
@@ -57,18 +55,13 @@ func fillFromBuildInfoData(info *debug.BuildInfo) {
 	}
 }
 
-// getVersionString returns a human-readable version banner of the form:
+// getVersionString returns a banner of the form:
 //
 //	betteralign version X.Y.Z (commit short-SHA) built on YYYY-MM-DD
 //
-// As a side effect it first calls fillFromBuildInfo, populating the
-// package-level Version/Commit/Date from build info when -ldflags did not.
-// The commit and build-date segments are omitted when their corresponding
-// ldflags were not provided (still equal to defaultUnknownInfo). Commit hashes
-// longer than seven characters are truncated to their short form. Build
-// dates of ten or more characters are sliced to their first ten bytes (the
-// YYYY-MM-DD prefix of an RFC 3339 timestamp); shorter dates are emitted
-// as-is.
+// It first calls fillFromBuildInfo. The commit and date segments are omitted
+// when unknown; the commit is shortened to 7 chars and the date to its
+// YYYY-MM-DD prefix.
 func getVersionString() string {
 	fillFromBuildInfo()
 

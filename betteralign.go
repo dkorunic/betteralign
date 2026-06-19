@@ -11,15 +11,11 @@
 // Package betteralign defines an Analyzer that detects structs that would use less
 // memory if their fields were sorted.
 
-// This is a fork of fieldalignment tool (https://pkg.go.dev/golang.org/x/tools/go/analysis/passes/fieldalignment)
-// patched to use DST (Decorated Syntax Tree) to support floating comments, field comments, preserve multiple line
-// spacing etc.
-// Vast majority of the alignment calculation code from fieldalignment (and maligned) has remained the same, except for
-// using DST and handling suggested fixes. With DST we cannot print out a single node and all decorations easily, so in
-// apply mode we are printing whole DST with alignment fixes into a file. Fix mode sadly doesn't do anything as we are
-// not using SuggestedFixes for partial rewrite.
-// To avoid DST panics due to node info reuse present in the original code, some logic from structslop
-// (https://github.com/orijtech/structslop) was also borrowed.
+// Fork of fieldalignment (https://pkg.go.dev/golang.org/x/tools/go/analysis/passes/fieldalignment)
+// using a DST (Decorated Syntax Tree) so comments and spacing survive a
+// rewrite. The alignment math is largely unchanged from fieldalignment/maligned;
+// apply mode reprints the whole file because DST can't serialise a single node,
+// and -fix is a no-op alias since SuggestedFixes are unused.
 //
 // Related AST issue:
 //   - https://github.com/golang/go/issues/20744
@@ -45,6 +41,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 
@@ -140,24 +137,16 @@ type analyzerConfig struct {
 // StringArrayFlag accumulates comma-separated values across repeated flag occurrences; backs -exclude_dirs / -exclude_files.
 type StringArrayFlag []string
 
-// String renders the accumulated entries through fmt's %v formatter. Exists
-// to satisfy flag.Value (which mandates a String method even on flags that
-// are pure accumulators); the format is intended for human-readable usage
-// output, not for round-tripping through Set.
+// String satisfies flag.Value with a human-readable rendering; not meant to
+// round-trip through Set.
 func (f *StringArrayFlag) String() string {
 	return fmt.Sprintf("%v", *f)
 }
 
-// Set appends one or more values from a single -flag occurrence onto the
-// accumulator. Comma-separated lists are split so `--exclude_dirs a,b,c`
-// and three repetitions of the same flag are equivalent — the form was
-// established by the original fieldalignment CLI and is preserved here for
-// drop-in compatibility. Empty entries (from stray leading/trailing commas
-// or `--exclude_dirs ,,`) are dropped silently so users don't get spurious
-// "" matches. Never returns an error today; the signature is dictated by
-// flag.Value, not by anticipated failures. Not safe for concurrent calls;
-// run.cfg.excludeDirs/excludeFiles are clones at run-start to defend
-// against host frameworks that mutate flag values in parallel.
+// Set splits comma-separated values onto the accumulator, matching the original
+// fieldalignment CLI (`a,b,c` is equivalent to three repeats). Empty entries
+// are dropped to avoid spurious "" matches. Never errors. Not concurrency-safe
+// — run clones the flag slices at start.
 func (f *StringArrayFlag) Set(value string) error {
 	for v := range strings.SplitSeq(value, ",") {
 		v = strings.TrimSpace(v)
@@ -175,22 +164,13 @@ var Analyzer = &analysis.Analyzer{
 	Requires: []*analysis.Analyzer{inspect.Analyzer},
 }
 
-// InitAnalyzer wires a fresh analyzerConfig into analyzer so each Analyzer
-// instance owns independent flag state. Exists because the original
-// fieldalignment used package-level flags, which conflicted when multiple
-// analyzers ran in parallel (the analysistest suite in particular, and
-// hosts like golangci-lint that run several analyzers in one process).
-// The function is exported so external drivers can build their own
-// Analyzer through `*analysis.Analyzer{Name:..., Doc:..., Requires:...}`
-// and then call InitAnalyzer to attach the betteralign flag set without
-// going through singlechecker.Main.
+// InitAnalyzer attaches a fresh flag set and Run hook so each Analyzer owns
+// independent flag state (the original fieldalignment used package-level flags
+// that collided when several analyzers ran in one process, e.g. under
+// golangci-lint). Exported for external drivers that build their own Analyzer.
 //
-// Idempotent: re-init on an Analyzer whose FlagSet already carries the
-// "apply" flag is a no-op rather than a panic. flag.FlagSet.BoolVar
-// os.Exit(2)s on duplicate flag names, which would take down the host
-// process; the lookup guard turns that into a benign re-entry. Not safe
-// for concurrent calls on the SAME Analyzer; safe across distinct
-// Analyzers (each owns its own FlagSet).
+// Idempotent: re-init is a no-op rather than a duplicate-flag os.Exit(2).
+// Concurrency-safe across distinct Analyzers, not on the same one.
 func InitAnalyzer(analyzer *analysis.Analyzer) {
 	if analyzer.Flags.Lookup("apply") != nil {
 		return
@@ -205,48 +185,24 @@ func InitAnalyzer(analyzer *analysis.Analyzer) {
 	analyzer.Run = cfg.run
 }
 
-// init wires the package-level Analyzer through the shared InitAnalyzer
-// path so direct importers of `betteralign.Analyzer` (the canonical
-// integration shape) see the flag set without having to remember to call
-// InitAnalyzer themselves. External drivers that construct their own
-// Analyzer never hit this path.
+// init wires the package-level Analyzer so direct importers of
+// betteralign.Analyzer get the flag set without calling InitAnalyzer.
 func init() {
 	InitAnalyzer(Analyzer)
 }
 
-// run is the analyzer entry point that go/analysis invokes once per
-// package. It rides the *inspector.Inspector that inspect.Analyzer
-// already built for this pass, so the traversal cost is shared across
-// any other analyzers participating in the same suite (vet, gopls, etc).
-// Reporting is decoupled from rewriting: diagnostics (including the
-// betteralign:ignore opt-out and the positional-literal check) come purely
-// from AST + type info, so report-only mode never reads source bytes from
-// disk and never builds DST trees, and a clean codebase does only AST work.
-// DST decoration is built lazily and only under -apply, since only the
-// rewrite needs it; a misaligned struct dstmin cannot decorate is therefore
-// still reported, just not rewritten.
+// run is the per-package analyzer entry point. Reporting is decoupled from
+// rewriting: diagnostics come from AST + type info alone, so report-only mode
+// never reads source bytes or builds DST. DST decoration is lazy and gated by
+// -apply (and its legacy alias -fix); a struct dstmin can't decorate is still
+// reported, just not rewritten. SuggestedFixes stay nil because DST can't
+// serialise a single node without losing comments — the rewrite emits whole
+// files (see package doc).
 //
-// The diagnostic-only path runs even when -apply is unset, so editors and
-// linters get the report; -apply (and its legacy alias -fix) gates the
-// rewrite step. SuggestedFixes are intentionally left nil — DST cannot
-// serialise a single node without losing its comment decorations, so the
-// rewrite has to emit the whole file (see the package doc for the
-// trade-off discussion). When -apply does run, each dirty file is
-// re-parsed after Fprint to verify the bytes form valid Go; an
-// unparseable result skips the write rather than corrupting the source.
-//
-// Returns (nil, nil) on success. Non-nil error wraps ErrPreFilterFiles
-// when -exclude_dirs / -exclude_files normalisation fails; per-file
-// failures (decoration, formatting, write) are logged to stderr and the
-// pass continues with the rest, since the caller (singlechecker, host
-// driver) treats an analyzer-level error as fatal for the whole pass.
-//
-// pass is provided by the framework and must not be retained beyond the
-// call. Concurrency: go/analysis invokes one run per pass and may invoke
-// multiple passes concurrently; each Pass owns its own context, so this
-// function is safe to call concurrently against distinct passes. The
-// excludeDirs/excludeFiles slices are cloned defensively because hosts
-// like golangci-lint may share flag state across passes.
+// Returns a non-nil error (wrapping ErrPreFilterFiles) only when exclude-path
+// normalisation fails; per-file decorate/format/write failures are logged and
+// skipped. Safe across concurrent passes; flag slices are cloned because hosts
+// like golangci-lint may share flag state.
 func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 	apply := cfg.apply
 	if a := pass.Analyzer.Flags.Lookup("fix"); a != nil && a.Value.String() == "true" {
@@ -314,7 +270,14 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 
 	inspect.Preorder(nodeFilter, func(node ast.Node) {
 		if f, ok := node.(*ast.File); ok {
-			currentFn = pass.Fset.File(f.Pos()).Name()
+			// Defensive: File is nil only for a stray AST not in the FileSet;
+			// skip rather than nil-deref .Name().
+			tf := pass.Fset.File(f.Pos())
+			if tf == nil {
+				currentSkip = true
+				return
+			}
+			currentFn = tf.Name()
 			currentASTFile = f
 			currentSkip = false
 
@@ -382,10 +345,10 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 			return
 		}
 
-		// Compute optimality without DST; clean files pay no decoration cost.
-		indexes, optsz, optptrs := optimalOrder(typ, sizes)
-		// Identity permutation means the original layout is already optimal.
-		if isIdentityOrder(indexes) {
+		// Compute optimality without DST and without allocating a permutation;
+		// clean files pay no decoration cost and the hot path stays zero-alloc.
+		optimal, optsz, optptrs := layoutMetrics(typ, sizes)
+		if optimal {
 			return
 		}
 		var message string
@@ -427,6 +390,10 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 		if !apply {
 			return
 		}
+
+		// Permutation needed only for the reorder; computed lazily per misaligned
+		// struct so report-only runs never allocate it.
+		indexes, _, _ := optimalOrder(typ, sizes)
 
 		// Decorate this file once; never retry on failure.
 		if _, failed := decorationFailed[currentFn]; failed {
@@ -549,30 +516,16 @@ var fieldSlicePool = sync.Pool{
 	New: func() any { s := []*dst.Field(nil); return &s },
 }
 
-// collectPositionalUsers indexes every *types.Struct whose layout is pinned
-// by a positional composite literal (`T{1, 2, 3}` rather than the keyed
-// form). Reordering such a struct would silently re-map literal elements to
-// different fields, so the diagnostic path consults this set before
-// rewriting. The recorded position is the first offending literal; the
-// diagnostic surfaces it so the user gets a jump target straight to the
-// code blocking the reorder.
+// collectPositionalUsers maps each *types.Struct pinned by a positional
+// composite literal (`T{1, 2, 3}`, not keyed) to its first such literal's
+// position. Reordering those structs would re-map literal elements to other
+// fields, so the diagnostic path consults this set and surfaces the position as
+// a jump target.
 //
-// Per-file skip flags (-exclude_files, -exclude_dirs, -test_files,
-// -generated_files) deliberately do NOT apply here: excluded source still
-// compiles against the struct's layout, so a reorder of the analysed
-// declaration would break the excluded literal just as it would break an
-// analysed one. Treating excluded files as evidence of "this struct is
-// pinned" is the safe-by-default behaviour.
-//
-// Go's grammar forbids mixing keyed and positional elements in the same
-// literal, so inspecting Elts[0] classifies the whole literal — the same
-// shortcut go vet's "composites" pass uses. Walk cost is O(literals);
-// canonicalStructType keys multiple syntactic forms (named, generic
-// instantiation, pointer-elided, alias chain) onto the same struct so
-// the map stays small.
-//
-// Returns a fresh map; safe to call concurrently against distinct passes,
-// not safe to share the returned map across concurrent mutations.
+// Per-file skip flags deliberately do not apply: an excluded file still
+// compiles against the layout, so its positional literal would break just the
+// same. Elts[0] classifies the whole literal (Go forbids mixing keyed and
+// positional). Returns a fresh map; one per pass.
 func collectPositionalUsers(inspect *inspector.Inspector, pass *analysis.Pass) map[*types.Struct]token.Pos {
 	users := make(map[*types.Struct]token.Pos)
 
@@ -600,31 +553,15 @@ func collectPositionalUsers(inspect *inspector.Inspector, pass *analysis.Pass) m
 	return users
 }
 
-// canonicalStructType collapses every syntactic form of a struct reference
-// onto the single *types.Struct the alignment visitor sees when it lands on
-// the corresponding *ast.StructType, so collectPositionalUsers and the main
-// visitor key against identical pointers. Returns nil when t does not
-// denote a struct (the caller's "not interesting" signal).
+// canonicalStructType collapses every syntactic form of a struct reference onto
+// the single *types.Struct the visitor sees at the *ast.StructType, so both key
+// against identical pointers. Returns nil for non-structs.
 //
-// Four forms collapse together:
-//
-//   - plain named structs (`T{...}`)                → T's struct body
-//   - chained type definitions (`type S T`)          → T's struct body (shared)
-//   - generic instantiations (`Box[int]{...}`)       → the generic origin's body
-//   - pointer-typed elided literals (`[]*T{{...}}`)  → T's struct body
-//
-// Type aliases (`type A = T`) are stripped via types.Unalias first, so the
-// chain looks through `type A = []*B` correctly. Anonymous struct literals
-// land in the *types.Struct case and key themselves; they cannot match any
-// analyser candidate (the visitor only reports named structs) but storing
-// them is harmless and avoids a special case for "skip anonymous".
-//
-// The *types.Pointer arm is load-bearing for elided composite literals
-// inside slice/array/map types whose element type is a pointer. In
-// `[]*T{{1,2,3}}` the type-checker records the inner literal as `*T`, not
-// `T`; without the unwrap step canonicalStructType would return nil and
-// the analyser would happily reorder T's fields, breaking the build the
-// next time someone compiled the file. Pure function; no allocations.
+// Collapses named structs, chained type defs, generic instantiations, and
+// pointer-elided literals; aliases are stripped via types.Unalias. The
+// *types.Pointer arm is load-bearing: in `[]*T{{...}}` the type-checker records
+// the inner literal as *T, and without the unwrap the analyzer would reorder T
+// and break the build.
 func canonicalStructType(t types.Type) *types.Struct {
 	t = types.Unalias(t)
 	if p, ok := t.(*types.Pointer); ok {
@@ -640,14 +577,10 @@ func canonicalStructType(t types.Type) *types.Struct {
 	return nil
 }
 
-// lookupUnsafePointer resolves unsafe.Pointer's canonical types.Type for
-// pass.TypesSizes lookups so the analyzer probes the target architecture
-// rather than hard-coding 64-bit sizes. Returns nil only if a future Go
-// release ever removes `unsafe.Pointer` from the unsafe package's scope,
-// which has been stable for the entire history of the language but the
-// guard costs nothing and lets run fall back to 8-byte defaults instead
-// of crashing. Memoised at init in unsafePointerTyp; pure on every call
-// since types.Unsafe is a process-wide singleton.
+// lookupUnsafePointer resolves unsafe.Pointer's types.Type so size lookups
+// probe the target architecture instead of hard-coding 64-bit. Returns nil only
+// if unsafe.Pointer ever disappears from the package scope; run then falls back
+// to 8-byte defaults. Memoised in unsafePointerTyp.
 func lookupUnsafePointer() types.Type {
 	obj := types.Unsafe.Scope().Lookup("Pointer")
 	if obj == nil {
@@ -660,14 +593,9 @@ func lookupUnsafePointer() types.Type {
 	return tn.Type()
 }
 
-// optimalOrder is the core layout algorithm: it sorts fields by the
-// alignment-first / GC-ptrdata-minimising comparator and computes the
-// resulting struct's size and ptrdata in the same pass. Computing
-// size/ptrdata here, while we already hold the sorted fieldElem slice,
-// saves a follow-up `sizes.Sizeof(rebuiltStruct)` / `sizes.ptrdata(...)`
-// pair that would re-walk the same fields — the rebuild would also need
-// to allocate a fresh *types.Struct, which go/types does not support
-// directly.
+// compareFieldElem is the alignment-first / GC-ptrdata-minimising comparator
+// shared by layoutMetrics and optimalOrder. The stable sort keeps equal-key
+// fields in source order, so the identity permutation means "already optimal".
 //
 // Sort order, in priority:
 //
@@ -677,18 +605,124 @@ func lookupUnsafePointer() types.Type {
 //  4. fewer trailing non-pointer bytes among pointerful fields (shrinks
 //     ptrdata to the smallest GC scan prefix);
 //  5. larger size first as the final tiebreaker.
-//
-// The sort is stable, so betteralign reports identity permutations when
-// the original order is already optimal under the comparator — that's
-// what isIdentityOrder checks for in the caller. fieldElem scratch
-// slices are recycled through elemsPool so the backing array survives
-// across optimalOrder calls in the same pass; the returned indexes
-// slice is freshly allocated because callers retain it past return.
-//
-// Pure with respect to str and sizes (the sizes caches are populated but
-// the result for any given type is stable). Safe to call concurrently
-// only if each goroutine has its own *gcSizes — the cache maps are not
-// concurrency-safe.
+func compareFieldElem(a, b fieldElem) int {
+	// Zero-sized fields before non-zero-sized.
+	if (a.sizeof == 0) != (b.sizeof == 0) {
+		if a.sizeof == 0 {
+			return -1
+		}
+		return 1
+	}
+	// Higher alignment first.
+	if c := cmp.Compare(b.alignof, a.alignof); c != 0 {
+		return c
+	}
+	// Pointerful fields before pointer-free.
+	if (a.ptrdata == 0) != (b.ptrdata == 0) {
+		if a.ptrdata != 0 {
+			return -1
+		}
+		return 1
+	}
+	// Among pointerful fields, fewer trailing non-pointer bytes first.
+	if a.ptrdata != 0 {
+		if c := cmp.Compare(a.sizeof-a.ptrdata, b.sizeof-b.ptrdata); c != 0 {
+			return c
+		}
+	}
+	// Larger size first (final tiebreaker).
+	return cmp.Compare(b.sizeof, a.sizeof)
+}
+
+// fillElems records one fieldElem per struct field in source order from the
+// memoised sizes. len(elems) must equal str.NumFields().
+func fillElems(str *types.Struct, elems []fieldElem, sizes *gcSizes) {
+	for i := range elems {
+		ft := str.Field(i).Type()
+		elems[i] = fieldElem{
+			alignof: sizes.Alignof(ft),
+			sizeof:  sizes.Sizeof(ft),
+			ptrdata: sizes.ptrdata(ft),
+			index:   i,
+		}
+	}
+}
+
+// elemsIdentity reports whether sorted elems are still in source order, i.e.
+// the original layout is already optimal (the stable sort guarantees this iff
+// no reordering improves it).
+func elemsIdentity(elems []fieldElem) bool {
+	for i := range elems {
+		if elems[i].index != i {
+			return false
+		}
+	}
+	return true
+}
+
+// measureLayout computes the size and ptrdata that result from laying fields
+// out in elems order. nf is len(elems); a trailing zero-sized field on a
+// non-empty struct gets one padding byte so its address can't alias the next
+// allocation. All arithmetic is overflow-saturated via align/addSize.
+func measureLayout(elems []fieldElem) (optSize, optPtrdata int64) {
+	nf := len(elems)
+	var offset int64
+	maxAlign := int64(1)
+	for i, e := range elems {
+		if e.alignof > maxAlign {
+			maxAlign = e.alignof
+		}
+		offset = align(offset, e.alignof)
+		if e.ptrdata != 0 {
+			optPtrdata = addSize(offset, e.ptrdata)
+		}
+		sz := e.sizeof
+		if i == nf-1 && sz == 0 && offset != 0 {
+			sz = 1
+		}
+		offset = addSize(offset, sz)
+	}
+	optSize = align(offset, maxAlign)
+	return optSize, optPtrdata
+}
+
+// layoutMetrics is the report-mode hot path: it reports whether str is already
+// optimally laid out and, if not, the optimal size and ptrdata — without
+// allocating a permutation (that's only needed by -apply; see optimalOrder).
+// Report-only runs dominate, so keeping the alloc off this path makes the
+// already-optimal case zero-allocation (see BenchmarkDecisionPath_Optimal_FastPath).
+// Optimal returns (true, 0, 0) and skips the layout walk. One *gcSizes per
+// goroutine — caches are not concurrency-safe.
+func layoutMetrics(str *types.Struct, sizes *gcSizes) (optimal bool, optSize, optPtrdata int64) {
+	nf := str.NumFields()
+
+	elemsPtr := elemsPool.Get().(*[]fieldElem)
+	elems := *elemsPtr
+	if cap(elems) < nf {
+		elems = make([]fieldElem, nf)
+	} else {
+		elems = elems[:nf]
+	}
+	defer func() {
+		*elemsPtr = elems[:0]
+		elemsPool.Put(elemsPtr)
+	}()
+
+	fillElems(str, elems, sizes)
+	slices.SortStableFunc(elems, compareFieldElem)
+	if elemsIdentity(elems) {
+		return true, 0, 0
+	}
+	optSize, optPtrdata = measureLayout(elems)
+	return false, optSize, optPtrdata
+}
+
+// optimalOrder returns the compacting field permutation plus the resulting size
+// and ptrdata. It is the -apply rewrite path; report-only runs use layoutMetrics
+// and skip this allocation. indexes is always a full permutation of
+// [0, NumFields) — including identity when already optimal — because the unit
+// and fuzz tests assert its contents (notably stable-sort order on equal keys).
+// One *gcSizes per goroutine.
 func optimalOrder(str *types.Struct, sizes *gcSizes) (indexes []int, optSize, optPtrdata int64) {
 	nf := str.NumFields()
 
@@ -704,83 +738,15 @@ func optimalOrder(str *types.Struct, sizes *gcSizes) (indexes []int, optSize, op
 		elemsPool.Put(elemsPtr)
 	}()
 
-	for i := range nf {
-		field := str.Field(i)
-		ft := field.Type()
-		elems[i] = fieldElem{
-			alignof: sizes.Alignof(ft),
-			sizeof:  sizes.Sizeof(ft),
-			ptrdata: sizes.ptrdata(ft),
-			index:   i,
-		}
-	}
-
-	slices.SortStableFunc(elems, func(a, b fieldElem) int {
-		// Zero-sized fields before non-zero-sized.
-		if (a.sizeof == 0) != (b.sizeof == 0) {
-			if a.sizeof == 0 {
-				return -1
-			}
-			return 1
-		}
-		// Higher alignment first.
-		if c := cmp.Compare(b.alignof, a.alignof); c != 0 {
-			return c
-		}
-		// Pointerful fields before pointer-free.
-		if (a.ptrdata == 0) != (b.ptrdata == 0) {
-			if a.ptrdata != 0 {
-				return -1
-			}
-			return 1
-		}
-		// Among pointerful fields, fewer trailing non-pointer bytes first.
-		if a.ptrdata != 0 {
-			if c := cmp.Compare(a.sizeof-a.ptrdata, b.sizeof-b.ptrdata); c != 0 {
-				return c
-			}
-		}
-		// Larger size first (final tiebreaker).
-		return cmp.Compare(b.sizeof, a.sizeof)
-	})
+	fillElems(str, elems, sizes)
+	slices.SortStableFunc(elems, compareFieldElem)
 
 	indexes = make([]int, nf)
-	var offset int64
-	maxAlign := int64(1)
-	for i, e := range elems {
-		indexes[i] = e.index
-		if e.alignof > maxAlign {
-			maxAlign = e.alignof
-		}
-		offset = align(offset, e.alignof)
-		if e.ptrdata != 0 {
-			optPtrdata = addSize(offset, e.ptrdata)
-		}
-		sz := e.sizeof
-		// Trailing zero-size field on a non-empty struct gets one padding byte.
-		if i == nf-1 && sz == 0 && offset != 0 {
-			sz = 1
-		}
-		offset = addSize(offset, sz)
+	for i := range elems {
+		indexes[i] = elems[i].index
 	}
-	optSize = align(offset, maxAlign)
+	optSize, optPtrdata = measureLayout(elems)
 	return indexes, optSize, optPtrdata
-}
-
-// isIdentityOrder is the "the existing layout is already optimal" guard.
-// Because optimalOrder uses a stable sort, the output preserves the
-// original order whenever the comparator can't distinguish two fields,
-// and matches it across the whole slice when the original is optimal.
-// The analyzer uses this single comparison instead of recomputing Sizeof
-// and ptrdata against str to skip diagnostic emission entirely when no
-// improvement is available. O(N) over the index slice; never errors.
-func isIdentityOrder(indexes []int) bool {
-	for i, idx := range indexes {
-		if idx != i {
-			return false
-		}
-	}
-	return true
 }
 
 // Code below based on go/types.StdSizes.
@@ -796,18 +762,10 @@ type gcSizes struct {
 	MaxAlign   int64
 }
 
-// newGCSizes constructs a *gcSizes pre-seeded with empty memoisation
-// caches. Mandatory for any caller that runs Alignof/Sizeof/ptrdata in
-// bulk (the analyzer pass) so the per-pass cost of recurring sub-types
-// (very common in generated protobuf or grpc code) stays linear in unique
-// types rather than reachable nodes.
-//
-// Tests may also build a *gcSizes via a plain struct literal with nil
-// caches; the Alignof/Sizeof/ptrdata helpers detect nil and degrade to
-// uncached computation, accepting the perf cost in exchange for the
-// ability to assert on cache-free behaviour. Not safe for concurrent use
-// — the cache maps are plain `map[types.Type]int64`. Allocate one per
-// goroutine if parallelising.
+// newGCSizes returns a *gcSizes with empty memoisation caches — required for
+// bulk use (the analyzer pass) so recurring sub-types stay linear in unique
+// types. Tests may instead use a nil-cache struct literal (the helpers degrade
+// to uncached). Not concurrency-safe; one per goroutine.
 func newGCSizes(wordSize, maxAlign int64) *gcSizes {
 	return &gcSizes{
 		WordSize:   wordSize,
@@ -818,19 +776,10 @@ func newGCSizes(wordSize, maxAlign int64) *gcSizes {
 	}
 }
 
-// Alignof reports T's alignment in bytes as the Go GC observes it,
-// memoising the answer so a single pass over recurring sub-types stays
-// cheap. The crucial bit is the sentinel: BUG-29 found that go/types
-// occasionally yields invalid self-referential types (multi-declaration
-// corners where the user's source is malformed but the type-checker
-// produces a value anyway), which would otherwise drive Alignof into
-// unbounded recursion. Writing a sentinel of 1 BEFORE the recursion
-// means the re-entry finds a cached value and returns immediately;
-// the spec also guarantees Alignof ≥ 1, so the sentinel doubles as a
-// safe approximation for any type the algorithm can't unwind.
-//
-// Returns a positive int64. Pure with respect to T; mutates s.alignCache
-// (so not safe for concurrent calls on a shared *gcSizes — see newGCSizes).
+// Alignof reports T's GC alignment in bytes, memoised. The sentinel write of 1
+// before recursing terminates invalid self-referential types (BUG-29): the
+// re-entry hits the cached 1, which is also a safe lower bound since the spec
+// guarantees Alignof ≥ 1. Mutates s.alignCache; not concurrency-safe.
 func (s *gcSizes) Alignof(T types.Type) int64 {
 	if v, ok := s.alignCache[T]; ok {
 		return v
@@ -845,14 +794,9 @@ func (s *gcSizes) Alignof(T types.Type) int64 {
 	return v
 }
 
-// alignofUncached is the actual algorithm Alignof memoises around. Split
-// out so the cache-write half stays trivial and so tests can exercise the
-// computation directly via a struct-literal *gcSizes with nil caches.
-//
-// Per the Go spec: arrays align to their element, structs to the max
-// alignment among fields (≥ 1), and every other type aligns to its size
-// clamped to [1, MaxAlign]. Recurses through Alignof (the memoised entry
-// point) so sub-type lookups still hit the cache.
+// alignofUncached is the algorithm behind Alignof, split out for nil-cache
+// testing. Per spec: arrays align to their element, structs to the max field
+// alignment, everything else to its size clamped to [1, MaxAlign].
 func (s *gcSizes) alignofUncached(T types.Type) int64 {
 	switch t := T.Underlying().(type) {
 	case *types.Array:
@@ -895,22 +839,10 @@ var basicSizes = [...]byte{
 	types.Complex128: 16,
 }
 
-// Sizeof reports T's size in bytes as the Go GC observes it: internal
-// padding included, but the trailing-zero-sized-field padding rule
-// applied only at the enclosing struct's layout, not by the field's own
-// type. Memoisation in sizeCache amortises recurring sub-types across a
-// pass.
-//
-// The sentinel-write-before-recurse pattern (mirroring Alignof) terminates
-// invalid self-referential types from BUG-29 — a malformed go/types
-// product would otherwise drive Sizeof into infinite recursion. Writing
-// 0 before descending means the re-entry finds the cached 0, collapsing
-// the recursive arm to "self is empty," which is finite even if not
-// strictly correct (the source is invalid anyway, so the analyzer just
-// emits no diagnostic for it).
-//
-// Result is saturated to math.MaxInt64 via addSize/mulSize on overflow,
-// not negative. Not safe for concurrent calls on a shared *gcSizes.
+// Sizeof reports T's size in bytes as the GC lays it out, memoised. The
+// sentinel write of 0 before recursing terminates invalid self-referential
+// types (BUG-29) by treating the re-entry as empty. Overflow saturates to
+// math.MaxInt64 via addSize/mulSize. Not concurrency-safe.
 func (s *gcSizes) Sizeof(T types.Type) int64 {
 	if v, ok := s.sizeCache[T]; ok {
 		return v
@@ -925,19 +857,12 @@ func (s *gcSizes) Sizeof(T types.Type) int64 {
 	return v
 }
 
-// sizeofUncached is the size algorithm Sizeof memoises around. Split out
-// so the recursive arms still hit the cache via Sizeof's wrapper while
-// tests can exercise the algorithm directly through a nil-cache *gcSizes.
-//
-// Basic kinds are table-lookups (basicSizes). String and interface types
-// are word pairs (`(ptr, len)` and `(itab, data)` respectively). Slices
-// are word triples (`(ptr, len, cap)`). Arrays multiply (with mulSize's
-// overflow saturation). Structs walk field-by-field, applying per-field
-// alignment via `align(o, a)` and the runtime's trailing-zero-field
-// padding rule: a zero-sized last field on a non-empty struct gets one
-// padding byte so the field's address never aliases the next allocation
-// (a guarantee &empty != &next). Unknown kinds fall through to a single
-// word as a conservative placeholder.
+// sizeofUncached is the algorithm behind Sizeof (split for nil-cache testing).
+// Basic kinds via basicSizes; string/interface are 2 words, slices 3, arrays
+// multiply (saturating). Structs walk fields applying alignment, with the
+// runtime's trailing-zero-field rule: a zero-sized last field on a non-empty
+// struct gets one padding byte so its address can't alias the next allocation.
+// Unknown kinds fall back to one word.
 func (s *gcSizes) sizeofUncached(T types.Type) int64 {
 	switch t := T.Underlying().(type) {
 	case *types.Basic:
@@ -980,15 +905,9 @@ func (s *gcSizes) sizeofUncached(T types.Type) int64 {
 	return s.WordSize // catch-all
 }
 
-// align is the offset-rounding primitive used throughout the layout
-// algorithm. Caller passes the running offset and the next field's
-// alignment; result is the offset where that field actually starts.
-// Saturation at math.MaxInt64 (rather than wrap or panic) keeps the
-// algorithm well-behaved on adversarial inputs from fuzz harnesses —
-// callers can compare the saturated result against MaxInt64 to detect
-// overflow if they care. Precondition: a > 0 (Alignof always returns ≥ 1,
-// so the value path satisfies this; the function does not guard against
-// a == 0 because a fuzz-hardened caller never passes one).
+// align rounds offset x up to alignment a, saturating at math.MaxInt64 instead
+// of wrapping or panicking on fuzz inputs. Precondition: a > 0 (Alignof always
+// returns ≥ 1).
 func align(x, a int64) int64 {
 	if x > math.MaxInt64-(a-1) {
 		return math.MaxInt64
@@ -997,14 +916,9 @@ func align(x, a int64) int64 {
 	return y - y%a
 }
 
-// mulSize is the array-size primitive: arr-len times element-size with
-// overflow saturation at math.MaxInt64. BUG-30 captured the original bug
-// — raw int64 multiply silently wraps negative on adversarial array
-// lengths from the fuzz harness, which then poisons every downstream
-// invariant ("size ≥ 0"). The non-positive-input collapse to 0 covers
-// both the legitimate case (Array of length 0) and the adversarial case
-// (negative length from an invalid AST), both of which should report a
-// zero-size array, not a wrapped value.
+// mulSize multiplies array length by element size, saturating at math.MaxInt64
+// (BUG-30: a raw multiply wrapped negative on adversarial lengths, poisoning
+// the "size ≥ 0" invariant). Non-positive inputs collapse to 0.
 func mulSize(n, size int64) int64 {
 	if n <= 0 || size <= 0 {
 		return 0
@@ -1015,12 +929,9 @@ func mulSize(n, size int64) int64 {
 	return n * size
 }
 
-// addSize is the offset-accumulator primitive: pairs with align() and
-// mulSize() to keep the layout walk overflow-saturated end-to-end.
-// Negative inputs collapse to 0 (defensive — neither legitimate field
-// sizes nor offsets can be negative, but a saturated upstream result
-// can be MaxInt64, and the corresponding sum is also MaxInt64, never
-// negative).
+// addSize accumulates offsets, saturating at math.MaxInt64; pairs with align
+// and mulSize to keep the layout walk overflow-safe end to end. Negative inputs
+// collapse to 0.
 func addSize(a, b int64) int64 {
 	if a < 0 || b < 0 {
 		return 0
@@ -1031,22 +942,10 @@ func addSize(a, b int64) int64 {
 	return a + b
 }
 
-// ptrdata reports how many bytes from the head of T the GC must scan for
-// pointers. A zero result means T is pointer-free (the GC can skip it
-// entirely); a positive result is the offset just past the last
-// pointer-bearing word, which is what the GC tracks for objects with
-// trailing pointer-free regions. This number is what the
-// alignment-first / ptrdata-minimising sort comparator in optimalOrder
-// optimises against — fewer ptrdata bytes means a smaller GC scan
-// prefix, which the runtime walks faster.
-//
-// Memoisation mirrors Sizeof and Alignof for the same reason: recurring
-// sub-types are common in real codebases. The pre-recursion sentinel of
-// 0 saves the BUG-29 self-referential-struct case from infinite
-// recursion by treating the re-entry as "self is pointer-free." Not
-// strictly correct, but the source is invalid anyway and the analyzer
-// emits no diagnostic for it. Not safe for concurrent calls on a shared
-// *gcSizes.
+// ptrdata reports how many bytes from T's head the GC must scan for pointers;
+// 0 means pointer-free. This is the value compareFieldElem minimises. Memoised;
+// the sentinel write of 0 before recursing terminates BUG-29 self-referential
+// types (treated as pointer-free). Not concurrency-safe.
 func (s *gcSizes) ptrdata(T types.Type) int64 {
 	if v, ok := s.ptrCache[T]; ok {
 		return v
@@ -1061,22 +960,12 @@ func (s *gcSizes) ptrdata(T types.Type) int64 {
 	return v
 }
 
-// ptrdataUncached is the ptrdata algorithm ptrdata memoises around. Each
-// kind is handled per the GC's actual scan rules: strings and
-// unsafe.Pointer hold a single pointer word at offset 0; channels, maps,
-// pointers, function values, and slices are entirely pointer (one word
-// of ptrdata, even slices since the GC only tracks the head pointer);
-// interfaces are two pointer words (`(itab, data)`); arrays propagate
-// their element's pointer span scaled to the array's last pointer-bearing
-// element; structs walk fields tracking the offset of the last
-// pointer-bearing field.
-//
-// The default arm (one-word fallback) catches type kinds the switch
-// doesn't enumerate — most importantly *types.TypeParam in generic code,
-// whose Underlying() returns itself rather than its constraint, so the
-// switch can never see a concrete kind. Returning the word size there
-// keeps the analyzer conservative (over-reports ptrdata, never
-// under-reports) instead of panicking on an unfamiliar kind.
+// ptrdataUncached is the algorithm behind ptrdata. strings/unsafe.Pointer are
+// one pointer word; chan/map/pointer/func/slice one word; interfaces two;
+// arrays scale to the last pointer-bearing element; structs track the offset
+// past the last pointer field. The default arm (one word) catches unenumerated
+// kinds — notably *types.TypeParam, whose Underlying() is itself — staying
+// conservative (over-reports) rather than panicking.
 func (s *gcSizes) ptrdataUncached(T types.Type) int64 {
 	switch t := T.Underlying().(type) {
 	case *types.Basic:
@@ -1124,10 +1013,8 @@ func (s *gcSizes) ptrdataUncached(T types.Type) int64 {
 	return s.WordSize
 }
 
-// hasSuffix is a multi-suffix early-out check used by run for the
-// test-file and generated-file gate. Kept as its own helper (rather than
-// inlined twice) so future suffix-set tweaks land in one place. O(N) in
-// the number of suffixes; typical N is 1–5.
+// hasSuffix reports whether fn ends in any of suffixes; backs the test- and
+// generated-file gates.
 func hasSuffix(fn string, suffixes []string) bool {
 	for _, s := range suffixes {
 		if strings.HasSuffix(fn, s) {
@@ -1137,22 +1024,11 @@ func hasSuffix(fn string, suffixes []string) bool {
 	return false
 }
 
-// hasGeneratedComment is the secondary detector for generated files —
-// suffix-based detection via hasSuffix catches the common naming
-// conventions, this function catches files where the generator didn't
-// follow a naming convention but did emit the canonical header
-// (protoc-gen-go, mockgen, sqlc, etc.). The two paths together are what
-// the -generated_files flag gates on.
-//
-// file.Comments is sorted by source position, so the loop scans
-// top-down and stops as soon as it reaches the package keyword — the Go
-// specification requires the header to appear before `package`, so any
-// later comment cannot be the header and need not be scanned. Inside a
-// candidate group, individual // lines are checked against
-// reGeneratedBy (a DFA generated by the `rec` tool for
-// `^//\s*Code generated by .* DO NOT EDIT\.$`); the DFA avoids the
-// regexp engine's per-call setup cost which matters when run is sweeping
-// thousands of files.
+// hasGeneratedComment detects the canonical `Code generated by ... DO NOT
+// EDIT.` header for generators that don't follow a naming convention (the
+// suffix gate via hasSuffix catches the rest). Comments are position-sorted, so
+// the scan stops at the package keyword (the header must precede it). Matching
+// uses reGeneratedBy, a DFA, to skip the regexp engine's per-call setup.
 func hasGeneratedComment(file *ast.File) bool {
 	for _, cg := range file.Comments {
 		if cg.Pos() > file.Package {
@@ -1167,29 +1043,15 @@ func hasGeneratedComment(file *ast.File) bool {
 	return false
 }
 
-// normalizeExcludePaths brings exclude-flag entries into a form isExcluded
-// can hand directly to filepath.Match. The mixed-form problem motivating
-// the normalisation: users supply `-exclude_dirs vendor` (clean and
-// relative) and also `-exclude_dirs /home/me/proj/internal` (absolute)
-// in the same invocation; without normalisation the absolute entry can
-// never match isExcluded's wd-relative input, and the literal `vendor/`
-// would not match `vendor` because filepath.Match doesn't strip trailing
-// separators.
+// normalizeExcludePaths canonicalises exclude-flag entries for filepath.Match:
+// absolute paths are made wd-relative (so they can match isExcluded's relative
+// input) and all entries are cleaned. The all-canonical common case returns the
+// input unchanged — treat the result as read-only.
 //
-// The common case — every entry is already relative and canonical —
-// returns the input slice unchanged with no allocation. Callers must
-// therefore treat the result as read-only; mutating it could mutate the
-// caller's input. The non-common path allocates a fresh slice and leaves
-// the input untouched.
-//
-// Returns ErrPreFilterFiles-wrapped errors via the caller for two
-// observable failures: filepath.Rel fails when an absolute path can't be
-// expressed relative to wd (cross-volume on Windows is the realistic
-// trigger); a "..-prefixed" relative result is rejected outright because
-// filepath.Match has no way to match a path that escapes the working
-// tree, and silently never-matching would be more confusing than failing
-// loudly. Errors include both the offending path and the wd so the user
-// can diagnose without inspecting the wrapped error.
+// Returns an error (wrapped as ErrPreFilterFiles by the caller) when an
+// absolute path can't be made relative to wd (cross-volume on Windows) or
+// escapes wd with a `..` prefix, which filepath.Match can never match — fail
+// loud, not silent.
 func normalizeExcludePaths(wd string, paths []string) ([]string, error) {
 	needsNorm := slices.ContainsFunc(paths, func(p string) bool {
 		return filepath.IsAbs(p) || filepath.Clean(p) != p
@@ -1216,24 +1078,11 @@ func normalizeExcludePaths(wd string, paths []string) ([]string, error) {
 	return out, nil
 }
 
-// isExcluded is the per-file exclude check the analyzer applies before
-// any AST work. Both flag sets use filepath.Match semantics so users can
-// supply glob patterns; the dir-set is checked against every ancestor of
-// fn's directory so a literal "vendor" excludes the whole vendor/
-// subtree, and `a/*/c` excludes any file under `a/<anything>/c/`.
-//
-// On filepath.Rel or filepath.Match errors (malformed pattern, path
-// escapes wd) the function logs to stderr and returns true. The
-// fail-safe direction is "treat as excluded" rather than "treat as
-// included": the alternative would have the analyzer happily emit
-// diagnostics for paths it could not classify, which would surprise
-// users into thinking their exclude pattern is wrong.
-//
-// O((ancestors × dirs) + files) per call. For betteralign's typical
-// inputs (a handful of dir patterns, a handful of file patterns, a few
-// dozen ancestors) this is negligible compared to the AST walk it
-// gates. Pure with respect to fs state — the only I/O is the stderr log
-// on error.
+// isExcluded reports whether fn is excluded by the dir or file glob sets
+// (filepath.Match semantics); the dir set is tested against every ancestor so
+// "vendor" excludes the whole subtree. On a Rel/Match error it logs and returns
+// true — failing toward "excluded" so unclassifiable paths don't get spurious
+// diagnostics. O((ancestors × dirs) + files).
 func isExcluded(wd, fn string, excludeDirs, excludeFiles []string) bool {
 	relfn, err := filepath.Rel(wd, fn)
 	if err != nil {
@@ -1274,17 +1123,9 @@ func isExcluded(wd, fn string, excludeDirs, excludeFiles []string) bool {
 	return false
 }
 
-// hasIgnoreComment is the per-struct opt-out check. Lets users carve a
-// single struct out of analysis without reaching for -exclude_files or
-// -opt_in, which gate at file scope and would force splitting code into
-// multiple files. The directive's scope is the struct body: it must
-// appear among the comments attached to the opening brace, where DST
-// gathers consecutive comment lines into a single decoration group.
-//
-// Only `//`-style line comments count (commentHasDirective rejects
-// `/* betteralign:ignore */`), and the directive must be followed by a
-// whitespace/end-of-string boundary so substring matches like
-// `betteralign:ignored` don't trigger. Pure predicate.
+// hasIgnoreComment reports the betteralign:ignore opt-out from a decorated
+// struct's opening-brace comment group. Only //-line comments count and the
+// directive needs a trailing word boundary (see commentHasDirective).
 func hasIgnoreComment(node *dst.FieldList) bool {
 	for _, opening := range node.Decs.Opening.All() {
 		if commentHasDirective(opening, ignoreStruct) {
@@ -1295,22 +1136,26 @@ func hasIgnoreComment(node *dst.FieldList) bool {
 	return false
 }
 
-// hasIgnoreCommentAST is the DST-independent twin of hasIgnoreComment, used so
-// the betteralign:ignore directive is honored even for structs dstmin cannot
-// decorate (single-line forms, etc.) where no DST node exists. It mirrors the
-// decoration's Opening routing: a group on the opening-brace line, inside the
-// body, is the directive's canonical home (`type S struct { // betteralign:ignore`).
-// Both paths share commentHasDirective, so the recognition rules can't drift;
-// only the comment-selection differs. file.Comments is position-sorted, so the
-// scan stops once it reaches the closing brace. Pure predicate.
+// hasIgnoreCommentAST is the DST-independent twin of hasIgnoreComment, so
+// betteralign:ignore is honored even for structs dstmin can't decorate. It looks
+// for the directive on the opening-brace line inside the body; shares
+// commentHasDirective so recognition can't drift.
 func hasIgnoreCommentAST(fset *token.FileSet, file *ast.File, s *ast.StructType) bool {
 	open := s.Fields.Opening
+	closing := s.Fields.Closing
 	openLine := fset.Position(open).Line
-	for _, cg := range file.Comments {
-		if cg.Pos() >= s.Fields.Closing {
+
+	// Binary-search to the first group past the opening brace rather than
+	// rescanning from the top — otherwise the analyzer is O(misaligned structs ×
+	// comments) (see BenchmarkHasIgnoreCommentAST_Scaling). Pos() is the raw byte
+	// offset, monotonic even under //line directives. Mirrors dstmin.commentRun.
+	comments := file.Comments
+	lo := sort.Search(len(comments), func(i int) bool { return comments[i].Pos() > open })
+	for _, cg := range comments[lo:] {
+		if cg.Pos() >= closing {
 			break
 		}
-		if cg.Pos() <= open || fset.Position(cg.Pos()).Line != openLine {
+		if fset.Position(cg.Pos()).Line != openLine {
 			continue
 		}
 		for _, c := range cg.List {
@@ -1323,12 +1168,8 @@ func hasIgnoreCommentAST(fset *token.FileSet, file *ast.File, s *ast.StructType)
 	return false
 }
 
-// commentGroupHasOptIn is the per-CommentGroup half of the -opt_in
-// detection used by run when -opt_in mode is active. nil cg is treated
-// as "no comments → no opt-in" so callers can hand in an
-// *ast.CommentGroup that may be nil (the common case for type specs
-// without a doc comment) without nil-checking themselves. See
-// commentHasDirective for the directive recognition rules.
+// commentGroupHasOptIn reports the -opt_in directive within cg; nil cg means no
+// opt-in (callers pass possibly-nil type-spec docs).
 func commentGroupHasOptIn(cg *ast.CommentGroup) bool {
 	if cg == nil {
 		return false
@@ -1341,22 +1182,13 @@ func commentGroupHasOptIn(cg *ast.CommentGroup) bool {
 	return false
 }
 
-// commentHasDirective is the central directive-recogniser for
-// betteralign:ignore and betteralign:check. Centralising the parsing
-// keeps the two directives consistent and the rules in one place:
+// commentHasDirective is the shared recogniser for betteralign:ignore and
+// betteralign:check, keeping both consistent:
 //
-//   - Must be a `//`-style line comment. Block comments are rejected
-//     because gofmt's handling of trailing block comments inside structs
-//     is fragile (see BUG-42) and we never want a `/* betteralign:ignore */`
-//     to silently flip behaviour based on placement.
-//   - Leading whitespace after `//` is tolerated (`// betteralign:ignore`
-//     is the canonical form, but `//betteralign:ignore` also works).
-//   - Trailing word boundary required: `betteralign:ignored` does NOT
-//     trigger `betteralign:ignore`. The boundary is space, tab, or end
-//     of comment.
-//
-// Pure function, no allocations beyond the strings package's interior
-// slicing.
+//   - //-line comments only; block comments are rejected (gofmt mishandles
+//     trailing block comments inside structs — BUG-42).
+//   - leading whitespace after // is tolerated.
+//   - trailing word boundary required (`betteralign:ignored` does not match).
 func commentHasDirective(comment, directive string) bool {
 	body, ok := strings.CutPrefix(comment, "//")
 	if !ok {
@@ -1374,44 +1206,25 @@ func commentHasDirective(comment, directive string) bool {
 	return c == ' ' || c == '\t'
 }
 
-// declaredWithOptInComment looks for the opt-in directive on the GenDecl
-// itself rather than on any contained TypeSpec. This handles the
-// parenthesised `type ( ... )` form, where users typically attach a
-// single doc comment to the whole group and expect it to apply to every
-// type inside. Without this path, an opt-in comment on `type (\n  S
-// struct{...}\n)` would never match because go/ast attaches the doc to
-// the GenDecl, not to the inner TypeSpec.
+// declaredWithOptInComment finds the opt-in directive on the GenDecl doc,
+// covering the parenthesised `type ( ... )` form where go/ast attaches the doc
+// to the group rather than each TypeSpec.
 func declaredWithOptInComment(decl *ast.GenDecl) bool {
 	return commentGroupHasOptIn(decl.Doc)
 }
 
-// applyToFile is the source-file writer for -apply mode. Three layers of
-// guarding stand between buf and the user's disk:
+// applyToFile atomically writes buf to fn under -apply, behind three guards:
 //
-//  1. ErrEmptyBuffer for buf == nil/empty. The realistic trigger is a
-//     future DST regression where Fprint returns successfully but emits
-//     nothing; refusing to write a zero-length file means the worst
-//     outcome of such a regression is "no rewrite happens", not "user's
-//     source file is now empty."
-//  2. ErrNotRegularFile via os.Lstat. Lstat (not Stat) is mandatory:
-//     os.Stat follows symlinks, so a symlink whose target is regular
-//     would pass an IsRegular check and the subsequent rename would
-//     replace the symlink itself with the rewritten file — which
-//     clobbers the user's symlink intent silently. A TOCTOU window
-//     remains between Lstat and renameio's temp-rename, but the common
-//     "symlink already lives at this path" case is now refused outright.
-//  3. The actual write goes through renameio's maybe.WriteFile, which
-//     does temp-write + atomic rename on POSIX (and best-effort on
-//     Windows) so a partial write or crash never leaves the user with
-//     half a Go file.
+//  1. ErrEmptyBuffer on empty buf — never truncate a source file to zero if a
+//     future Fprint regression emits nothing.
+//  2. ErrNotRegularFile via os.Lstat (not Stat): Stat follows symlinks, so the
+//     rename would replace the symlink's target; Lstat refuses the symlink
+//     itself. A TOCTOU window remains but the common case is closed.
+//  3. renameio's maybe.WriteFile does temp-write + atomic rename, so a crash
+//     never leaves half a file.
 //
-// Errors from Lstat and WriteFile are wrapped with ErrStatFile and
-// ErrWriteFile so callers can classify failures via errors.Is without
-// parsing strings. Permission bits are preserved by passing st.Mode() to
-// WriteFile.
-//
-// Not safe for concurrent calls on the same fn; the analyzer serialises
-// per-file writes in run's apply phase.
+// Wraps ErrStatFile/ErrWriteFile for errors.Is and preserves permission bits.
+// Not concurrency-safe on the same fn; run serialises writes.
 func applyToFile(fn string, buf []byte) error {
 	if len(buf) == 0 {
 		return ErrEmptyBuffer

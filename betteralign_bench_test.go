@@ -67,8 +67,8 @@ func BenchmarkOptimalOrder_Large(b *testing.B) {
 
 // makeOptimalBenchStruct constructs a struct already laid out in optimal
 // field order: a pointer field first, then descending-alignment, pointer-free
-// fields. optimalOrder returns the identity permutation for this shape, so
-// it exercises the isIdentityOrder fast path in the analyzer's main loop.
+// fields. layoutMetrics reports this shape as already optimal, so it
+// exercises the zero-allocation fast path in the analyzer's main loop.
 func makeOptimalBenchStruct(n int) *types.Struct {
 	if n < 1 {
 		n = 1
@@ -115,36 +115,38 @@ func BenchmarkDecisionPath_Optimal_NoFastPath(b *testing.B) {
 	}
 }
 
-// BenchmarkDecisionPath_Optimal_FastPath measures the same shape under the
-// post-optimization path: the identity check short-circuits before Sizeof
-// and ptrdata are called. The delta against the NoFastPath variant is the
-// win on already-aligned structs.
+// BenchmarkDecisionPath_Optimal_FastPath measures the analyzer's real
+// report-mode hot path for an already-optimal struct: layoutMetrics returns
+// optimal=true and the caller short-circuits before Sizeof/ptrdata and before
+// any permutation allocation. The delta against the NoFastPath variant is the
+// win on already-aligned structs; this path is now zero-allocation.
 func BenchmarkDecisionPath_Optimal_FastPath(b *testing.B) {
 	str := makeOptimalBenchStruct(20)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
 		sizes := newGCSizes(8, 8)
-		indexes, _, _ := optimalOrder(str, sizes)
-		if !isIdentityOrder(indexes) {
-			b.Fatal("optimal struct should produce identity permutation")
+		optimal, _, _ := layoutMetrics(str, sizes)
+		if !optimal {
+			b.Fatal("optimal struct should be reported as optimal")
 		}
 	}
 }
 
-// BenchmarkDecisionPath_Suboptimal_FastPath measures the slow-path cost when
-// the identity check misses: optimalOrder, then isIdentityOrder (returns
-// false), then Sizeof and ptrdata. Delta against an analogous run without
-// isIdentityOrder is the fast path's overhead when it doesn't fire.
+// BenchmarkDecisionPath_Suboptimal_FastPath measures the report-mode path when
+// the struct is misaligned: layoutMetrics returns optimal=false plus the
+// optimal size/ptrdata, then the caller reads the current Sizeof and ptrdata
+// to build the diagnostic message. The permutation (optimalOrder) is not
+// computed in report mode, only under -apply.
 func BenchmarkDecisionPath_Suboptimal_FastPath(b *testing.B) {
 	str := makeBenchStruct(20)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
 		sizes := newGCSizes(8, 8)
-		indexes, optsz, optptrs := optimalOrder(str, sizes)
-		if isIdentityOrder(indexes) {
-			b.Fatal("suboptimal struct should not produce identity permutation")
+		optimal, optsz, optptrs := layoutMetrics(str, sizes)
+		if optimal {
+			b.Fatal("suboptimal struct should not be reported as optimal")
 		}
 		sz := sizes.Sizeof(str)
 		ptrs := sizes.ptrdata(str)
