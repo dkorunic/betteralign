@@ -79,6 +79,18 @@ func TestSuggestions(t *testing.T) {
 	analysistest.Run(t, testdata, analyzer, "a")
 }
 
+// TestGreenTeaWording pins the Go 1.26+ scan-work framing of the pointer-bytes
+// diagnostic; the pre-1.26 "bytes saved" wording is covered by TestSuggestions.
+// Skips on 32-bit arches, where the fixture's uintptr math no longer holds.
+func TestGreenTeaWording(t *testing.T) {
+	if runtime.GOARCH != "amd64" && runtime.GOARCH != "arm64" {
+		t.Skipf("pointer-bytes fixture assumes 64-bit word size, GOARCH=%s", runtime.GOARCH)
+	}
+	testdata := analysistest.TestData()
+	analyzer := NewTestAnalyzer()
+	analysistest.Run(t, testdata, analyzer, "greentea")
+}
+
 func TestApply(t *testing.T) {
 	srcDir := filepath.Join("testdata", "src")
 	workDir := filepath.Join(srcDir, "a")

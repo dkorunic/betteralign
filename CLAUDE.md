@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-`betteralign` is a Go static analysis tool (fork of `fieldalignment`) that detects structs using suboptimal memory layout and optionally rewrites them. It sorts struct fields by descending alignment, then minimizes GC pointer scan overhead.
+`betteralign` is a Go static analysis tool (fork of `fieldalignment`) that detects structs using suboptimal memory layout and optionally rewrites them. It sorts struct fields by descending alignment, then minimizes each value's `ptrdata` — which lowers the GC's scan-work estimate used for pacing (and, on Go before 1.26, also the bytes physically scanned).
 
 `AGENTS.md` is a near-duplicate of this file for OpenCode; keep the two in sync when editing build or architecture notes.
 
@@ -86,6 +86,10 @@ Fields are sorted **stably** by the `compareFieldElem` comparator (shared by `la
 5. Larger size first
 
 A multi-name field (`A, B int`) moves as one grouped declaration — the reorder never splits it.
+
+### Green Tea GC diagnostic wording
+
+The pointer-bytes diagnostic is framed by the **analyzed** package's Go version, not betteralign's own. `targetGoVersion` reads it from the per-file `//go:build go1.x` constraint (`ast.File.GoVersion`) if present, else the module's `go` directive (`pass.Pkg.GoVersion()`), and `greenTeaGC` gates on `>= go1.26` (via `go/version`, guarding invalid strings with `version.IsValid`). For Go 1.26+ targets — where the Green Tea GC marks by span rather than per value — the message drops the *N bytes saved* claim and reads `struct with N pointer bytes could be M (lowers GC scan-work estimate)`; older/unknown targets keep the classic wording. Size diagnostics never change. Coverage: `TestGreenTeaWording` (with the `//go:build go1.26` fixture under `testdata/src/greentea/`) plus internal unit tests in `version_internal_test.go`.
 
 ### Composite-literal safety
 

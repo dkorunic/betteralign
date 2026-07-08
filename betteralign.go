@@ -38,6 +38,7 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	"go/version"
 	"math"
 	"os"
 	"path/filepath"
@@ -73,7 +74,14 @@ has 24 pointer bytes because it has to scan further through the *uint32.
 
 	struct { string; uint32 }
 
-has 8 because it can stop immediately after the string pointer.
+has 8 because the pointer bytes end immediately after the string pointer.
+
+This "pointer bytes" figure is the type's ptrdata. On Go before 1.26 it was
+also the number of bytes the collector scanned per value; under the Green Tea
+GC (default in Go 1.26) marking is span-based rather than per-value, so a
+smaller ptrdata lowers the ptrdata-based scan-work estimate the runtime uses
+for GC pacing rather than the bytes physically scanned. betteralign frames the
+pointer-bytes diagnostic to match the Go version of the analyzed package.
 
 Be aware that the most compact order is not always the most efficient.
 In rare cases it may cause two variables each updated by its own goroutine
@@ -356,7 +364,13 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 		if sz := sizes.Sizeof(typ); sz != optsz {
 			message = fmt.Sprintf("%d bytes saved: struct of size %d could be %d", sz-optsz, sz, optsz)
 		} else if ptrs := sizes.ptrdata(typ); ptrs != optptrs {
-			message = fmt.Sprintf("%d bytes saved: struct with %d pointer bytes could be %d", ptrs-optptrs, ptrs, optptrs)
+			// Frame the pointer-bytes win to the analyzed project's Go version:
+			// under Green Tea it is a scan-work estimate, not bytes saved.
+			if greenTeaGC(targetGoVersion(pass, currentASTFile)) {
+				message = fmt.Sprintf("struct with %d pointer bytes could be %d (lowers GC scan-work estimate)", ptrs, optptrs)
+			} else {
+				message = fmt.Sprintf("%d bytes saved: struct with %d pointer bytes could be %d", ptrs-optptrs, ptrs, optptrs)
+			}
 		} else {
 			return
 		}
@@ -613,6 +627,27 @@ func lookupUnsafePointer() types.Type {
 	return tn.Type()
 }
 
+// targetGoVersion reports the analyzed source's effective Go version, a file's
+// //go:build go1.x constraint taking precedence over the module's go.mod. Empty
+// when unknown (e.g. GOPATH-mode packages), which callers treat as pre-1.26.
+func targetGoVersion(pass *analysis.Pass, file *ast.File) string {
+	if file != nil && file.GoVersion != "" {
+		return file.GoVersion
+	}
+	if pass.Pkg != nil {
+		return pass.Pkg.GoVersion()
+	}
+	return ""
+}
+
+// greenTeaGC reports whether the analyzed package targets Go 1.26+, where the
+// Green Tea GC's span-based marking makes a smaller ptrdata a scan-work pacing
+// win rather than fewer bytes scanned. Invalid/unknown versions count as
+// pre-1.26 — hence the IsValid guard, since Compare reads invalid input as 0.
+func greenTeaGC(v string) bool {
+	return version.IsValid(v) && version.Compare(v, "go1.26") >= 0
+}
+
 // compareFieldElem is the alignment-first / GC-ptrdata-minimising comparator
 // shared by layoutMetrics and optimalOrder. The stable sort keeps equal-key
 // fields in source order, so the identity permutation means "already optimal".
@@ -621,9 +656,10 @@ func lookupUnsafePointer() types.Type {
 //
 //  1. zero-sized fields first (they collapse alignment requirements);
 //  2. higher alignment first (fills natural-alignment slots);
-//  3. pointer-bearing fields before pointer-free (front-loads GC scan);
-//  4. fewer trailing non-pointer bytes among pointerful fields (shrinks
-//     ptrdata to the smallest GC scan prefix);
+//  3. pointer-bearing fields before pointer-free (front-loads pointers,
+//     shrinking ptrdata);
+//  4. fewer trailing non-pointer bytes among pointerful fields (minimises
+//     ptrdata, the GC's scan-work pacing estimate);
 //  5. larger size first as the final tiebreaker.
 func compareFieldElem(a, b fieldElem) int {
 	// Zero-sized fields before non-zero-sized.

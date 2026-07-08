@@ -56,7 +56,7 @@ This tool builds upon the following prior work:
 `betteralign` pursues two goals:
 
 1. Minimize struct size by sorting fields in **descending alignment order** and placing zero-sized fields first, reducing internal padding (and avoiding the one-byte tail the runtime adds when a struct ends in a zero-sized field).
-2. Reduce **GC pointer scan overhead** by grouping pointer-bearing fields before pointer-free ones ([the GC stops scanning at the last pointer in a value](https://go.dev/doc/gc-guide)).
+2. Lower the **`ptrdata`-based scan-work estimate the GC uses for pacing** by grouping pointer-bearing fields before pointer-free ones, shrinking each value's `ptrdata` (the head prefix the runtime records as potentially holding pointers). On Go before 1.26 this also directly reduced the bytes scanned per value, since [the collector stopped scanning at the last pointer in a value](https://go.dev/doc/gc-guide); under the Green Tea GC (default in Go 1.26) marking is span-based rather than per-value, so the win is the smaller `ptrdata` feeding GC pacing rather than fewer bytes physically scanned.
 
 With those goals in mind, fields are sorted stably by the following criteria, in order:
 
@@ -80,7 +80,7 @@ As declared, `Record` is **24 bytes** on a 64-bit platform: `Flag` sits at offse
 
 After `optimalOrder` sorts by descending alignment, the layout becomes `ID, Count, Flag` and shrinks to **16 bytes**: `ID` at offset 0, `Count` at offset 8, `Flag` at offset 12, plus 3 trailing padding bytes to round to 16. No internal padding is needed because each field already lands on a correctly-aligned offset. Same data, 33% less memory.
 
-### GC scan: ordering pointer-bearing fields by trailing non-pointer bytes
+### GC `ptrdata`: ordering pointer-bearing fields by trailing non-pointer bytes
 
 ```go
 type IPAddr struct {
@@ -89,7 +89,9 @@ type IPAddr struct {
 }
 ```
 
-`Zone` comes first because `string` has fewer trailing non-pointer bytes than `[]byte`: `Sizeof(string) - ptrdata(string) = 8` versus `Sizeof([]byte) - ptrdata([]byte) = 16`. The struct is 40 bytes either way on a 64-bit platform, but with `Zone` first the GC only scans the first 24 bytes for pointers; reversing the fields would push that to 32.
+`Zone` comes first because `string` has fewer trailing non-pointer bytes than `[]byte`: `Sizeof(string) - ptrdata(string) = 8` versus `Sizeof([]byte) - ptrdata([]byte) = 16`. The struct is 40 bytes either way on a 64-bit platform, but with `Zone` first the value's `ptrdata` is only 24 bytes; reversing the fields would push it to 32. That `ptrdata` feeds the GC's scan-work estimate used for pacing — and, on Go before 1.26, the number of bytes the collector scanned per value. Under the Green Tea GC (default in Go 1.26) marking is span-based, so the smaller `ptrdata` lowers the pacing estimate rather than the bytes physically scanned.
+
+The pointer-bytes diagnostic reflects this: `betteralign` reads the **Go version of the project being analyzed** (its `go.mod` `go` directive, or a per-file `//go:build go1.x` constraint). For a target on Go 1.26 or newer it reports the reorder as lowering the GC scan-work estimate; for older targets it keeps the classic *N bytes saved* framing, which there still maps to bytes physically scanned. Struct-size diagnostics are unaffected — that saving is real memory regardless of GC.
 
 ## Runtime tuning with `GOGC`
 
