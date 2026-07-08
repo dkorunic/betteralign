@@ -6,7 +6,7 @@ require (
 	github.com/KimMachineGun/automemlimit v0.7.5
 	github.com/google/renameio/v2 v2.0.2
 	go.uber.org/automaxprocs v1.6.0
-	golang.org/x/tools v0.46.0
+	golang.org/x/tools v0.47.0
 	gotest.tools/v3 v3.5.2
 )
 

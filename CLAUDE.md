@@ -74,7 +74,7 @@ The `afl-fuzz-*` tasks run the same targets under gosentry/LibAFL (`CGO_ENABLED=
 
 ### Why a whole-file reprint instead of SuggestedFixes
 
-Go's `ast` package does not associate comments with nodes (only byte offsets), so rewriting a single struct node loses all comments. `internal/dstmin` preserves them by reprinting the whole file. The trade-off: `SuggestedFixes` is never populated, `-fix` is a no-op alias for `-apply`, and `golangci-lint` auto-fix integration is impossible.
+Go's `ast` package does not associate comments with nodes (only byte offsets), so rewriting a single struct node loses all comments. `internal/dstmin` preserves them by reprinting the whole file. The trade-off: `SuggestedFixes` is never populated, `-fix` acts as an alias for `-apply` (it rewrites files, though the driver suppresses diagnostic output in fix mode), and `golangci-lint` auto-fix integration is impossible.
 
 ### Field sort order (`compareFieldElem`)
 

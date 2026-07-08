@@ -126,10 +126,10 @@ func TestDecorateFile_LeadDocAttachedToField(t *testing.T) {
 		t.Fatalf("DecorateFile: %v", err)
 	}
 	st := df.structs[0]
-	if got := st.Fields.List[0].lead.All(); len(got) != 1 || got[0] != "// lead for a" {
+	if got := st.Fields.List[0].lead; len(got) != 1 || got[0] != "// lead for a" {
 		t.Errorf("field 0 lead = %q, want [%q]", got, "// lead for a")
 	}
-	if got := st.Fields.List[1].lead.All(); len(got) != 0 {
+	if got := st.Fields.List[1].lead; len(got) != 0 {
 		t.Errorf("field 1 lead = %q, want empty", got)
 	}
 }
@@ -143,12 +143,12 @@ func TestDecorateFile_MultiLineLeadDoc(t *testing.T) {
 		t.Fatalf("DecorateFile: %v", err)
 	}
 	st := df.structs[0]
-	got := st.Fields.List[0].lead.All()
+	got := st.Fields.List[0].lead
 	want := []string{"// line one", "// line two"}
 	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
 		t.Errorf("field a lead = %q, want %q", got, want)
 	}
-	if l := st.Fields.List[1].lead.All(); len(l) != 0 {
+	if l := st.Fields.List[1].lead; len(l) != 0 {
 		t.Errorf("field b lead = %q, want empty", l)
 	}
 }
@@ -162,10 +162,10 @@ func TestDecorateFile_BlockCommentLeadDoc(t *testing.T) {
 		t.Fatalf("DecorateFile: %v", err)
 	}
 	st := df.structs[0]
-	if got := st.Fields.List[0].lead.All(); len(got) != 1 || got[0] != "/* lead */" {
+	if got := st.Fields.List[0].lead; len(got) != 1 || got[0] != "/* lead */" {
 		t.Errorf("field a lead = %q, want [%q]", got, "/* lead */")
 	}
-	if l := st.Fields.List[1].lead.All(); len(l) != 0 {
+	if l := st.Fields.List[1].lead; len(l) != 0 {
 		t.Errorf("field b lead = %q, want empty", l)
 	}
 }
@@ -197,7 +197,7 @@ func TestDecorateFile_FloatingBetweenFieldsAttachesToPrevious(t *testing.T) {
 	if got != "\t// floating after a, before b\n\n" {
 		t.Errorf("field 0 trail = %q, want %q", got, "\t// floating after a, before b\n\n")
 	}
-	if l := st.Fields.List[1].lead.All(); len(l) != 0 {
+	if l := st.Fields.List[1].lead; len(l) != 0 {
 		t.Errorf("field 1 lead = %q, want empty (blank line broke doc binding)", l)
 	}
 }
@@ -217,6 +217,8 @@ func TestDecorateFile_FloatingAfterLastFieldAttachesToLast(t *testing.T) {
 	}
 }
 
+// A comment on the { line is not routed to any field: the { line sits outside
+// the body span, so the verbatim splice must preserve it across a reorder.
 func TestDecorateFile_OpeningBraceComment(t *testing.T) {
 	src := "package p\n\ntype S struct { // betteralign:ignore\n\ta int\n\tb int\n}\n"
 	fset, f, _ := parseSource(t, src)
@@ -226,9 +228,18 @@ func TestDecorateFile_OpeningBraceComment(t *testing.T) {
 		t.Fatalf("DecorateFile: %v", err)
 	}
 	st := df.structs[0]
-	got := st.Fields.Decs.Opening.All()
-	if len(got) != 1 || got[0] != "// betteralign:ignore" {
-		t.Errorf("Opening = %q, want [%q]", got, "// betteralign:ignore")
+	for i, fld := range st.Fields.List {
+		if len(fld.lead) != 0 {
+			t.Errorf("field %d lead = %q, want empty ({-line comment must stay verbatim)", i, fld.lead)
+		}
+	}
+	st.Fields.List[0], st.Fields.List[1] = st.Fields.List[1], st.Fields.List[0]
+	var buf bytes.Buffer
+	if err := Fprint(&buf, df); err != nil {
+		t.Fatalf("Fprint: %v", err)
+	}
+	if !bytes.Contains(buf.Bytes(), []byte("struct { // betteralign:ignore")) {
+		t.Errorf("{-line comment lost after reorder:\n%s", buf.String())
 	}
 }
 
@@ -246,10 +257,12 @@ func TestDecorateFile_NestedStructCommentNotCapturedByOuter(t *testing.T) {
 	// df.structs is in source order, so Outer is first (it spans Inner).
 	outer := df.structs[0]
 	inner := df.structs[1]
-	if got := outer.Fields.Decs.Opening.All(); len(got) != 0 {
-		t.Errorf("outer.Opening = %q, want empty (comment belongs to Inner.a)", got)
+	for i, fld := range outer.Fields.List {
+		if got := fld.lead; len(got) != 0 {
+			t.Errorf("outer field %d lead = %q, want empty (comment belongs to Inner.a)", i, got)
+		}
 	}
-	if got := inner.Fields.List[0].lead.All(); len(got) != 1 || got[0] != "// lead for a" {
+	if got := inner.Fields.List[0].lead; len(got) != 1 || got[0] != "// lead for a" {
 		t.Errorf("inner.a.lead = %q, want [%q]", got, "// lead for a")
 	}
 }
@@ -268,11 +281,8 @@ func TestDecorateFile_CommentBetweenIdentifierAndType(t *testing.T) {
 	if aBody != "\ta /*c*/ int\n" {
 		t.Errorf("field a body = %q, want %q (inline comment must be inside body span)", aBody, "\ta /*c*/ int\n")
 	}
-	if got := st.Fields.List[0].lead.All(); len(got) != 0 {
+	if got := st.Fields.List[0].lead; len(got) != 0 {
 		t.Errorf("field a lead = %q, want empty (inline comment, not lead-doc)", got)
-	}
-	if got := st.Fields.Decs.Opening.All(); len(got) != 0 {
-		t.Errorf("Opening = %q, want empty", got)
 	}
 }
 
@@ -286,7 +296,7 @@ func TestDecorateFile_MultiLineBlockCommentOnFieldLastLine(t *testing.T) {
 	}
 	st := df.structs[0]
 	// Block comment is field a's trail; field b's lead must stay empty.
-	if got := st.Fields.List[1].lead.All(); len(got) != 0 {
+	if got := st.Fields.List[1].lead; len(got) != 0 {
 		t.Errorf("field b lead = %q, want empty (block comment belongs to field a)", got)
 	}
 	// Field a's body span ends at the newline after `a int /* start`.
@@ -724,12 +734,9 @@ func TestDecorateFile_CommentInRejectedInnerStructDoesNotLeakToOuter(t *testing.
 	}
 	outer := df.structs[0]
 	for i, fld := range outer.Fields.List {
-		if got := fld.lead.All(); len(got) != 0 {
+		if got := fld.lead; len(got) != 0 {
 			t.Errorf("outer.Fields.List[%d].lead = %q, want empty (comment belongs to rejected Inner)", i, got)
 		}
-	}
-	if got := outer.Fields.Decs.Opening.All(); len(got) != 0 {
-		t.Errorf("outer.Opening = %q, want empty", got)
 	}
 }
 

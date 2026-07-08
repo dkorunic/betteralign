@@ -11,8 +11,7 @@
 //
 // API parity: this package intentionally mirrors the names betteralign.go
 // referenced in sirkon/dst (Decorator, NewDecorator, DecorateFile, Fprint,
-// File, StructType, FieldList, Field, FieldListDecorations,
-// Decorations) so the caller diff is minimal.
+// File, StructType, FieldList, Field) so the caller diff is minimal.
 package dstmin
 
 import (
@@ -79,32 +78,17 @@ type StructType struct {
 // FieldList wraps *ast.FieldList.
 type FieldList struct {
 	List []*Field
-	Decs FieldListDecorations
 }
-
-// FieldListDecorations holds decoration buckets. Only Opening is decorator-populated.
-type FieldListDecorations struct {
-	Start   Decorations
-	Opening Decorations
-	End     Decorations
-}
-
-// Decorations is a sequence of parser-produced comment-text strings.
-type Decorations []string
 
 // nestedRange is a [lo, hi) token.Pos interval of a nested struct body.
 type nestedRange struct{ lo, hi token.Pos }
-
-// All exposes the underlying slice (aliased, not copied) for sirkon/dst API
-// parity.
-func (d Decorations) All() []string { return []string(d) }
 
 // Field wraps *ast.Field.
 type Field struct {
 	ast   *ast.Field
 	Names []struct{}
 	// Lead-doc comment lines, in source order.
-	lead Decorations
+	lead []string
 	// Inter-field blanks attach to both neighbours; gofmt coalesces duplicates.
 	leadBlanksStart, leadBlanksEnd   int
 	trailBlanksStart, trailBlanksEnd int
@@ -315,32 +299,29 @@ func (dec *Decorator) buildStruct(df *File, st *ast.StructType) (*StructType, bo
 	return dstSt, true
 }
 
-// decorateComments routes each in-body comment group to one of four slots so a
-// reorder carries comments with their owning field. fileComments is st's
-// narrowed run (see commentRun); nested lists descendant struct bodies, whose
-// comments are routed by the inner struct's own call. These two narrowings keep
-// the pass off the O(structs × comments) quadratic.
+// decorateComments routes each in-body comment group to its owning field's
+// lead or trail slot so a reorder carries comments with their field. Comments
+// that never move with a field (on the { line, floating above the first
+// field, or in an empty struct) are skipped: their bytes survive through the
+// verbatim splice and blank-span emits instead. fileComments is st's narrowed
+// run (see commentRun); nested lists descendant struct bodies, whose comments
+// are routed by the inner struct's own call. These two narrowings keep the
+// pass off the O(structs × comments) quadratic.
 //
 // Rules apply in order, first match wins (the numbering predates implementation
 // order and is kept for the BUG-36/39 references on Rules 4/2):
 //
-//	Rule 1: comment on the { line                 -> Opening
+//	Rule 1: comment on the { line                 -> skip (header's verbatim span)
 //	Rule 3: comment starts on a field's last line -> field's trail
 //	Rule 2: comment ends on the line before a field -> field's lead-doc
-//	Rule 4: floating block between fields          -> preceding field's trail
+//	Rule 4: floating block between fields          -> preceding field's trail,
+//	        or skip when no field precedes (first field's leadBlanks covers it)
 //
 // Mutates dstSt.Fields.List in place.
 func (dec *Decorator) decorateComments(df *File, st *ast.StructType, dstSt *StructType, fileComments []*ast.CommentGroup, nested []nestedRange) {
 	if len(dstSt.Fields.List) == 0 {
-		// No fields: every body comment routes to Opening.
-		for _, cg := range fileComments {
-			if !insideStructBody(st, cg) {
-				continue
-			}
-			for _, c := range cg.List {
-				dstSt.Fields.Decs.Opening = append(dstSt.Fields.Decs.Opening, c.Text)
-			}
-		}
+		// No fields: nothing can be reordered, so an empty struct is never
+		// dirty and its body comments always survive via the verbatim path.
 		return
 	}
 
@@ -374,11 +355,9 @@ func (dec *Decorator) decorateComments(df *File, st *ast.StructType, dstSt *Stru
 		cgStartLine := tf.Line(cg.Pos())
 		cgEndLine := tf.Line(cg.End())
 
-		// Rule 1: comment on the { line.
+		// Rule 1: comment on the { line — the { line sits outside the body
+		// span [bodyStart, bodyEnd), so the verbatim splice keeps it in place.
 		if cgStartLine == lbraceLine {
-			for _, c := range cg.List {
-				dstSt.Fields.Decs.Opening = append(dstSt.Fields.Decs.Opening, c.Text)
-			}
 			continue
 		}
 
@@ -441,9 +420,9 @@ func (dec *Decorator) decorateComments(df *File, st *ast.StructType, dstSt *Stru
 			}
 		}
 		if attachIdx == -1 {
-			for _, c := range cg.List {
-				dstSt.Fields.Decs.Opening = append(dstSt.Fields.Decs.Opening, c.Text)
-			}
+			// Floating above the first field: its bytes live in
+			// [bodyStart, leadDocStart), which the first field's leadBlanks
+			// span re-emits wherever that field lands.
 			continue
 		}
 		// BUG-36: comment group overlaps next field's body — skip to avoid double-write on reorder.

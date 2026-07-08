@@ -15,7 +15,7 @@
 // using a DST (Decorated Syntax Tree) so comments and spacing survive a
 // rewrite. The alignment math is largely unchanged from fieldalignment/maligned;
 // apply mode reprints the whole file because DST can't serialise a single node,
-// and -fix is a no-op alias since SuggestedFixes are unused.
+// and -fix acts as an alias for -apply since SuggestedFixes are unused.
 //
 // Related AST issue:
 //   - https://github.com/golang/go/issues/20744
@@ -33,6 +33,7 @@ import (
 	"bytes"
 	"cmp"
 	"errors"
+	"flag"
 	"fmt"
 	"go/ast"
 	"go/token"
@@ -205,7 +206,7 @@ func init() {
 // like golangci-lint may share flag state.
 func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 	apply := cfg.apply
-	if a := pass.Analyzer.Flags.Lookup("fix"); a != nil && a.Value.String() == "true" {
+	if fixRequested(pass) {
 		apply = true
 	}
 	testFiles := cfg.testFiles
@@ -391,14 +392,17 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 			return
 		}
 
+		// Decorate this file once; never retry on failure. Checked before
+		// optimalOrder so a file that already failed decoration doesn't pay the
+		// sort + permutation alloc for its remaining misaligned structs.
+		if _, failed := decorationFailed[currentFn]; failed {
+			return
+		}
+
 		// Permutation needed only for the reorder; computed lazily per misaligned
 		// struct so report-only runs never allocate it.
 		indexes, _, _ := optimalOrder(typ, sizes)
 
-		// Decorate this file once; never retry on failure.
-		if _, failed := decorationFailed[currentFn]; failed {
-			return
-		}
 		if dec == nil {
 			dec = dst.NewDecorator(pass.Fset)
 		}
@@ -480,6 +484,22 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 	}
 
 	return nil, nil
+}
+
+// fixRequested reports whether the -fix alias of -apply is active. Both flag
+// sets matter: x/tools drivers register -fix on the process-global set (via
+// analysisflags), while hosts and the test harness wire it onto Analyzer.Flags.
+// Checking only Analyzer.Flags makes -fix a silent no-op in the shipped binary,
+// since the driver then applies the (always nil) SuggestedFixes instead of
+// reporting diagnostics.
+func fixRequested(pass *analysis.Pass) bool {
+	if a := pass.Analyzer.Flags.Lookup("fix"); a != nil && a.Value.String() == "true" {
+		return true
+	}
+	if a := flag.Lookup("fix"); a != nil && a.Value.String() == "true" {
+		return true
+	}
+	return false
 }
 
 // unsafePointerTyp anchors word-size and pointer-alignment lookups via pass.TypesSizes.
@@ -813,6 +833,12 @@ func (s *gcSizes) alignofUncached(T types.Type) int64 {
 		return max
 	}
 	a := s.Sizeof(T) // may be 0
+	// gc aligns complex{64,128} to their float half, not their full size
+	// (Alignof(complex64) is 4, not 8); mirrors go/types.StdSizes. Upstream
+	// fieldalignment omits this and over-aligns, misreporting sizes.
+	if b, ok := T.Underlying().(*types.Basic); ok && b.Info()&types.IsComplex != 0 {
+		a /= 2
+	}
 	// spec: Alignof(any) ≥ 1.
 	if a < 1 {
 		return 1
@@ -1123,23 +1149,11 @@ func isExcluded(wd, fn string, excludeDirs, excludeFiles []string) bool {
 	return false
 }
 
-// hasIgnoreComment reports the betteralign:ignore opt-out from a decorated
-// struct's opening-brace comment group. Only //-line comments count and the
-// directive needs a trailing word boundary (see commentHasDirective).
-func hasIgnoreComment(node *dst.FieldList) bool {
-	for _, opening := range node.Decs.Opening.All() {
-		if commentHasDirective(opening, ignoreStruct) {
-			return true
-		}
-	}
-
-	return false
-}
-
-// hasIgnoreCommentAST is the DST-independent twin of hasIgnoreComment, so
-// betteralign:ignore is honored even for structs dstmin can't decorate. It looks
-// for the directive on the opening-brace line inside the body; shares
-// commentHasDirective so recognition can't drift.
+// hasIgnoreCommentAST reports the betteralign:ignore opt-out. Working from the
+// AST rather than DST honors the directive even for structs dstmin can't
+// decorate. Only a //-line comment on the opening-brace line counts;
+// recognition is shared with the opt-in check via commentHasDirective so the
+// two can't drift.
 func hasIgnoreCommentAST(fset *token.FileSet, file *ast.File, s *ast.StructType) bool {
 	open := s.Fields.Opening
 	closing := s.Fields.Closing

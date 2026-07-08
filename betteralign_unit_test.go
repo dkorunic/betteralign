@@ -9,6 +9,7 @@ package betteralign
 
 import (
 	"errors"
+	"flag"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -21,7 +22,6 @@ import (
 	"testing"
 	"time"
 
-	dst "github.com/dkorunic/betteralign/internal/dstmin"
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/ast/inspector"
 )
@@ -615,95 +615,7 @@ func TestHasGeneratedComment(t *testing.T) {
 	})
 }
 
-// ─── Layer 8: hasIgnoreComment (BUG-24, BUG-25) ──────────────────────────────
-
-// TestHasIgnoreCommentOpening verifies that the betteralign:ignore directive is
-// read from the Opening decoration of the field list, not from other positions.
-// BUG-24: checking End (closing-brace area) instead of Opening means the
-// annotation is never found.
-func TestHasIgnoreCommentOpening(t *testing.T) {
-	t.Run("ignore comment in Opening is detected", func(t *testing.T) {
-		fl := &dst.FieldList{}
-		fl.Decs.Opening = dst.Decorations{"// betteralign:ignore"}
-		if !hasIgnoreComment(fl) {
-			t.Error("betteralign:ignore in Opening not detected (BUG-24)")
-		}
-	})
-
-	t.Run("ignore comment in End (node tail) is NOT detected", func(t *testing.T) {
-		// BUG-24 would also fire on End-decorations; this asserts it doesn't.
-		fl := &dst.FieldList{}
-		fl.Decs.End = dst.Decorations{"// betteralign:ignore"}
-		if hasIgnoreComment(fl) {
-			t.Error("betteralign:ignore in End should not trigger ignore (BUG-24 would wrongly trigger)")
-		}
-	})
-
-	t.Run("ignore comment in Start (node head) is NOT detected", func(t *testing.T) {
-		fl := &dst.FieldList{}
-		fl.Decs.Start = dst.Decorations{"// betteralign:ignore"}
-		if hasIgnoreComment(fl) {
-			t.Error("betteralign:ignore in Start should not trigger ignore")
-		}
-	})
-
-	t.Run("no decorations returns false", func(t *testing.T) {
-		fl := &dst.FieldList{}
-		if hasIgnoreComment(fl) {
-			t.Error("empty field list should return false")
-		}
-	})
-
-	t.Run("unrelated comment in Opening does not trigger", func(t *testing.T) {
-		fl := &dst.FieldList{}
-		fl.Decs.Opening = dst.Decorations{"// some other comment"}
-		if hasIgnoreComment(fl) {
-			t.Error("unrelated Opening comment should not trigger ignore")
-		}
-	})
-}
-
-// TestHasIgnoreCommentPrefixGuard verifies that only line comments (// prefix)
-// can carry the betteralign:ignore directive, not block comments or bare strings.
-// BUG-25: removing the HasPrefix("//") guard allows block comments and other
-// strings that merely contain the directive substring to trigger ignore.
-func TestHasIgnoreCommentPrefixGuard(t *testing.T) {
-	t.Run("line comment triggers ignore", func(t *testing.T) {
-		fl := &dst.FieldList{}
-		fl.Decs.Opening = dst.Decorations{"// betteralign:ignore"}
-		if !hasIgnoreComment(fl) {
-			t.Error("line comment with // prefix should trigger ignore")
-		}
-	})
-
-	t.Run("block comment does NOT trigger ignore", func(t *testing.T) {
-		// BUG-25 removes HasPrefix("//") so block comments would also match.
-		fl := &dst.FieldList{}
-		fl.Decs.Opening = dst.Decorations{"/* betteralign:ignore */"}
-		if hasIgnoreComment(fl) {
-			t.Error("block comment should NOT trigger ignore (BUG-25 would wrongly trigger)")
-		}
-	})
-
-	t.Run("bare string containing directive does NOT trigger ignore", func(t *testing.T) {
-		// Without the // prefix guard a bare substring match would fire (BUG-25).
-		fl := &dst.FieldList{}
-		fl.Decs.Opening = dst.Decorations{"betteralign:ignore"}
-		if hasIgnoreComment(fl) {
-			t.Error("bare string without // prefix should NOT trigger ignore (BUG-25 would wrongly trigger)")
-		}
-	})
-
-	t.Run("partial match without directive does NOT trigger", func(t *testing.T) {
-		fl := &dst.FieldList{}
-		fl.Decs.Opening = dst.Decorations{"// betteralign:checked"}
-		if hasIgnoreComment(fl) {
-			t.Error("partial directive match should not trigger ignore")
-		}
-	})
-}
-
-// ─── Layer 8b: hasIgnoreCommentAST (DST-independent ignore) ──────────────────
+// ─── Layer 8: hasIgnoreCommentAST (AST-based ignore) ─────────────────────────
 
 // firstStructType parses src (with comments) and returns its fileset, file,
 // and the first *ast.StructType in preorder.
@@ -728,10 +640,9 @@ func firstStructType(t *testing.T, src string) (*token.FileSet, *ast.File, *ast.
 	return fset, f, st
 }
 
-// TestHasIgnoreCommentAST pins the DST-independent ignore check: it honors the
-// directive only on the opening-brace line (matching hasIgnoreComment's
-// Opening routing), so it agrees with the DST path on decoratable structs
-// while still working for shapes dstmin cannot decorate.
+// TestHasIgnoreCommentAST pins the AST-based ignore check: it honors the
+// directive only on the opening-brace line, and works even for shapes dstmin
+// cannot decorate.
 func TestHasIgnoreCommentAST(t *testing.T) {
 	cases := []struct {
 		name string
@@ -971,7 +882,7 @@ func makeCommentGroup(texts ...string) *ast.CommentGroup {
 // opt-in. Block comments, substring matches, and missing // prefix must not.
 // BUG-27: substring matching (strings.Contains) without a // prefix guard and
 // without a word-boundary check accepts block comments and partial directives,
-// inconsistent with hasIgnoreComment.
+// inconsistent with the ignore check.
 func TestCommentGroupHasOptInPrefix(t *testing.T) {
 	tests := []struct {
 		name string
@@ -1004,32 +915,42 @@ func TestCommentGroupHasOptInPrefix(t *testing.T) {
 	}
 }
 
-// TestHasIgnoreCommentPrefix verifies that hasIgnoreComment also enforces the
-// word-boundary rule. The pre-fix code matched "// betteralign:ignored" as a
-// substring of betteralign:ignore.
-func TestHasIgnoreCommentPrefix(t *testing.T) {
-	tests := []struct {
-		name string
-		text string
-		want bool
-	}{
-		{"directive matches", "// betteralign:ignore", true},
-		{"directive with trailing text matches", "// betteralign:ignore reason", true},
-		{"directive with trailing tab matches", "// betteralign:ignore\treason", true},
-		{"longer-token suffix is rejected", "// betteralign:ignored", false},
-		{"longer-token prefix is rejected", "// xbetteralign:ignore", false},
-		{"block comment rejected", "/* betteralign:ignore */", false},
-		{"bare string rejected", "betteralign:ignore", false},
+// fixGlobalFlag stands in for the -fix flag x/tools drivers register on the
+// process-global set.
+var fixGlobalFlag = flag.Bool("fix", false, "test stand-in for the driver's -fix")
+
+// TestFixRequestedGlobalFlag guards the production path: fixRequested must see
+// -fix on the global set, where drivers register it — not only Analyzer.Flags.
+func TestFixRequestedGlobalFlag(t *testing.T) {
+	pass := &analysis.Pass{Analyzer: &analysis.Analyzer{}}
+
+	if fixRequested(pass) {
+		t.Error("fixRequested = true with -fix unset, want false")
 	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			fl := &dst.FieldList{}
-			fl.Decs.Opening = dst.Decorations{tc.text}
-			got := hasIgnoreComment(fl)
-			if got != tc.want {
-				t.Errorf("hasIgnoreComment(%q) = %v, want %v", tc.text, got, tc.want)
-			}
-		})
+
+	*fixGlobalFlag = true
+	defer func() { *fixGlobalFlag = false }()
+	if !fixRequested(pass) {
+		t.Error("fixRequested = false with global -fix set, want true")
+	}
+}
+
+// TestFixRequestedAnalyzerFlag covers the host-registered variant, where -fix
+// lives on Analyzer.Flags (as the TestApply harness wires it).
+func TestFixRequestedAnalyzerFlag(t *testing.T) {
+	analyzer := &analysis.Analyzer{}
+	var fix bool
+	analyzer.Flags.BoolVar(&fix, "fix", false, "host-registered alias")
+	pass := &analysis.Pass{Analyzer: analyzer}
+
+	if fixRequested(pass) {
+		t.Error("fixRequested = true with analyzer -fix unset, want false")
+	}
+	if err := analyzer.Flags.Set("fix", "true"); err != nil {
+		t.Fatal(err)
+	}
+	if !fixRequested(pass) {
+		t.Error("fixRequested = false with analyzer -fix set, want true")
 	}
 }
 
@@ -1125,9 +1046,9 @@ func TestIsExcluded(t *testing.T) {
 }
 
 // TestCommentHasDirective exercises the shared //-comment / word-boundary
-// matcher directly. hasIgnoreComment and commentGroupHasOptIn both delegate to
-// it; this table makes the contract explicit rather than relying on indirect
-// coverage through the two callers.
+// matcher directly. hasIgnoreCommentAST and commentGroupHasOptIn both delegate
+// to it; this table makes the contract explicit rather than relying on
+// indirect coverage through the two callers.
 func TestCommentHasDirective(t *testing.T) {
 	const directive = "betteralign:check"
 	tests := []struct {
@@ -1295,6 +1216,36 @@ func TestGcSizesSizeofBasicKinds(t *testing.T) {
 				t.Errorf("Sizeof(%s) = %d, want %d", tc.name, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestGcSizesAlignofComplex pins complex alignment to the float half (4 for
+// complex64, not 8), and the layout consequences that upstream's over-alignment
+// got wrong.
+func TestGcSizesAlignofComplex(t *testing.T) {
+	if got := testSizes64.Alignof(types.Typ[types.Complex64]); got != 4 {
+		t.Errorf("Alignof(complex64) = %d, want 4", got)
+	}
+	if got := testSizes64.Alignof(types.Typ[types.Complex128]); got != 8 {
+		t.Errorf("Alignof(complex128) = %d, want 8", got)
+	}
+
+	// struct{byte; complex64; byte}: 16 as declared, 12 with complex64 first.
+	// Over-aligning complex64 to 8 inflated both to 24 -> 16.
+	str := types.NewStruct([]*types.Var{
+		types.NewVar(token.NoPos, nil, "a", types.Typ[types.Uint8]),
+		types.NewVar(token.NoPos, nil, "b", types.Typ[types.Complex64]),
+		types.NewVar(token.NoPos, nil, "c", types.Typ[types.Uint8]),
+	}, nil)
+	if got := testSizes64.Sizeof(str); got != 16 {
+		t.Errorf("Sizeof(struct{byte;complex64;byte}) = %d, want 16", got)
+	}
+	optimal, optSize, _ := layoutMetrics(str, testSizes64)
+	if optimal {
+		t.Fatal("layoutMetrics(struct{byte;complex64;byte}) = optimal, want misaligned")
+	}
+	if optSize != 12 {
+		t.Errorf("optimal size = %d, want 12", optSize)
 	}
 }
 
