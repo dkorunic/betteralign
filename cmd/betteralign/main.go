@@ -16,7 +16,6 @@ import (
 
 	"github.com/KimMachineGun/automemlimit/memlimit"
 	"github.com/dkorunic/betteralign"
-	"go.uber.org/automaxprocs/maxprocs"
 	"golang.org/x/tools/go/analysis/singlechecker"
 )
 
@@ -32,9 +31,6 @@ func main() {
 			),
 		),
 	)
-
-	undo, _ := maxprocs.Set()
-	defer undo()
 
 	if wantsVersion(os.Args[1:]) {
 		fmt.Println(getVersionString())
