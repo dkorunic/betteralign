@@ -27,6 +27,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // Sentinel errors classified via errors.Is.
@@ -112,11 +113,35 @@ func (dec *Decorator) DecorateFile(f *ast.File) (*File, error) {
 		// nothing to read or splice against.
 		return nil, fmt.Errorf("%w: position not in FileSet", ErrSourceRead)
 	}
-	src, err := os.ReadFile(tf.Name())
+	src, err := readSourceOnce(tf.Name())
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s: %w", ErrSourceRead, tf.Name(), err)
 	}
 	return dec.DecorateFileSrc(f, src), nil
+}
+
+// sourceCache memoises each file's first-read bytes by path, process-wide.
+var sourceCache sync.Map // map[string][]byte
+
+// readSourceOnce pins the bytes the splice runs against to the file as first
+// seen, so they still match the AST offsets after -fix rewrites it (issue #36).
+//
+// Under `betteralign -fix ./...` a non-test file loads in several package
+// variants (base + [p.test]), so independent passes decorate and rewrite the
+// same path. A fresh os.ReadFile would hand a later pass an earlier pass's
+// rewrite, and its stale offsets would duplicate/drop fields. Safe because a
+// pass only rewrites a file it first decorated through here, so every read —
+// including concurrent misses — precedes the first write.
+func readSourceOnce(name string) ([]byte, error) {
+	if v, ok := sourceCache.Load(name); ok {
+		return v.([]byte), nil
+	}
+	b, err := os.ReadFile(name)
+	if err != nil {
+		return nil, err
+	}
+	actual, _ := sourceCache.LoadOrStore(name, b)
+	return actual.([]byte), nil
 }
 
 // DecorateFileSrc is the in-memory entry point for tests and fuzz harnesses

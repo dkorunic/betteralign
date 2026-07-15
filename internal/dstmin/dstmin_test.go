@@ -13,6 +13,7 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -968,5 +969,107 @@ func TestFprint_GofmtCorruptedOutputIsRejected(t *testing.T) {
 	}
 	if !errors.Is(err, ErrFormat) {
 		t.Errorf("Fprint err = %v; want errors.Is(err, ErrFormat)", err)
+	}
+}
+
+// reverseFirstStructInto reprints f with its first >=2-field struct reversed,
+// mirroring the reorder the analyzer applies under -fix.
+func reverseFirstStructInto(t *testing.T, dec *Decorator, f *ast.File) string {
+	t.Helper()
+	df, err := dec.DecorateFile(f)
+	if err != nil {
+		t.Fatalf("DecorateFile: %v", err)
+	}
+	var target *StructType
+	for _, st := range df.structs {
+		if len(st.Fields.List) >= 2 {
+			target = st
+			break
+		}
+	}
+	if target == nil {
+		t.Fatal("no decoratable struct with >=2 fields")
+	}
+	slices.Reverse(target.Fields.List)
+	var buf bytes.Buffer
+	if err := Fprint(&buf, df); err != nil {
+		t.Fatalf("Fprint: %v", err)
+	}
+	return buf.String()
+}
+
+// TestDecorateFile_ReprintUsesParsedNotDiskBytes is the regression for issue #36:
+// two passes (the base + [p.test] variants) reverse the same parsed struct, but
+// the first writes its result to disk before the second decorates. Both must
+// reprint identical valid Go — the second has to splice against its parsed bytes,
+// not the first pass's rewrite, or fields duplicate/drop.
+func TestDecorateFile_ReprintUsesParsedNotDiskBytes(t *testing.T) {
+	src := `package p
+
+type (
+	// Handler is a callback.
+	Handler func(string) error
+
+	// Scanner scans things.
+	Scanner struct {
+		// enabled toggles scanning.
+		enabled bool
+		// cache holds results.
+		cache map[string]int
+		// name identifies the scanner.
+		name string
+		// logger writes logs.
+		//
+		// It is multi-line on purpose.
+		logger *int
+		// count tracks totals.
+		count int64
+		// pool is a worker pool.
+		pool *int
+	}
+)
+`
+	// Both variants parse the pristine file before any rewrite, as go/packages does.
+	fset, f1, path := parseSource(t, src)
+	f2, err := parser.ParseFile(fset, path, nil, parser.ParseComments|parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("second parse: %v", err)
+	}
+
+	// Pass 1: reorder and write to disk, as -apply does.
+	out1 := reverseFirstStructInto(t, NewDecorator(fset), f1)
+	if err := os.WriteFile(path, []byte(out1), 0o644); err != nil {
+		t.Fatalf("apply pass 1: %v", err)
+	}
+
+	// Pass 2: same reorder of the same parsed struct — must match pass 1.
+	out2 := reverseFirstStructInto(t, NewDecorator(fset), f2)
+
+	if out1 != out2 {
+		t.Errorf("second pass reprint diverged after disk rewrite (issue #36)\n=== PASS 1 ===\n%s\n=== PASS 2 ===\n%s", out1, out2)
+	}
+
+	// Corruption also shows as dup/dropped fields: output must parse with each name once.
+	outFile, err := parser.ParseFile(token.NewFileSet(), "out.go", []byte(out2), parser.ParseComments|parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("pass 2 produced invalid Go (issue #36):\n%s\nparse error: %v", out2, err)
+	}
+	counts := map[string]int{}
+	ast.Inspect(outFile, func(n ast.Node) bool {
+		st, ok := n.(*ast.StructType)
+		if !ok {
+			return true
+		}
+		for _, fld := range st.Fields.List {
+			for _, nm := range fld.Names {
+				counts[nm.Name]++
+			}
+		}
+		return true
+	})
+	for _, name := range []string{"enabled", "cache", "name", "logger", "count", "pool"} {
+		if counts[name] != 1 {
+			t.Errorf("field %q appears %d times, want 1 (issue #36 dup/drop)\n%s", name, counts[name], out2)
+		}
 	}
 }
