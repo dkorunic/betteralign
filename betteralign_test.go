@@ -207,6 +207,110 @@ func TestApplyViaFixAlias(t *testing.T) {
 	}
 }
 
+// TestApplyDefersPositionalLiteralInTestFile is the regression for the issue #36
+// sibling: a struct pinned by a positional literal that lives only in an
+// in-package test file must survive -fix — the base pass, blind to the test
+// file, must defer to the [pkg.test] variant.
+func TestApplyDefersPositionalLiteralInTestFile(t *testing.T) {
+	srcDir := filepath.Join("testdata", "src")
+	workDir := filepath.Join(srcDir, "litguard")
+
+	tmpDir, err := os.MkdirTemp(srcDir, "litguard-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	tmpWorkDir := filepath.Join(tmpDir, "litguard")
+	if err := os.Mkdir(tmpWorkDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	paths, err := filepath.Glob(filepath.Join(workDir, "*.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig := make(map[string]string, len(paths))
+	for _, path := range paths {
+		base := filepath.Base(path)
+		src, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		orig[base] = string(src)
+		if err := os.WriteFile(filepath.Join(tmpWorkDir, base), src, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	testdata := analysistest.TestData()
+	analyzer := NewTestAnalyzer()
+	var fix bool
+	analyzer.Flags.BoolVar(&fix, "fix", false, "alias for -apply (test harness only)")
+	_ = analyzer.Flags.Set("fix", "true")
+
+	analysistest.Run(t, testdata, analyzer, filepath.Join(filepath.Base(tmpDir), "litguard"))
+
+	got, err := os.ReadFile(filepath.Join(tmpWorkDir, "lit.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != orig["lit.go"] {
+		t.Errorf("lit.go was rewritten despite a positional literal in the test file:\n--- got:\n%s\n--- want (unchanged):\n%s", got, orig["lit.go"])
+	}
+}
+
+// TestApplyRewritesWhenTestFileBuildExcluded guards the deferral from over-firing:
+// a positional literal in a build-excluded test file is never compiled, so the
+// struct must still be rewritten. The deferral must key on files go/packages
+// actually loaded, not on a disk glob that ignores build constraints.
+func TestApplyRewritesWhenTestFileBuildExcluded(t *testing.T) {
+	srcDir := filepath.Join("testdata", "src")
+	workDir := filepath.Join(srcDir, "litexcluded")
+
+	tmpDir, err := os.MkdirTemp(srcDir, "litexcluded-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	tmpWorkDir := filepath.Join(tmpDir, "litexcluded")
+	if err := os.Mkdir(tmpWorkDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	paths, err := filepath.Glob(filepath.Join(workDir, "*.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range paths {
+		src, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(tmpWorkDir, filepath.Base(path)), src, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	testdata := analysistest.TestData()
+	analyzer := NewTestAnalyzer()
+	var fix bool
+	analyzer.Flags.BoolVar(&fix, "fix", false, "alias for -apply (test harness only)")
+	_ = analyzer.Flags.Set("fix", "true")
+
+	analysistest.Run(t, testdata, analyzer, filepath.Join(filepath.Base(tmpDir), "litexcluded"))
+
+	got, err := os.ReadFile(filepath.Join(tmpWorkDir, "lit.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Optimal order is b, c, a: the pointer field must move ahead of the bool.
+	if b, a := strings.Index(string(got), "b *int"), strings.Index(string(got), "a bool"); b < 0 || a < 0 || b > a {
+		t.Errorf("lit.go was not reordered (build-excluded test literal must not block the fix):\n%s", got)
+	}
+}
+
 func TestFlagExcludeDirs(t *testing.T) {
 	t.Run("exclude none", func(t *testing.T) {
 		testdata := analysistest.TestData()

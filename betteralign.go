@@ -36,6 +36,7 @@ import (
 	"flag"
 	"fmt"
 	"go/ast"
+	"go/parser"
 	"go/token"
 	"go/types"
 	"go/version"
@@ -216,6 +217,11 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 	apply := cfg.apply
 	if fixRequested(pass) {
 		apply = true
+	}
+	// The base pass can't see in-package test files; defer -apply to the variant
+	// that can, so a positional literal there isn't silently broken.
+	if apply && deferToTestVariant(pass) {
+		apply = false
 	}
 	testFiles := cfg.testFiles
 	generatedFiles := cfg.generatedFiles
@@ -585,6 +591,64 @@ func collectPositionalUsers(inspect *inspector.Inspector, pass *analysis.Pass) m
 	})
 
 	return users
+}
+
+// deferToTestVariant reports whether this pass should skip -apply and let the
+// in-package test variant rewrite instead.
+//
+// collectPositionalUsers scans only the current pass's files, so the base pass
+// (p) can't see a positional literal in an in-package *_test.go that pins a
+// struct's layout — it would rewrite the struct and break the test. The
+// p [p.test] variant sees those tests plus the same non-test files, so deferring
+// loses no coverage.
+//
+// True iff a sibling *_test.go declaring this package was loaded (in the shared
+// FileSet) but isn't one of this pass's files. Keying on loaded files, not a disk
+// glob, respects build constraints: a build-excluded test never compiles, so it
+// can't break and must not block the fix. External test packages (p_test) load
+// separately and never rewrite p — their literals are the documented
+// cross-package limitation.
+func deferToTestVariant(pass *analysis.Pass) bool {
+	dir := ""
+	seen := make(map[string]struct{}, len(pass.Files))
+	for _, f := range pass.Files {
+		tf := pass.Fset.File(f.Pos())
+		if tf == nil {
+			continue
+		}
+		seen[tf.Name()] = struct{}{}
+		if dir == "" {
+			dir = filepath.Dir(tf.Name())
+		}
+	}
+	if dir == "" {
+		return false
+	}
+
+	deferred := false
+	// The shared FileSet spans all variants, so the [p.test] variant's test files
+	// are visible from the base pass here.
+	pass.Fset.Iterate(func(tf *token.File) bool {
+		name := tf.Name()
+		if !strings.HasSuffix(name, "_test.go") || filepath.Dir(name) != dir {
+			return true
+		}
+		if _, ok := seen[name]; ok {
+			return true
+		}
+		// Package clause distinguishes in-package from external (p_test) tests;
+		// unparsable files can't pin anything.
+		pf, err := parser.ParseFile(token.NewFileSet(), name, nil, parser.PackageClauseOnly)
+		if err != nil || pf.Name == nil {
+			return true
+		}
+		if pf.Name.Name == pass.Pkg.Name() {
+			deferred = true
+			return false
+		}
+		return true
+	})
+	return deferred
 }
 
 // canonicalStructType collapses every syntactic form of a struct reference onto

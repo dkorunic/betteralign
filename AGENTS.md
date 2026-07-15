@@ -95,6 +95,8 @@ The pointer-bytes diagnostic is framed by the **analyzed** package's Go version,
 
 A struct constructed anywhere in the package via a *positional* composite literal (`T{1, 2, 3}` rather than keyed) is reported but **never** rewritten under `-apply`, since reordering would silently re-map the literal's elements. The diagnostic points at the offending literal.
 
+The check scans only the current pass's files, and go/packages runs the analyzer once per variant — base `p` (non-test files) and `p [p.test]` (non-test + in-package test files). Since the base pass can't see a positional literal that lives in an in-package `*_test.go`, `deferToTestVariant` makes the base pass skip `-apply` whenever such a test file exists, deferring to the `[p.test]` variant, which sees the same non-test files plus the tests. Literals in *external* test packages (`package p_test`) load separately and never rewrite `p`'s structs, so they remain the documented cross-package limitation.
+
 ### Magic comment annotations
 
 - `// betteralign:ignore` inside a struct's opening brace — skip this struct entirely.
