@@ -158,6 +158,13 @@ func (dec *Decorator) DecorateFileSrc(f *ast.File, src []byte) *File {
 	tf := dec.Fset.File(f.Pos())
 	df := &File{ast: f, source: src, tf: tf}
 
+	// f isn't in dec.Fset: no positions to splice against. Return it undecorated
+	// so Fprint emits src verbatim rather than nil-deref offsetOf. DecorateFile
+	// guards this; direct callers (tests, fuzz harnesses) don't.
+	if tf == nil {
+		return df
+	}
+
 	// Stack holds enclosing structs; decoratedSet filters which ancestors record
 	// nested ranges for the routing pass.
 	nestedRanges := make(map[*ast.StructType][]nestedRange)

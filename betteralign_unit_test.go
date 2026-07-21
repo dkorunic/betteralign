@@ -996,6 +996,36 @@ func TestIsExcluded(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "bare dir name matches at any depth (gitignore-style)",
+			fn:   filepath.Join(wd, "a", "internal", "x", "foo.go"),
+			dirs: []string{"internal"},
+			want: true,
+		},
+		{
+			name: "bare dir name matches an intermediate component",
+			fn:   filepath.Join(wd, "a", "vendor", "pkg", "foo.go"),
+			dirs: []string{"vendor"},
+			want: true,
+		},
+		{
+			name: "bare glob matches a component at depth",
+			fn:   filepath.Join(wd, "a", "testdata", "foo.go"),
+			dirs: []string{"test*"},
+			want: true,
+		},
+		{
+			name: "qualified pattern matches its exact relative path at depth",
+			fn:   filepath.Join(wd, "a", "internal", "foo.go"),
+			dirs: []string{filepath.Join("a", "internal")},
+			want: true,
+		},
+		{
+			name: "qualified pattern does not basename-match at depth",
+			fn:   filepath.Join(wd, "a", "internal", "foo.go"),
+			dirs: []string{filepath.Join("x", "internal")},
+			want: false,
+		},
+		{
 			name:  "file matching glob pattern is excluded",
 			fn:    filepath.Join(wd, "foo.go"),
 			files: []string{"*.go"},
@@ -2127,5 +2157,59 @@ func TestApplyToFileRejectsEmptyBuffer(t *testing.T) {
 	}
 	if string(got) != "package x\n" {
 		t.Errorf("file was modified despite empty-buffer guard: got %q", got)
+	}
+}
+
+// TestLayoutDependsOnTypeParam pins which generic field shapes make a struct's
+// layout instantiation-dependent (so run() suppresses the diagnostic): by-value
+// positions (T, [N]T, by-value struct) do; indirections (*T, []T, map[...]T) and
+// an unused type parameter do not.
+func TestLayoutDependsOnTypeParam(t *testing.T) {
+	src := `package p
+type Direct[T any] struct { A bool; B T; C bool }
+type ArrayOfParam[T any] struct { A bool; B [4]T }
+type NestedByValue[T any] struct { A bool; B struct{ X T } }
+type PointerToParam[T any] struct { A bool; B *T }
+type SliceOfParam[T any] struct { A bool; B []T }
+type MapOfParam[T any] struct { A bool; B map[string]T }
+type ChanOfParam[T any] struct { A bool; B chan T }
+type ParamUnusedInLayout[T any] struct { A bool; B int64 }
+type NoParam struct { A bool; B int64; C bool }
+`
+	pkg, skip := typeCheckFuzzSource(src)
+	if skip != "" || pkg == nil {
+		t.Fatalf("type-check failed: skip=%q pkg=%v", skip, pkg)
+	}
+
+	want := map[string]bool{
+		"Direct":              true,
+		"ArrayOfParam":        true,
+		"NestedByValue":       true,
+		"PointerToParam":      false,
+		"SliceOfParam":        false,
+		"MapOfParam":          false,
+		"ChanOfParam":         false,
+		"ParamUnusedInLayout": false,
+		"NoParam":             false,
+	}
+	for name, exp := range want {
+		obj := pkg.Scope().Lookup(name)
+		if obj == nil {
+			t.Errorf("%s: not found in package scope", name)
+			continue
+		}
+		named, ok := obj.Type().(*types.Named)
+		if !ok {
+			t.Errorf("%s: not a named type (%T)", name, obj.Type())
+			continue
+		}
+		st, ok := named.Origin().Underlying().(*types.Struct)
+		if !ok {
+			t.Errorf("%s: underlying is not a struct (%T)", name, named.Underlying())
+			continue
+		}
+		if got := layoutDependsOnTypeParam(st); got != exp {
+			t.Errorf("layoutDependsOnTypeParam(%s) = %v, want %v", name, got, exp)
+		}
 	}
 }

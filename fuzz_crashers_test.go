@@ -33,13 +33,16 @@ func TestGCSizesCrashersDoNotHang(t *testing.T) {
 	replayHarnessCrashers(t, "fuzz/gcsizes/crashers", runGCSizesInvariant)
 }
 
-// replayHarnessCrashers walks dir for raw crasher inputs (files with no
-// extension; sibling metadata files such as .output/.quoted/.metadata are
-// skipped), runs each through fn under a 2 s deadline, and reports per-input
-// failures so the failing hash is easy to map back to the offending
-// input. Skips when the directory does not exist so CI without a fuzz
-// workdir stays green.
-func replayHarnessCrashers(t *testing.T, dir string, fn func(t *testing.T, src string)) {
+// replayHarnessCrashers runs each raw crasher input (extension-less files;
+// .output/.quoted/.metadata siblings skipped) through fn under a 2 s deadline,
+// as a per-input subtest. Skips when dir is absent so CI without a fuzz workdir
+// stays green.
+//
+// The replay runs in a watchdog goroutine to catch a BUG-44-style hang, so it
+// must avoid SkipNow/FailNow off the test goroutine: type-checking goes through
+// the *testing.T-free typeCheckFuzzSource (silent return on uninteresting
+// input), fn asserts only via t.Errorf, and t.Fatalf stays on the test goroutine.
+func replayHarnessCrashers(t *testing.T, dir string, fn func(t *testing.T, pkg *types.Package)) {
 	t.Helper()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -68,7 +71,11 @@ func replayHarnessCrashers(t *testing.T, dir string, fn func(t *testing.T, src s
 			done := make(chan struct{})
 			go func() {
 				defer close(done)
-				fn(t, string(data))
+				pkg, skip := typeCheckFuzzSource(string(data))
+				if skip != "" || pkg == nil {
+					return // uninteresting input: silent acceptance
+				}
+				fn(t, pkg)
 			}()
 			select {
 			case <-done:
@@ -79,16 +86,10 @@ func replayHarnessCrashers(t *testing.T, dir string, fn func(t *testing.T, src s
 	}
 }
 
-// runOptimalOrderInvariant mirrors the FuzzOptimalOrder body so the
-// regression test exercises the same path. Inputs the original harness
-// would have Skipped surface here as silent acceptance, matching the
-// "uninteresting" classification.
-func runOptimalOrderInvariant(t *testing.T, src string) {
+// runOptimalOrderInvariant mirrors the FuzzOptimalOrder walk (type-checking and
+// skips happen in replayHarnessCrashers) and asserts via t.Errorf only.
+func runOptimalOrderInvariant(t *testing.T, pkg *types.Package) {
 	t.Helper()
-	pkg := typeCheckFuzzInput(t, src)
-	if pkg == nil {
-		return
-	}
 	sizes := newGCSizes(8, 8)
 	for _, name := range pkg.Scope().Names() {
 		tn, ok := pkg.Scope().Lookup(name).(*types.TypeName)
@@ -110,14 +111,10 @@ func runOptimalOrderInvariant(t *testing.T, src string) {
 	}
 }
 
-// runGCSizesInvariant mirrors the FuzzGCSizes body so the regression
-// test exercises the same path.
-func runGCSizesInvariant(t *testing.T, src string) {
+// runGCSizesInvariant mirrors the FuzzGCSizes walk so the regression test
+// exercises the same path.
+func runGCSizesInvariant(t *testing.T, pkg *types.Package) {
 	t.Helper()
-	pkg := typeCheckFuzzInput(t, src)
-	if pkg == nil {
-		return
-	}
 	sizes := newGCSizes(8, 8)
 	for _, name := range pkg.Scope().Names() {
 		tn, ok := pkg.Scope().Lookup(name).(*types.TypeName)

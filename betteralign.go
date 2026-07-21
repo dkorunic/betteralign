@@ -103,6 +103,14 @@ are analyzed. Anonymous structs (nested struct-typed fields, struct literals,
 skipped. To enable analysis of one of those, lift it into a named type
 declaration.
 
+A generic struct whose layout depends on a type parameter — one with a type
+parameter in a by-value field position (` + "`B T`" + `, ` + "`B [4]T`" + `, or a by-value
+struct holding one) — is also skipped. Such a field is sized from the
+constraint's underlying (` + "`T any`" + ` as ` + "`interface{}`" + `), so its size and
+pointer-bytes figures would be per-instantiation guesses. Fields that hold a
+type parameter only indirectly (` + "`*T`" + `, ` + "`[]T`" + `, ` + "`map[K]T`" + `) have a fixed
+layout and are still analyzed.
+
 If a struct is constructed somewhere in the package with a positional
 composite literal (` + "`T{1, 2, 3}`" + ` rather than ` + "`T{a: 1, b: 2, c: 3}`" + `),
 the reorder is reported but never applied: rewriting the field order would
@@ -110,6 +118,20 @@ re-map the literal's elements to different fields, breaking the build (or
 worse, silently mis-assigning values when the new field types still happen
 to accept the old element types). Convert the literal to keyed form and
 rerun to enable the reorder.
+
+This positional-literal guard only sees the package that declares the struct
+and its in-package tests. A positional literal of an exported struct used from
+another package (an ordinary importer, or an external ` + "`package p_test`" + `) is
+invisible to the pass that rewrites the struct, so ` + "`-apply`" + ` may reorder it and
+break — or silently mis-assign — that caller. Unexported structs are safe. When
+running ` + "`-apply ./...`" + ` across a multi-package module, gate it with a
+` + "`go build ./...`" + ` (and your tests) afterwards, or convert positional literals
+to keyed form first. The in-package test guard also relies on the test files
+being loaded, so a driver run with -test=false can still rewrite a struct
+pinned by a literal in an in-package test.
+
+Windows-line-ending (CRLF) files are reported but never rewritten under
+` + "`-apply`" + `; normalise them to LF to enable the reorder.
 
 `
 
@@ -214,14 +236,17 @@ func init() {
 // skipped. Safe across concurrent passes; flag slices are cloned because hosts
 // like golangci-lint may share flag state.
 func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
+	// Hand the whole package to the [pkg.test] variant when it exists: the base
+	// pass is blind to in-package test files, so it could rewrite a struct a
+	// test's positional literal pins, and would emit a duplicate, caveat-less
+	// diagnostic. The variant sees a superset of files, so nothing is lost.
+	if deferToTestVariant(pass) {
+		return nil, nil
+	}
+
 	apply := cfg.apply
 	if fixRequested(pass) {
 		apply = true
-	}
-	// The base pass can't see in-package test files; defer -apply to the variant
-	// that can, so a positional literal there isn't silently broken.
-	if apply && deferToTestVariant(pass) {
-		apply = false
 	}
 	testFiles := cfg.testFiles
 	generatedFiles := cfg.generatedFiles
@@ -366,6 +391,14 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 		if optimal {
 			return
 		}
+
+		// Skip structs whose layout depends on a type parameter: sized from the
+		// constraint underlying, their figures are per-instantiation guesses.
+		// On the misaligned path only, so non-generic structs pay nothing.
+		if layoutDependsOnTypeParam(typ) {
+			return
+		}
+
 		var message string
 		if sz := sizes.Sizeof(typ); sz != optsz {
 			message = fmt.Sprintf("%d bytes saved: struct of size %d could be %d", sz-optsz, sz, optsz)
@@ -593,21 +626,18 @@ func collectPositionalUsers(inspect *inspector.Inspector, pass *analysis.Pass) m
 	return users
 }
 
-// deferToTestVariant reports whether this pass should skip -apply and let the
-// in-package test variant rewrite instead.
+// deferToTestVariant reports whether this pass should hand the whole package to
+// the in-package test variant, skipping both reporting and -apply.
 //
-// collectPositionalUsers scans only the current pass's files, so the base pass
-// (p) can't see a positional literal in an in-package *_test.go that pins a
-// struct's layout — it would rewrite the struct and break the test. The
-// p [p.test] variant sees those tests plus the same non-test files, so deferring
-// loses no coverage.
+// The base pass can't see in-package *_test.go files, so a positional literal
+// there is invisible: it would rewrite the pinned struct (breaking the test)
+// and duplicate the variant's diagnostic without its caveat. The [p.test]
+// variant sees those tests plus the same non-test files, so deferring loses
+// nothing.
 //
-// True iff a sibling *_test.go declaring this package was loaded (in the shared
-// FileSet) but isn't one of this pass's files. Keying on loaded files, not a disk
-// glob, respects build constraints: a build-excluded test never compiles, so it
-// can't break and must not block the fix. External test packages (p_test) load
-// separately and never rewrite p — their literals are the documented
-// cross-package limitation.
+// Keys on loaded files, not a disk glob, so a build-excluded test — which never
+// compiles and can't break — doesn't block the fix. External p_test packages
+// load separately and never rewrite p (the documented cross-package limitation).
 func deferToTestVariant(pass *analysis.Pass) bool {
 	dir := ""
 	seen := make(map[string]struct{}, len(pass.Files))
@@ -625,30 +655,55 @@ func deferToTestVariant(pass *analysis.Pass) bool {
 		return false
 	}
 
-	deferred := false
-	// The shared FileSet spans all variants, so the [p.test] variant's test files
-	// are visible from the base pass here.
-	pass.Fset.Iterate(func(tf *token.File) bool {
+	for _, e := range testFilesByDir(pass.Fset)[dir] {
+		if _, ok := seen[e.name]; ok {
+			continue
+		}
+		// pkgName tells in-package tests from external p_test ones.
+		if e.pkgName == pass.Pkg.Name() {
+			return true
+		}
+	}
+	return false
+}
+
+// testFileEntry is a loaded *_test.go and its package clause, letting
+// deferToTestVariant skip the external-p_test ones without re-parsing per pass.
+type testFileEntry struct {
+	name    string
+	pkgName string
+}
+
+// testVariantCache memoises the per-FileSet *_test.go scan (keyed by
+// *token.FileSet, value map[dir][]testFileEntry): deferToTestVariant runs on
+// every pass over the shared FileSet, so the walk must not repeat per package.
+// Entries live for the process lifetime, which suits the CLI and golangci-lint.
+var testVariantCache sync.Map // map[*token.FileSet]map[string][]testFileEntry
+
+// testFilesByDir groups fset's *_test.go files by directory, building the map
+// once. The FileSet is fully populated before analysis, so the scan is a safe
+// concurrent read; a racing double-build stores one deterministic result
+// (LoadOrStore, as in readSourceOnce). Unparsable files are dropped.
+func testFilesByDir(fset *token.FileSet) map[string][]testFileEntry {
+	if v, ok := testVariantCache.Load(fset); ok {
+		return v.(map[string][]testFileEntry)
+	}
+	byDir := make(map[string][]testFileEntry)
+	fset.Iterate(func(tf *token.File) bool {
 		name := tf.Name()
-		if !strings.HasSuffix(name, "_test.go") || filepath.Dir(name) != dir {
+		if !strings.HasSuffix(name, "_test.go") {
 			return true
 		}
-		if _, ok := seen[name]; ok {
-			return true
-		}
-		// Package clause distinguishes in-package from external (p_test) tests;
-		// unparsable files can't pin anything.
 		pf, err := parser.ParseFile(token.NewFileSet(), name, nil, parser.PackageClauseOnly)
 		if err != nil || pf.Name == nil {
 			return true
 		}
-		if pf.Name.Name == pass.Pkg.Name() {
-			deferred = true
-			return false
-		}
+		dir := filepath.Dir(name)
+		byDir[dir] = append(byDir[dir], testFileEntry{name: name, pkgName: pf.Name.Name})
 		return true
 	})
-	return deferred
+	actual, _ := testVariantCache.LoadOrStore(fset, byDir)
+	return actual.(map[string][]testFileEntry)
 }
 
 // canonicalStructType collapses every syntactic form of a struct reference onto
@@ -867,6 +922,44 @@ func optimalOrder(str *types.Struct, sizes *gcSizes) (indexes []int, optSize, op
 	}
 	optSize, optPtrdata = measureLayout(elems)
 	return indexes, optSize, optPtrdata
+}
+
+// layoutDependsOnTypeParam reports whether str's layout would differ across
+// instantiations, i.e. a type parameter sits in a by-value field position. Such
+// a field is sized from the constraint underlying (T any → interface{}), so its
+// figures are per-instantiation guesses and run() suppresses the diagnostic.
+// A type parameter behind a pointer/slice/map/chan/func/interface has a fixed
+// layout and does not count.
+func layoutDependsOnTypeParam(str *types.Struct) bool {
+	return typeParamInLayout(str, make(map[types.Type]struct{}))
+}
+
+// typeParamInLayout is layoutDependsOnTypeParam's recursion. It matches a
+// *types.TypeParam before calling Underlying() — which for a type parameter is
+// its constraint's interface, not the parameter — and recurses only into arrays
+// and structs (by-value holders). seen breaks cycles in recursive types.
+func typeParamInLayout(t types.Type, seen map[types.Type]struct{}) bool {
+	if t == nil {
+		return false
+	}
+	if _, ok := types.Unalias(t).(*types.TypeParam); ok {
+		return true
+	}
+	if _, ok := seen[t]; ok {
+		return false
+	}
+	seen[t] = struct{}{}
+	switch u := t.Underlying().(type) {
+	case *types.Array:
+		return typeParamInLayout(u.Elem(), seen)
+	case *types.Struct:
+		for i := range u.NumFields() {
+			if typeParamInLayout(u.Field(i).Type(), seen) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Code below based on go/types.StdSizes.
@@ -1089,9 +1182,11 @@ func (s *gcSizes) ptrdata(T types.Type) int64 {
 // ptrdataUncached is the algorithm behind ptrdata. strings/unsafe.Pointer are
 // one pointer word; chan/map/pointer/func/slice one word; interfaces two;
 // arrays scale to the last pointer-bearing element; structs track the offset
-// past the last pointer field. The default arm (one word) catches unenumerated
-// kinds — notably *types.TypeParam, whose Underlying() is itself — staying
-// conservative (over-reports) rather than panicking.
+// past the last pointer field. The default arm is a conservative one-word
+// fallback: effectively unreachable, since Underlying() resolves named types,
+// aliases, and type parameters first (a type parameter's Underlying() is its
+// constraint's *types.Interface, caught above), but it over-reports rather than
+// panicking on any future kind.
 func (s *gcSizes) ptrdataUncached(T types.Type) int64 {
 	switch t := T.Underlying().(type) {
 	case *types.Basic:
@@ -1135,7 +1230,7 @@ func (s *gcSizes) ptrdataUncached(T types.Type) int64 {
 		return p
 	}
 
-	// Conservative one-word fallback for unenumerated kinds (e.g. uninstantiated TypeParam).
+	// Conservative one-word fallback; see the doc comment on unreachability.
 	return s.WordSize
 }
 
@@ -1205,10 +1300,12 @@ func normalizeExcludePaths(wd string, paths []string) ([]string, error) {
 }
 
 // isExcluded reports whether fn is excluded by the dir or file glob sets
-// (filepath.Match semantics); the dir set is tested against every ancestor so
-// "vendor" excludes the whole subtree. On a Rel/Match error it logs and returns
-// true — failing toward "excluded" so unclassifiable paths don't get spurious
-// diagnostics. O((ancestors × dirs) + files).
+// (filepath.Match). Each ancestor of fn's wd-relative path is tested by full
+// path and, for separator-free patterns, by basename — so a bare name
+// ("vendor", "internal") excludes that directory at any depth while a
+// slash-bearing pattern ("a/internal") matches only that exact relative path. A
+// Rel/Match error logs and returns true (fail toward excluded).
+// O((ancestors × dirs) + files).
 func isExcluded(wd, fn string, excludeDirs, excludeFiles []string) bool {
 	relfn, err := filepath.Rel(wd, fn)
 	if err != nil {
@@ -1220,13 +1317,25 @@ func isExcluded(wd, fn string, excludeDirs, excludeFiles []string) bool {
 		for {
 			for _, excludeDir := range excludeDirs {
 				// filepath.Match doesn't clean; covers callers that skip normalizeExcludePaths.
-				match, err := filepath.Match(filepath.Clean(excludeDir), ancestor)
+				pattern := filepath.Clean(excludeDir)
+				match, err := filepath.Match(pattern, ancestor)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "%v %s: %v\n", ErrPreFilterFiles, fn, err)
 					return true
 				}
 				if match {
 					return true
+				}
+				// Bare names also match by basename, excluding that dir at any depth.
+				if !strings.ContainsRune(pattern, filepath.Separator) {
+					match, err := filepath.Match(pattern, filepath.Base(ancestor))
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "%v %s: %v\n", ErrPreFilterFiles, fn, err)
+						return true
+					}
+					if match {
+						return true
+					}
 				}
 			}
 			parent := filepath.Dir(ancestor)

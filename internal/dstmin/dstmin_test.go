@@ -1073,3 +1073,48 @@ type (
 		}
 	}
 }
+
+// TestDecorateFileSrc_FileNotInFsetIsSafe pins the nil-*token.File guard: a file
+// absent from dec.Fset must return undecorated (Fprint emits src verbatim), not
+// nil-deref in offsetOf. Covers direct callers, which DecorateFile can't guard.
+func TestDecorateFileSrc_FileNotInFsetIsSafe(t *testing.T) {
+	src := "package p\n\ntype S struct {\n\ta bool\n\tb int64\n\tc bool\n}\n"
+	// Parse against one FileSet, decorate against a fresh, empty one so
+	// dec.Fset.File(f.Pos()) returns nil.
+	parseFset := token.NewFileSet()
+	f, err := parser.ParseFile(parseFset, "input.go", src, parser.ParseComments|parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	dec := NewDecorator(token.NewFileSet())
+	var df *File
+	if !panicsNot(func() { df = dec.DecorateFileSrc(f, []byte(src)) }) {
+		t.Fatal("DecorateFileSrc panicked on a file absent from dec.Fset")
+	}
+	if df == nil {
+		t.Fatal("DecorateFileSrc returned nil *File")
+	}
+	if len(df.structs) != 0 {
+		t.Errorf("df.structs len = %d, want 0 (no positions to splice against)", len(df.structs))
+	}
+
+	var buf bytes.Buffer
+	if err := Fprint(&buf, df); err != nil {
+		t.Fatalf("Fprint: %v", err)
+	}
+	if buf.String() != src {
+		t.Errorf("Fprint emitted %q, want verbatim source %q", buf.String(), src)
+	}
+}
+
+// panicsNot reports whether fn ran to completion without panicking.
+func panicsNot(fn func()) (ok bool) {
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+	fn()
+	return true
+}

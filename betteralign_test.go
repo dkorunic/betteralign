@@ -15,6 +15,8 @@ import (
 	"github.com/dkorunic/betteralign"
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/analysistest"
+	"golang.org/x/tools/go/analysis/checker"
+	"golang.org/x/tools/go/packages"
 	"gotest.tools/v3/golden"
 )
 
@@ -89,6 +91,17 @@ func TestGreenTeaWording(t *testing.T) {
 	testdata := analysistest.TestData()
 	analyzer := NewTestAnalyzer()
 	analysistest.Run(t, testdata, analyzer, "greentea")
+}
+
+// TestGenericLayoutSuppressed pins that a struct whose layout depends on a type
+// parameter (a by-value type-param field or array-of-type-param) is not
+// reported — its size/ptrdata would be a per-instantiation guess — while a
+// non-generic struct and a generic struct whose fields have fixed layout (a
+// pointer to the type param) are still reported.
+func TestGenericLayoutSuppressed(t *testing.T) {
+	testdata := analysistest.TestData()
+	analyzer := NewTestAnalyzer()
+	analysistest.Run(t, testdata, analyzer, "generics")
 }
 
 func TestApply(t *testing.T) {
@@ -207,10 +220,46 @@ func TestApplyViaFixAlias(t *testing.T) {
 	}
 }
 
-// TestApplyDefersPositionalLiteralInTestFile is the regression for the issue #36
-// sibling: a struct pinned by a positional literal that lives only in an
-// in-package test file must survive -fix — the base pass, blind to the test
-// file, must defer to the [pkg.test] variant.
+// analyzeWithFix loads pattern from the GOPATH-style testdata tree and runs the
+// analyzer with -fix via checker.Analyze. Unlike analysistest.Run it doesn't
+// enforce `// want` comments — needed when the base pass and its [pkg.test]
+// variant must diverge on whether a shared file reports a diagnostic, which the
+// per-root want model can't express. The -fix rewrites still happen as a side
+// effect, as under analysistest.Run.
+func analyzeWithFix(t *testing.T, pattern string) *checker.Graph {
+	t.Helper()
+	dir := analysistest.TestData()
+	mode := packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles |
+		packages.NeedImports | packages.NeedTypes | packages.NeedTypesSizes |
+		packages.NeedSyntax | packages.NeedTypesInfo | packages.NeedDeps | packages.NeedModule
+	cfg := &packages.Config{
+		Mode:  mode,
+		Dir:   dir,
+		Tests: true,
+		Env:   append(os.Environ(), "GOPATH="+dir, "GO111MODULE=off", "GOWORK=off"),
+	}
+	pkgs, err := packages.Load(cfg, pattern)
+	if err != nil {
+		t.Fatalf("load %s: %v", pattern, err)
+	}
+	analyzer := NewTestAnalyzer()
+	var fix bool
+	analyzer.Flags.BoolVar(&fix, "fix", false, "alias for -apply (test harness only)")
+	if err := analyzer.Flags.Set("fix", "true"); err != nil {
+		t.Fatal(err)
+	}
+	g, err := checker.Analyze([]*analysis.Analyzer{analyzer}, pkgs, nil)
+	if err != nil {
+		t.Fatalf("analyze %s: %v", pattern, err)
+	}
+	return g
+}
+
+// TestApplyDefersPositionalLiteralInTestFile is the issue #36 sibling
+// regression: a struct pinned by a positional literal in an in-package test
+// file must survive -fix (the base pass defers to the [pkg.test] variant), and
+// the base pass must stay silent while the variant reports the caveat. That
+// per-root divergence is why it uses checker.Analyze, not analysistest.Run.
 func TestApplyDefersPositionalLiteralInTestFile(t *testing.T) {
 	srcDir := filepath.Join("testdata", "src")
 	workDir := filepath.Join(srcDir, "litguard")
@@ -243,13 +292,8 @@ func TestApplyDefersPositionalLiteralInTestFile(t *testing.T) {
 		}
 	}
 
-	testdata := analysistest.TestData()
-	analyzer := NewTestAnalyzer()
-	var fix bool
-	analyzer.Flags.BoolVar(&fix, "fix", false, "alias for -apply (test harness only)")
-	_ = analyzer.Flags.Set("fix", "true")
-
-	analysistest.Run(t, testdata, analyzer, filepath.Join(filepath.Base(tmpDir), "litguard"))
+	pattern := filepath.Join(filepath.Base(tmpDir), "litguard")
+	g := analyzeWithFix(t, pattern)
 
 	got, err := os.ReadFile(filepath.Join(tmpWorkDir, "lit.go"))
 	if err != nil {
@@ -257,6 +301,36 @@ func TestApplyDefersPositionalLiteralInTestFile(t *testing.T) {
 	}
 	if string(got) != orig["lit.go"] {
 		t.Errorf("lit.go was rewritten despite a positional literal in the test file:\n--- got:\n%s\n--- want (unchanged):\n%s", got, orig["lit.go"])
+	}
+
+	// The base pass must stay silent; only the [pkg.test] variant reports, with
+	// the caveat. Otherwise the two roots emit a duplicate diagnostic.
+	var base, variant *checker.Action
+	for _, act := range g.Roots {
+		switch id := act.Package.ID; {
+		case id == pattern:
+			base = act
+		case strings.HasPrefix(id, pattern+" [") && strings.HasSuffix(id, ".test]"):
+			variant = act
+		}
+	}
+	if base == nil {
+		t.Fatalf("base package %q not among roots", pattern)
+	}
+	if variant == nil {
+		t.Fatalf("[pkg.test] variant for %q not among roots", pattern)
+	}
+	if n := len(base.Diagnostics); n != 0 {
+		t.Errorf("base pass reported %d diagnostics; want 0 (it must defer to the test variant): %v", n, base.Diagnostics)
+	}
+	caveat := false
+	for _, d := range variant.Diagnostics {
+		if strings.Contains(d.Message, "reorder skipped") {
+			caveat = true
+		}
+	}
+	if !caveat {
+		t.Errorf("test variant did not report the caveat diagnostic; got %v", variant.Diagnostics)
 	}
 }
 

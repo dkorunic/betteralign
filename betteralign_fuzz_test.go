@@ -6,6 +6,7 @@
 package betteralign
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -67,15 +68,21 @@ func addFuzzCorpus(f *testing.F, root string) {
 	})
 }
 
-// typeCheckFuzzInput parses and type-checks src. The Importer is nil so any
-// imports resolve to errors-but-non-nil packages; the resulting *types.Package
-// is still usable for struct introspection. Returns nil on parser failure
-// (uninteresting input). Bytes are fed to parser.ParseFile directly via its
-// src parameter — no temp file is created per exec, which matters at fuzz
-// throughput where 56k tempdir create/cleanup cycles/sec would otherwise
-// hammer the disk. Panics from go/types itself (malformed generics, recursive
-// alias chains — known upstream defects) are recovered and reported as Skip
-// so the fuzzer keeps hunting for real betteralign bugs.
+// typeCheckFuzzSource parses and type-checks src, returning the package or, for
+// uninteresting input, a nil package and a non-empty skip reason. It never
+// touches *testing.T, so — unlike typeCheckFuzzInput — it is safe to call from a
+// spawned goroutine (see replayHarnessCrashers, whose watchdog type-checks off
+// the test goroutine).
+//
+// The Importer is nil so any imports resolve to errors-but-non-nil packages; the
+// resulting *types.Package is still usable for struct introspection. The skip
+// reason is "input not valid Go" on parser failure. Bytes are fed to
+// parser.ParseFile directly via its src parameter — no temp file is created per
+// exec, which matters at fuzz throughput where 56k tempdir create/cleanup
+// cycles/sec would otherwise hammer the disk. Panics from go/types itself
+// (malformed generics, recursive alias chains — known upstream defects) are
+// recovered and returned as a skip reason so the fuzzer keeps hunting for real
+// betteralign bugs.
 //
 // IgnoreFuncBodies: true bypasses constant folding inside function bodies
 // (BUG-44). Adversarial inputs like `134291756e439044200-4-5-…` produce
@@ -84,12 +91,11 @@ func addFuzzCorpus(f *testing.F, root string) {
 // and tripped a fuzzing watchdog. The fuzz invariants only look at
 // package-scope named types via pkg.Scope().Names(), so skipping bodies
 // is invisible to every assertion the harness makes.
-func typeCheckFuzzInput(t *testing.T, src string) (pkg *types.Package) {
-	t.Helper()
+func typeCheckFuzzSource(src string) (pkg *types.Package, skip string) {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "input.go", src, parser.ParseComments|parser.SkipObjectResolution)
 	if err != nil {
-		t.Skip("input not valid Go")
+		return nil, "input not valid Go"
 	}
 	conf := types.Config{
 		Error:            func(error) {}, // swallow type errors; partial info is enough
@@ -98,10 +104,24 @@ func typeCheckFuzzInput(t *testing.T, src string) (pkg *types.Package) {
 	}
 	defer func() {
 		if r := recover(); r != nil {
-			t.Skipf("go/types panic (upstream): %v", r)
+			pkg, skip = nil, fmt.Sprintf("go/types panic (upstream): %v", r)
 		}
 	}()
 	pkg, _ = conf.Check("fuzz", fset, []*ast.File{file}, nil)
+	return pkg, ""
+}
+
+// typeCheckFuzzInput type-checks src for the fuzz targets, delegating to
+// typeCheckFuzzSource and translating an uninteresting-input signal into t.Skip.
+// It must be called from the goroutine running the fuzz/test function, because
+// t.Skip calls SkipNow; the crasher-replay harness type-checks off the test
+// goroutine and so calls typeCheckFuzzSource directly instead.
+func typeCheckFuzzInput(t *testing.T, src string) *types.Package {
+	t.Helper()
+	pkg, skip := typeCheckFuzzSource(src)
+	if skip != "" {
+		t.Skip(skip)
+	}
 	return pkg
 }
 
