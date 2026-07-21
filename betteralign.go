@@ -236,17 +236,14 @@ func init() {
 // skipped. Safe across concurrent passes; flag slices are cloned because hosts
 // like golangci-lint may share flag state.
 func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
-	// Hand the whole package to the [pkg.test] variant when it exists: the base
-	// pass is blind to in-package test files, so it could rewrite a struct a
-	// test's positional literal pins, and would emit a duplicate, caveat-less
-	// diagnostic. The variant sees a superset of files, so nothing is lost.
-	if deferToTestVariant(pass) {
-		return nil, nil
-	}
-
 	apply := cfg.apply
 	if fixRequested(pass) {
 		apply = true
+	}
+	// Defer only -apply, never reporting, to the test variant; see
+	// deferToTestVariant.
+	if apply && deferToTestVariant(pass) {
+		apply = false
 	}
 	testFiles := cfg.testFiles
 	generatedFiles := cfg.generatedFiles
@@ -626,14 +623,16 @@ func collectPositionalUsers(inspect *inspector.Inspector, pass *analysis.Pass) m
 	return users
 }
 
-// deferToTestVariant reports whether this pass should hand the whole package to
-// the in-package test variant, skipping both reporting and -apply.
+// deferToTestVariant reports whether this pass should skip -apply and leave the
+// rewrite to the in-package test variant.
 //
 // The base pass can't see in-package *_test.go files, so a positional literal
-// there is invisible: it would rewrite the pinned struct (breaking the test)
-// and duplicate the variant's diagnostic without its caveat. The [p.test]
-// variant sees those tests plus the same non-test files, so deferring loses
-// nothing.
+// there is invisible; it must not rewrite a struct such a literal pins. The
+// [p.test] variant sees those tests and owns the rewrite. Only -apply is
+// deferred, not reporting: the base pass still reports, so healthy non-test code
+// stays covered even when the driver skips the variant as ill-typed. The
+// trade-off is a possible duplicate diagnostic (base plain, variant caveated)
+// for a struct pinned by a test literal.
 //
 // Keys on loaded files, not a disk glob, so a build-excluded test — which never
 // compiles and can't break — doesn't block the fix. External p_test packages

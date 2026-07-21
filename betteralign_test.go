@@ -257,9 +257,10 @@ func analyzeWithFix(t *testing.T, pattern string) *checker.Graph {
 
 // TestApplyDefersPositionalLiteralInTestFile is the issue #36 sibling
 // regression: a struct pinned by a positional literal in an in-package test
-// file must survive -fix (the base pass defers to the [pkg.test] variant), and
-// the base pass must stay silent while the variant reports the caveat. That
-// per-root divergence is why it uses checker.Analyze, not analysistest.Run.
+// file must survive -fix — the base pass defers -apply to the [pkg.test]
+// variant. It also pins the reporting split: the base reports plain, the
+// variant reports the caveat. That per-root divergence needs checker.Analyze
+// rather than analysistest.Run.
 func TestApplyDefersPositionalLiteralInTestFile(t *testing.T) {
 	srcDir := filepath.Join("testdata", "src")
 	workDir := filepath.Join(srcDir, "litguard")
@@ -292,7 +293,8 @@ func TestApplyDefersPositionalLiteralInTestFile(t *testing.T) {
 		}
 	}
 
-	pattern := filepath.Join(filepath.Base(tmpDir), "litguard")
+	// act.Package.ID is slash-based even on Windows; match it.
+	pattern := filepath.ToSlash(filepath.Join(filepath.Base(tmpDir), "litguard"))
 	g := analyzeWithFix(t, pattern)
 
 	got, err := os.ReadFile(filepath.Join(tmpWorkDir, "lit.go"))
@@ -303,8 +305,8 @@ func TestApplyDefersPositionalLiteralInTestFile(t *testing.T) {
 		t.Errorf("lit.go was rewritten despite a positional literal in the test file:\n--- got:\n%s\n--- want (unchanged):\n%s", got, orig["lit.go"])
 	}
 
-	// The base pass must stay silent; only the [pkg.test] variant reports, with
-	// the caveat. Otherwise the two roots emit a duplicate diagnostic.
+	// Only -apply is deferred: base reports plain, variant adds the caveat. Both
+	// appear (the accepted duplicate) — see deferToTestVariant.
 	var base, variant *checker.Action
 	for _, act := range g.Roots {
 		switch id := act.Package.ID; {
@@ -320,8 +322,13 @@ func TestApplyDefersPositionalLiteralInTestFile(t *testing.T) {
 	if variant == nil {
 		t.Fatalf("[pkg.test] variant for %q not among roots", pattern)
 	}
-	if n := len(base.Diagnostics); n != 0 {
-		t.Errorf("base pass reported %d diagnostics; want 0 (it must defer to the test variant): %v", n, base.Diagnostics)
+	if len(base.Diagnostics) == 0 {
+		t.Errorf("base pass reported nothing; it must still cover the struct")
+	}
+	for _, d := range base.Diagnostics {
+		if strings.Contains(d.Message, "reorder skipped") {
+			t.Errorf("base pass emitted the caveat, which it can't know: %q", d.Message)
+		}
 	}
 	caveat := false
 	for _, d := range variant.Diagnostics {
@@ -331,6 +338,58 @@ func TestApplyDefersPositionalLiteralInTestFile(t *testing.T) {
 	}
 	if !caveat {
 		t.Errorf("test variant did not report the caveat diagnostic; got %v", variant.Diagnostics)
+	}
+}
+
+// TestReportsHealthyCodeWhenTestFileIllTyped is the regression guard for the
+// deferral: a healthy non-test file must still be reported when an in-package
+// test file fails to type-check. The driver skips the ill-typed [pkg.test]
+// variant, so if the base pass deferred *reporting* too the struct would go
+// silent. Only -apply is deferred, so the base pass still reports it.
+func TestReportsHealthyCodeWhenTestFileIllTyped(t *testing.T) {
+	srcDir := filepath.Join("testdata", "src")
+	tmpDir, err := os.MkdirTemp(srcDir, "illtyped-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	pkgDir := filepath.Join(tmpDir, "illtyped")
+	if err := os.Mkdir(pkgDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	// Healthy non-test file with a misaligned struct.
+	if err := os.WriteFile(filepath.Join(pkgDir, "p.go"),
+		[]byte("package illtyped\n\ntype T struct {\n\tA bool\n\tB int64\n\tC bool\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Valid syntax, type error in the body → the [pkg.test] variant is ill-typed
+	// and skipped, while the base package stays healthy.
+	if err := os.WriteFile(filepath.Join(pkgDir, "p_test.go"),
+		[]byte("package illtyped\n\nvar _ int = \"not an int\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	pattern := filepath.ToSlash(filepath.Join(filepath.Base(tmpDir), "illtyped"))
+	g := analyzeWithFix(t, pattern)
+
+	var base *checker.Action
+	for _, act := range g.Roots {
+		if act.Package.ID == pattern {
+			base = act
+		}
+	}
+	if base == nil {
+		t.Fatalf("base package %q not among roots", pattern)
+	}
+	found := false
+	for _, d := range base.Diagnostics {
+		if strings.Contains(d.Message, "could be") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("base pass reported no diagnostic for the healthy struct; got %v (regression: an ill-typed test file blanked healthy code)", base.Diagnostics)
 	}
 }
 
