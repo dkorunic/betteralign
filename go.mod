@@ -1,6 +1,6 @@
 module github.com/dkorunic/betteralign
 
-go 1.26
+go 1.27
 
 require (
 	github.com/KimMachineGun/automemlimit v0.7.5
