@@ -952,8 +952,8 @@ func typeParamInLayout(t types.Type, seen map[types.Type]struct{}) bool {
 	case *types.Array:
 		return typeParamInLayout(u.Elem(), seen)
 	case *types.Struct:
-		for i := range u.NumFields() {
-			if typeParamInLayout(u.Field(i).Type(), seen) {
+		for field := range u.Fields() {
+			if typeParamInLayout(field.Type(), seen) {
 				return true
 			}
 		}
