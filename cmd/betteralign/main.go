@@ -22,7 +22,7 @@ import (
 const maxMemRatio = 0.9
 
 func main() {
-	_, _ = memlimit.SetGoMemLimitWithOpts(
+	_, _ = memlimit.Set(
 		memlimit.WithRatio(maxMemRatio),
 		memlimit.WithProvider(
 			memlimit.ApplyFallback(
