@@ -5,7 +5,7 @@ go 1.27
 require (
 	github.com/KimMachineGun/automemlimit v1.0.0
 	github.com/google/renameio/v2 v2.0.2
-	golang.org/x/tools v0.49.0
+	golang.org/x/tools v0.50.0
 	gotest.tools/v3 v3.5.2
 )
 
