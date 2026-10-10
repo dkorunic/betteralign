@@ -8,7 +8,7 @@
 
 ## About
 
-**betteralign** is a tool that detects structs that would use less memory if their fields were reordered, and optionally rewrites them.
+**betteralign** detects and fixes suboptimal struct field layout in Go: it reduces padding and GC pointer bytes, and rewrites files while preserving comments. It is a drop-in replacement for `fieldalignment`.
 
 It is a fork of the official Go [fieldalignment](https://cs.opensource.google/go/x/tools/+/master:go/analysis/passes/fieldalignment/fieldalignment.go) tool, with the bulk of the alignment logic unchanged. Its notable differences group into a few themes:
 
