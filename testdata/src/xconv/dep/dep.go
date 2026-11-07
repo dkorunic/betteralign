@@ -40,3 +40,33 @@ type Holder struct {
 		O bool
 	}
 }
+
+// Named types whose fields or elements are unnamed structs: a positional or
+// element literal assigns to them with no field reference to follow.
+type Wrapped struct {
+	W struct {
+		P1 bool
+		P2 int64
+		P3 bool
+	}
+}
+
+type List []struct {
+	Q1 bool
+	Q2 int64
+	Q3 bool
+}
+
+// Deep is reachable only through Shallow's field: an importer that never
+// names Deep can't assign to its unnamed field.
+type Shallow struct {
+	In Deep
+}
+
+type Deep struct {
+	F struct {
+		Z1 bool
+		Z2 int64
+		Z3 bool
+	}
+}

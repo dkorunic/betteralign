@@ -118,6 +118,45 @@ func TestGcSizesAlignofStruct(t *testing.T) {
 	}
 }
 
+// TestGcSizesAlign64Marker pins gc's align64 rule: a struct with a field of
+// sync/atomic's (or internal/runtime/atomic's) align64 type is 8-byte aligned
+// even where MaxAlign is 4. Without it, atomic.Int64 measured 4-aligned on
+// 386: struct{bool; atomic.Int64; bool} reported 16 bytes (gc: 24), and a
+// 32-bit rewrite could grow a struct by placing the word after a 4-byte field.
+func TestGcSizesAlign64Marker(t *testing.T) {
+	sizes32 := newGCSizes(4, 4)
+	for _, path := range []string{"sync/atomic", "internal/runtime/atomic"} {
+		pkg := types.NewPackage(path, "atomic")
+		align64 := types.NewNamed(types.NewTypeName(token.NoPos, pkg, "align64", nil), types.NewStruct(nil, nil), nil)
+		int64Typ := types.NewNamed(types.NewTypeName(token.NoPos, pkg, "Int64", nil), types.NewStruct([]*types.Var{
+			types.NewField(token.NoPos, pkg, "_", align64, false),
+			types.NewField(token.NoPos, pkg, "v", types.Typ[types.Int64], false),
+		}, nil), nil)
+		if got := sizes32.Alignof(int64Typ); got != 8 {
+			t.Errorf("%s: Alignof(Int64) on 386 = %d, want 8", path, got)
+		}
+		mixed := types.NewStruct([]*types.Var{
+			types.NewField(token.NoPos, nil, "b", types.Typ[types.Bool], false),
+			types.NewField(token.NoPos, nil, "x", int64Typ, false),
+			types.NewField(token.NoPos, nil, "c", types.Typ[types.Bool], false),
+		}, nil)
+		if got := sizes32.Sizeof(mixed); got != 24 {
+			t.Errorf("%s: Sizeof(struct{bool; Int64; bool}) on 386 = %d, want 24", path, got)
+		}
+	}
+
+	// The marker counts only from those packages: a user's align64 is a plain
+	// empty struct.
+	own := types.NewNamed(types.NewTypeName(token.NoPos, types.NewPackage("example.com/p", "p"), "align64", nil), types.NewStruct(nil, nil), nil)
+	st := types.NewStruct([]*types.Var{
+		types.NewField(token.NoPos, nil, "_", own, false),
+		types.NewField(token.NoPos, nil, "v", types.Typ[types.Int64], false),
+	}, nil)
+	if got := sizes32.Alignof(st); got != 4 {
+		t.Errorf("Alignof(struct{_ p.align64; v int64}) on 386 = %d, want 4", got)
+	}
+}
+
 // ─── Layer 3: gcSizes.Sizeof (BUG-04 … BUG-08) ────────────────────────────────
 
 // TestGcSizesSizeofString verifies that string is measured as two words.

@@ -62,3 +62,29 @@ func assign(p P, v V, h H) R {
 	x.Field = h
 	return dep.Result()
 }
+
+type W struct { // want `reorder skipped: identical unnamed struct type at .*dep.go`
+	P1 bool
+	P2 int64
+	P3 bool
+}
+
+type Q struct { // want `reorder skipped: identical unnamed struct type at .*dep.go`
+	Q1 bool
+	Q2 int64
+	Q3 bool
+}
+
+func literals(w W, q Q) (dep.Wrapped, dep.List) {
+	return dep.Wrapped{w}, dep.List{q}
+}
+
+// Identical to the unnamed struct inside dep.Deep, which this package never
+// names, so nothing links them: Z still reorders.
+type Z struct { // want `struct of size 24 could be 16$`
+	Z1 bool
+	Z2 int64
+	Z3 bool
+}
+
+var _ dep.Shallow

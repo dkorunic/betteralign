@@ -142,7 +142,9 @@ cache-line pad) is skipped the same way, since its layout is deliberate.
 
 A struct the package depends on in field order is reported but never
 rewritten: one whose field offset is taken with ` + "`unsafe.Offsetof`" + `, one
-converted to or from another struct type, one identical to an unnamed struct
+whose field is passed to a 64-bit ` + "`sync/atomic`" + ` function (which needs it
+8-byte aligned on 32-bit platforms), one converted to or from another struct
+type, one identical to an unnamed struct
 type it may be assigned to (including an alias ` + "`type A = struct{...}`" + `), one
 converted to or from ` + "`unsafe.Pointer`" + ` (type punning), and one passed to
 ` + "`encoding/binary`" + ` or ` + "`encoding/asn1`" + ` (whose wire format is field order).
@@ -754,7 +756,22 @@ const (
 	pinUnsafe     = "unsafe.Pointer conversion at %s depends on field layout"
 	pinBinary     = "encoding/binary call at %s depends on field order"
 	pinASN1       = "encoding/asn1 call at %s depends on field order"
+	pinAtomic     = "64-bit atomic access at %s needs its 8-byte alignment on 32-bit platforms"
 )
+
+// isAtomic64Func reports whether fn is one of sync/atomic's 64-bit functions
+// (AddInt64, LoadUint64, CompareAndSwapInt64, ...). Their operand must be
+// 8-byte aligned on 386, arm and 32-bit mips; the typed atomic.Int64 and
+// atomic.Uint64 are aligned by the compiler and need no pin.
+func isAtomic64Func(fn *types.Func) bool {
+	if fn == nil || fn.Pkg() == nil || fn.Pkg().Path() != "sync/atomic" {
+		return false
+	}
+	if sig, ok := fn.Type().(*types.Signature); !ok || sig.Recv() != nil {
+		return false
+	}
+	return strings.HasSuffix(fn.Name(), "Int64") || strings.HasSuffix(fn.Name(), "Uint64")
+}
 
 // orderCodecs are the functions that encode or decode struct fields in
 // declaration order, by package path; the value is the pin message.
@@ -789,6 +806,10 @@ var unsafeOffsetof = types.Unsafe.Scope().Lookup("Offsetof")
 //     requires identical underlying types, field order included, so
 //     reordering one side alone (the other ignored, excluded or pinned) breaks
 //     the build. Both sides are pinned.
+//   - &x.f passed to a 64-bit sync/atomic function (AddInt64, LoadUint64,
+//     ...): 386, arm and 32-bit mips need f 8-byte aligned, which only the
+//     first word of an allocation guarantees, so x's layout (and every
+//     embedded struct on the path) is deliberate.
 //   - an unnamed struct type identical to another struct type in the package
 //     (a parameter, variable or alias `type A = struct{...}`): assignability
 //     between them rests on identical field order. Both are pinned.
@@ -841,6 +862,25 @@ func collectLayoutPins(inspect *inspector.Inspector, pass *analysis.Pass, sizes 
 				}
 			}
 			return
+		}
+	}
+
+	// pinFieldPath pins the struct of field selector sel and, for a promoted
+	// field, every embedded struct on the path to it: each one's layout places
+	// the field. The field's own type is not pinned.
+	pinFieldPath := func(sel *ast.SelectorExpr, p layoutPin) {
+		selection := pass.TypesInfo.Selections[sel]
+		if selection == nil || selection.Kind() != types.FieldVal {
+			return
+		}
+		t := selection.Recv()
+		for _, idx := range selection.Index() {
+			st := canonicalStructType(t)
+			if st == nil || idx >= st.NumFields() {
+				return
+			}
+			pin(st, p)
+			t = st.Field(idx).Type()
 		}
 	}
 
@@ -901,6 +941,35 @@ func collectLayoutPins(inspect *inspector.Inspector, pass *analysis.Pass, sizes 
 				}
 				return
 			}
+			// The 64-bit function API (AddInt64(&s.n, 1), ...) needs the word
+			// 8-byte aligned on 32-bit platforms, which only the first word of
+			// an allocation guarantees, so the layout around it is deliberate.
+			if isAtomic64Func(fn) && len(call.Args) > 0 {
+				if addr, ok := ast.Unparen(call.Args[0]).(*ast.UnaryExpr); ok && addr.Op == token.AND {
+					// &s.f, or an element of an array field (&s.f[i]), which
+					// the array's offset places; a slice's or pointed-to
+					// array's elements live in their own allocation.
+					x := ast.Unparen(addr.X)
+					for {
+						ix, ok := x.(*ast.IndexExpr)
+						if !ok {
+							break
+						}
+						t := pass.TypesInfo.TypeOf(ix.X)
+						if t == nil {
+							break
+						}
+						if _, isArray := types.Unalias(t).Underlying().(*types.Array); !isArray {
+							break
+						}
+						x = ast.Unparen(ix.X)
+					}
+					if sel, ok := x.(*ast.SelectorExpr); ok {
+						pinFieldPath(sel, layoutPin{format: pinAtomic, pos: call.Pos()})
+					}
+				}
+				return
+			}
 			if len(call.Args) != 1 {
 				return
 			}
@@ -940,22 +1009,8 @@ func collectLayoutPins(inspect *inspector.Inspector, pass *analysis.Pass, sizes 
 			if typeutil.Callee(pass.TypesInfo, call) != unsafeOffsetof {
 				return
 			}
-			sel, ok := ast.Unparen(call.Args[0]).(*ast.SelectorExpr)
-			if !ok {
-				return
-			}
-			selection := pass.TypesInfo.Selections[sel]
-			if selection == nil || selection.Kind() != types.FieldVal {
-				return
-			}
-			t := selection.Recv()
-			for _, idx := range selection.Index() {
-				st := canonicalStructType(t)
-				if st == nil || idx >= st.NumFields() {
-					return
-				}
-				pin(st, layoutPin{format: pinOffsetof, pos: call.Pos()})
-				t = st.Field(idx).Type()
+			if sel, ok := ast.Unparen(call.Args[0]).(*ast.SelectorExpr); ok {
+				pinFieldPath(sel, layoutPin{format: pinOffsetof, pos: call.Pos()})
 			}
 			return
 		}
@@ -990,47 +1045,65 @@ func collectLayoutPins(inspect *inspector.Inspector, pass *analysis.Pass, sizes 
 		}
 	}
 	slices.SortFunc(foreign, func(a, b types.Object) int { return cmp.Compare(a.Pos(), b.Pos()) })
-	walked := make(map[types.Type]bool)
-	var addUnnamed func(t types.Type, pos token.Pos)
-	addUnnamed = func(t types.Type, pos token.Pos) {
+	// A named type the package references is opened one level, its fields
+	// or elements: a positional dep.Holder{h} or an element of dep.List{e}
+	// assigns to them with no field reference of its own. Named types inside
+	// it are not opened, which keeps the walk to what the package references
+	// rather than its whole dependency graph. inNamed is part of the memo key,
+	// so a type first seen inside another one is still opened when referenced.
+	type walkKey struct {
+		t       types.Type
+		inNamed bool
+	}
+	walked := make(map[walkKey]bool)
+	var addUnnamed func(t types.Type, pos token.Pos, inNamed bool)
+	addUnnamed = func(t types.Type, pos token.Pos, inNamed bool) {
 		t = types.Unalias(t)
-		if walked[t] {
+		if _, ok := t.(*types.Named); ok && inNamed {
 			return
 		}
-		walked[t] = true
+		if walked[walkKey{t, inNamed}] {
+			return
+		}
+		walked[walkKey{t, inNamed}] = true
 		switch t := t.(type) {
+		case *types.Named:
+			if st, ok := t.Underlying().(*types.Struct); ok {
+				for f := range st.Fields() {
+					addUnnamed(f.Type(), pos, true)
+				}
+			} else {
+				addUnnamed(t.Underlying(), pos, true)
+			}
 		case *types.Struct:
+			// Its fields need no walk: assigning to one goes through the field,
+			// which has its own Uses entry, or spells the type in this package.
 			if _, local := allPos[t]; !local && t.NumFields() > 0 {
 				unnamed = append(unnamed, t)
 				allPos[t] = pos
 			}
-			for f := range t.Fields() {
-				addUnnamed(f.Type(), pos)
-			}
 		case *types.Pointer:
-			addUnnamed(t.Elem(), pos)
+			addUnnamed(t.Elem(), pos, inNamed)
 		case *types.Slice:
-			addUnnamed(t.Elem(), pos)
+			addUnnamed(t.Elem(), pos, inNamed)
 		case *types.Array:
-			addUnnamed(t.Elem(), pos)
+			addUnnamed(t.Elem(), pos, inNamed)
 		case *types.Chan:
-			addUnnamed(t.Elem(), pos)
+			addUnnamed(t.Elem(), pos, inNamed)
 		case *types.Map:
-			addUnnamed(t.Key(), pos)
-			addUnnamed(t.Elem(), pos)
+			addUnnamed(t.Key(), pos, inNamed)
+			addUnnamed(t.Elem(), pos, inNamed)
 		case *types.Signature:
 			for v := range t.Params().Variables() {
-				addUnnamed(v.Type(), pos)
+				addUnnamed(v.Type(), pos, inNamed)
 			}
 			for v := range t.Results().Variables() {
-				addUnnamed(v.Type(), pos)
+				addUnnamed(v.Type(), pos, inNamed)
 			}
 		}
-		// A *types.Named is its own type, never identical to a struct literal;
-		// its fields are reached through their own Uses entries.
 	}
 	for _, obj := range foreign {
-		addUnnamed(obj.Type(), obj.Pos())
+		addUnnamed(obj.Type(), obj.Pos(), false)
 	}
 
 	// Identity: each unnamed struct type pins every distinct identical struct
@@ -1584,6 +1657,21 @@ func (s *gcSizes) Alignof(T types.Type) int64 {
 // alignofUncached is the algorithm behind Alignof, split out for nil-cache
 // testing. Per spec: arrays align to their element, structs to the max field
 // alignment, everything else to its size clamped to [1, MaxAlign].
+// isAlign64 reports whether t is the compiler's align64 marker: a field of it
+// makes the enclosing struct 8-byte aligned (cmd/compile's types.CalcSize
+// recognises it only in sync/atomic and the runtime's atomic package).
+func isAlign64(t types.Type) bool {
+	n, ok := types.Unalias(t).(*types.Named)
+	if !ok || n.Obj().Name() != "align64" || n.Obj().Pkg() == nil {
+		return false
+	}
+	switch n.Obj().Pkg().Path() {
+	case "sync/atomic", "internal/runtime/atomic", "runtime/internal/atomic":
+		return true
+	}
+	return false
+}
+
 func (s *gcSizes) alignofUncached(T types.Type) int64 {
 	switch t := T.Underlying().(type) {
 	case *types.Array:
@@ -1593,6 +1681,14 @@ func (s *gcSizes) alignofUncached(T types.Type) int64 {
 		// spec: Alignof(struct) == max(Alignof(fields)), ≥ 1.
 		max := int64(1)
 		for i, nf := 0, t.NumFields(); i < nf; i++ {
+			if isAlign64(t.Field(i).Type()) {
+				// gc forces 8-byte alignment past MaxAlign for atomic.Int64
+				// and friends on 32-bit targets.
+				if max < 8 {
+					max = 8
+				}
+				continue
+			}
 			if a := s.Alignof(t.Field(i).Type()); a > max {
 				max = a
 			}
