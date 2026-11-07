@@ -1,4 +1,4 @@
-//go:build excludedtag
+//go:build ignore
 
 package litexcluded
 

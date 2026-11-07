@@ -38,11 +38,13 @@ import (
 	"fmt"
 	"go/ast"
 	"go/build"
+	"go/build/constraint"
 	"go/parser"
 	"go/token"
 	"go/types"
 	"go/version"
 	"io"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
@@ -496,7 +498,7 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 		// A pinned layout is safe to report, unsafe to mutate.
 		pin, pinned := ensureLayoutPins()[typ]
 		if pinned {
-			message += "; reorder skipped: " + fmt.Sprintf(pin.format, pass.Fset.Position(pin.pos))
+			message += "; reorder skipped: " + fmt.Sprintf(pin.format, pin.where(pass.Fset))
 		}
 		diags = append(diags, pendingDiag{diag: analysis.Diagnostic{
 			Pos:     s.Pos(),
@@ -778,9 +780,20 @@ var fieldSlicePool = sync.Pool{
 
 // layoutPin records why a struct's field order must not change: pos is the
 // offending source position and format the diagnostic suffix, taking pos as %s.
+// at replaces pos for a position outside the pass's FileSet (a file this
+// build excludes, see otherBuildPositional).
 type layoutPin struct {
 	format string
+	at     string
 	pos    token.Pos
+}
+
+// where renders the pin's position for its diagnostic.
+func (p layoutPin) where(fset *token.FileSet) string {
+	if p.at != "" {
+		return p.at
+	}
+	return fset.Position(p.pos).String()
 }
 
 const (
@@ -1141,6 +1154,22 @@ func collectLayoutPins(inspect *inspector.Inspector, pass *analysis.Pass, sizes 
 		addUnnamed(obj.Type(), obj.Pos(), false)
 	}
 
+	// Positional literals in the package's files this build excludes (another
+	// GOOS/GOARCH, an unset tag) are invisible to type checking, yet a reorder
+	// breaks that build or, with compatible field types, silently re-maps its
+	// values. Found syntactically, by type name; after the typed pins, which
+	// win.
+	if dir := packageDir(pass); dir != "" {
+		other := otherBuildPositional(dir, pass.Pkg.Name())
+		for _, name := range slices.Sorted(maps.Keys(other)) {
+			if tn, ok := pass.Pkg.Scope().Lookup(name).(*types.TypeName); ok {
+				if st := canonicalStructType(tn.Type()); st != nil {
+					pin(st, layoutPin{format: pinPositional, at: other[name]})
+				}
+			}
+		}
+	}
+
 	// Identity: each unnamed struct type pins every distinct identical struct
 	// type, and is pinned by it. Identical structs share their field names in
 	// order, so bucketing by them confines types.Identical to real candidates;
@@ -1262,8 +1291,14 @@ func workspaceModules(dir string) []string {
 }
 
 // moduleRoot returns the directory of the go.mod nearest above file, or "".
+// Vendored code has none of its own and belongs to no used module: the walk
+// stops at a vendor directory rather than reach the vendoring module's go.mod
+// (go work vendor puts vendor/ in a workspace root that may be `use .`).
 func moduleRoot(file string) string {
 	for d := filepath.Dir(file); ; d = filepath.Dir(d) {
+		if filepath.Base(d) == "vendor" {
+			return ""
+		}
 		if _, err := os.Stat(filepath.Join(d, "go.mod")); err == nil {
 			return d
 		}
@@ -1271,6 +1306,140 @@ func moduleRoot(file string) string {
 			return ""
 		}
 	}
+}
+
+// packageDir returns the directory most of pass's files live in: cgo's
+// generated files sit in the build cache, so the first file won't do.
+func packageDir(pass *analysis.Pass) string {
+	counts := make(map[string]int)
+	best := ""
+	for _, f := range pass.Files {
+		tf := pass.Fset.File(f.Pos())
+		if tf == nil {
+			continue
+		}
+		d := filepath.Dir(tf.Name())
+		counts[d]++
+		if counts[d] > counts[best] || counts[d] == counts[best] && d < best {
+			best = d
+		}
+	}
+	return best
+}
+
+// otherBuildCache memoises otherBuildPositional per directory and package
+// name, built once (passes start concurrently; see testFilesByDir).
+var otherBuildCache sync.Map // map[[2]string]func() map[string]string
+
+// otherBuildPositional maps each type name to the first positional composite
+// literal of it ("file:line:col") in dir's .go files of package pkgName that
+// the current build excludes, by go/build's GOOS, GOARCH and tags. Only the
+// syntax is available there, so a literal counts by its type's name: an
+// elided one ([]T{{...}}) by its container's element type.
+func otherBuildPositional(dir, pkgName string) map[string]string {
+	scan, _ := otherBuildCache.LoadOrStore([2]string{dir, pkgName}, sync.OnceValue(func() map[string]string {
+		return scanOtherBuild(dir, pkgName)
+	}))
+	return scan.(func() map[string]string)()
+}
+
+// scanOtherBuild is otherBuildPositional's uncached body.
+func scanOtherBuild(dir, pkgName string) map[string]string {
+	found := make(map[string]string)
+	paths, err := filepath.Glob(filepath.Join(dir, "*.go"))
+	if err != nil {
+		return found
+	}
+	slices.Sort(paths)
+	fset := token.NewFileSet()
+	for _, path := range paths {
+		if match, err := build.Default.MatchFile(dir, filepath.Base(path)); err != nil || match {
+			continue
+		}
+		src, err := os.ReadFile(path)
+		if err != nil || neverBuilt(src) {
+			continue
+		}
+		f, err := parser.ParseFile(fset, path, src, parser.SkipObjectResolution)
+		if err != nil || f.Name.Name != pkgName {
+			continue
+		}
+		// visit records lit, typed by its own type or, elided, by implied,
+		// and descends into elided element literals.
+		var visit func(lit *ast.CompositeLit, implied ast.Expr)
+		visit = func(lit *ast.CompositeLit, implied ast.Expr) {
+			typ := lit.Type
+			if typ == nil {
+				typ = implied
+			}
+			if name := literalTypeName(typ); name != "" && len(lit.Elts) > 0 {
+				if _, keyed := lit.Elts[0].(*ast.KeyValueExpr); !keyed {
+					if _, seen := found[name]; !seen {
+						found[name] = fset.Position(lit.Pos()).String()
+					}
+				}
+			}
+			var key, elem ast.Expr
+			switch t := ast.Unparen(typ).(type) {
+			case *ast.ArrayType:
+				elem = t.Elt
+			case *ast.MapType:
+				key, elem = t.Key, t.Value
+			}
+			for _, e := range lit.Elts {
+				k, v := ast.Expr(nil), e
+				if kv, ok := e.(*ast.KeyValueExpr); ok {
+					k, v = kv.Key, kv.Value
+				}
+				if c, ok := ast.Unparen(k).(*ast.CompositeLit); ok && c.Type == nil && key != nil {
+					visit(c, key)
+				}
+				if c, ok := ast.Unparen(v).(*ast.CompositeLit); ok && c.Type == nil && elem != nil {
+					visit(c, elem)
+				}
+			}
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			if lit, ok := n.(*ast.CompositeLit); ok && lit.Type != nil {
+				visit(lit, nil)
+			}
+			return true
+		})
+	}
+	return found
+}
+
+// neverBuilt reports whether src opts out of every build with the
+// conventional `//go:build ignore`: unlike a GOOS or an unset tag, no build
+// ever compiles it, so its literals can't break.
+func neverBuilt(src []byte) bool {
+	for line := range strings.Lines(string(src)) {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "package ") {
+			return false
+		}
+		if constraint.IsGoBuild(line) {
+			expr, err := constraint.Parse(line)
+			return err == nil && expr.String() == "ignore"
+		}
+	}
+	return false
+}
+
+// literalTypeName returns the local type name a composite literal of type t
+// (or of *t, elided in []*T{{...}}) builds, or "" for any other type.
+func literalTypeName(t ast.Expr) string {
+	switch t := ast.Unparen(t).(type) {
+	case *ast.Ident:
+		return t.Name
+	case *ast.StarExpr:
+		return literalTypeName(t.X)
+	case *ast.IndexExpr:
+		return literalTypeName(t.X)
+	case *ast.IndexListExpr:
+		return literalTypeName(t.X)
+	}
+	return ""
 }
 
 // isStdPath reports whether path looks like a standard-library import path:

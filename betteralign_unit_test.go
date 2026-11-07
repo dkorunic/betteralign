@@ -2463,7 +2463,10 @@ func TestSameRunWorkspace(t *testing.T) {
 		return p
 	}
 	write("ws/go.work", "go 1.24\n\nuse (\n\t./a\n\t./b\n)\n")
-	for _, m := range []string{"ws/a", "ws/b", "ws/b/sub", "ws/c", "solo/a", "solo/b"} {
+	// A workspace whose root is itself a used module, vendoring its
+	// dependencies there (go work vendor).
+	write("wsv/go.work", "go 1.24\n\nuse .\n")
+	for _, m := range []string{"ws/a", "ws/b", "ws/b/sub", "ws/c", "solo/a", "solo/b", "wsv"} {
 		write(m+"/go.mod", "module example.com/"+filepath.Base(m)+"\n\ngo 1.24\n")
 	}
 
@@ -2488,6 +2491,7 @@ func TestSameRunWorkspace(t *testing.T) {
 	check("nested module not used", "ws/a/a.go", "ws/b/sub/s.go", false)
 	check("module outside use list", "ws/a/a.go", "ws/c/c.go", false)
 	check("replace without workspace", "solo/a/a.go", "solo/b/b.go", false)
+	check("vendored into a used module", "wsv/app/a.go", "wsv/vendor/example.com/dep/dep.go", false)
 
 	t.Setenv("GOWORK", "off")
 	check("GOWORK=off", "ws/a/a.go", "ws/b/b.go", false)

@@ -475,9 +475,11 @@ func TestReportsHealthyCodeWhenTestFileIllTyped(t *testing.T) {
 }
 
 // TestApplyRewritesWhenTestFileBuildExcluded guards the deferral from over-firing:
-// a positional literal in a build-excluded test file is never compiled, so the
-// struct must still be rewritten. The deferral must key on files go/packages
-// actually loaded, not on a disk glob that ignores build constraints.
+// a positional literal in a test file excluded from every build (//go:build
+// ignore) is never compiled, so the struct must still be rewritten. The
+// deferral must key on files go/packages actually loaded, not on a disk glob
+// that ignores build constraints. (A file behind an ordinary tag or another
+// GOOS does compile somewhere and pins; see TestOtherBuildPositional.)
 func TestApplyRewritesWhenTestFileBuildExcluded(t *testing.T) {
 	srcDir := filepath.Join("testdata", "src")
 	workDir := filepath.Join(srcDir, "litexcluded")
@@ -954,6 +956,14 @@ func TestFixWithGeneratedFiles(t *testing.T) {
 	if y, x := strings.Index(string(got), "y int32"), strings.Index(string(got), "x byte"); y < 0 || x < 0 || y > x {
 		t.Errorf("generated file was not rewritten under -fix -generated_files:\n%s", got)
 	}
+}
+
+// TestOtherBuildPositional pins positional literals in files the current
+// build excludes (another GOOS/GOARCH, an unset build tag): type checking
+// never sees them, so a reorder broke that platform's build or, with
+// compatible field types, silently re-mapped its values.
+func TestOtherBuildPositional(t *testing.T) {
+	analysistest.Run(t, analysistest.TestData(), NewTestAnalyzer(), "otherbuild")
 }
 
 // TestNested checks the diagnostics of structs holding another struct by value:
