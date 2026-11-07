@@ -1159,14 +1159,10 @@ func collectLayoutPins(inspect *inspector.Inspector, pass *analysis.Pass, sizes 
 	// breaks that build or, with compatible field types, silently re-maps its
 	// values. Found syntactically, by type name; after the typed pins, which
 	// win.
-	if dir := packageDir(pass); dir != "" {
-		other := otherBuildPositional(dir, pass.Pkg.Name())
-		for _, name := range slices.Sorted(maps.Keys(other)) {
-			if tn, ok := pass.Pkg.Scope().Lookup(name).(*types.TypeName); ok {
-				if st := canonicalStructType(tn.Type()); st != nil {
-					pin(st, layoutPin{format: pinPositional, at: other[name]})
-				}
-			}
+	other := otherBuildPositional(pass)
+	for _, path := range slices.Sorted(maps.Keys(other)) {
+		if st := resolveLiteralPath(pass.Pkg, path); st != nil {
+			pin(st, layoutPin{format: pinPositional, at: other[path]})
 		}
 	}
 
@@ -1308,105 +1304,149 @@ func moduleRoot(file string) string {
 	}
 }
 
-// packageDir returns the directory most of pass's files live in: cgo's
-// generated files sit in the build cache, so the first file won't do.
-func packageDir(pass *analysis.Pass) string {
-	counts := make(map[string]int)
-	best := ""
-	for _, f := range pass.Files {
-		tf := pass.Fset.File(f.Pos())
-		if tf == nil {
-			continue
-		}
-		d := filepath.Dir(tf.Name())
-		counts[d]++
-		if counts[d] > counts[best] || counts[d] == counts[best] && d < best {
-			best = d
-		}
-	}
-	return best
+// otherBuildCache memoises scanOtherBuild by path, size and modification
+// time (a long-running host sees an edited file afresh), built once: passes
+// start concurrently, and p and p [p.test] share their ignored files.
+var otherBuildCache sync.Map // map[declSourceKey]func() otherBuildScan
+
+// otherBuildScan is one excluded file's package name and, per literal type
+// path, its first positional composite literal ("file:line:col").
+type otherBuildScan struct {
+	lits map[string]string
+	pkg  string
 }
 
-// otherBuildCache memoises otherBuildPositional per directory and package
-// name, built once (passes start concurrently; see testFilesByDir).
-var otherBuildCache sync.Map // map[[2]string]func() map[string]string
-
-// otherBuildPositional maps each type name to the first positional composite
-// literal of it ("file:line:col") in dir's .go files of package pkgName that
-// the current build excludes, by go/build's GOOS, GOARCH and tags. Only the
-// syntax is available there, so a literal counts by its type's name: an
-// elided one ([]T{{...}}) by its container's element type.
-func otherBuildPositional(dir, pkgName string) map[string]string {
-	scan, _ := otherBuildCache.LoadOrStore([2]string{dir, pkgName}, sync.OnceValue(func() map[string]string {
-		return scanOtherBuild(dir, pkgName)
-	}))
-	return scan.(func() map[string]string)()
-}
-
-// scanOtherBuild is otherBuildPositional's uncached body.
-func scanOtherBuild(dir, pkgName string) map[string]string {
+// otherBuildPositional maps each literal type path (see scanOtherBuild) to the
+// first positional composite literal of it in pass's .go files of its own
+// package that the build excluded (pass.IgnoredFiles: another GOOS/GOARCH, an
+// unset tag, a tag the run set that a file negates).
+func otherBuildPositional(pass *analysis.Pass) map[string]string {
 	found := make(map[string]string)
-	paths, err := filepath.Glob(filepath.Join(dir, "*.go"))
-	if err != nil {
-		return found
-	}
-	slices.Sort(paths)
-	fset := token.NewFileSet()
-	for _, path := range paths {
-		if match, err := build.Default.MatchFile(dir, filepath.Base(path)); err != nil || match {
+	for _, path := range slices.Sorted(slices.Values(pass.IgnoredFiles)) {
+		if !strings.HasSuffix(path, ".go") {
 			continue
 		}
-		src, err := os.ReadFile(path)
-		if err != nil || neverBuilt(src) {
+		fi, err := os.Stat(path)
+		if err != nil {
 			continue
 		}
-		f, err := parser.ParseFile(fset, path, src, parser.SkipObjectResolution)
-		if err != nil || f.Name.Name != pkgName {
+		key := declSourceKey{path, fi.Size(), fi.ModTime().UnixNano()}
+		scan, _ := otherBuildCache.LoadOrStore(key, sync.OnceValue(func() otherBuildScan {
+			return scanOtherBuild(path)
+		}))
+		s := scan.(func() otherBuildScan)()
+		if s.pkg != pass.Pkg.Name() {
 			continue
 		}
-		// visit records lit, typed by its own type or, elided, by implied,
-		// and descends into elided element literals.
-		var visit func(lit *ast.CompositeLit, implied ast.Expr)
-		visit = func(lit *ast.CompositeLit, implied ast.Expr) {
-			typ := lit.Type
-			if typ == nil {
-				typ = implied
-			}
-			if name := literalTypeName(typ); name != "" && len(lit.Elts) > 0 {
-				if _, keyed := lit.Elts[0].(*ast.KeyValueExpr); !keyed {
-					if _, seen := found[name]; !seen {
-						found[name] = fset.Position(lit.Pos()).String()
-					}
-				}
-			}
-			var key, elem ast.Expr
-			switch t := ast.Unparen(typ).(type) {
-			case *ast.ArrayType:
-				elem = t.Elt
-			case *ast.MapType:
-				key, elem = t.Key, t.Value
-			}
-			for _, e := range lit.Elts {
-				k, v := ast.Expr(nil), e
-				if kv, ok := e.(*ast.KeyValueExpr); ok {
-					k, v = kv.Key, kv.Value
-				}
-				if c, ok := ast.Unparen(k).(*ast.CompositeLit); ok && c.Type == nil && key != nil {
-					visit(c, key)
-				}
-				if c, ok := ast.Unparen(v).(*ast.CompositeLit); ok && c.Type == nil && elem != nil {
-					visit(c, elem)
-				}
+		for typ, at := range s.lits {
+			if _, seen := found[typ]; !seen {
+				found[typ] = at
 			}
 		}
-		ast.Inspect(f, func(n ast.Node) bool {
-			if lit, ok := n.(*ast.CompositeLit); ok && lit.Type != nil {
-				visit(lit, nil)
-			}
-			return true
-		})
 	}
 	return found
+}
+
+// scanOtherBuild records path's positional composite literals by the type
+// they build. Only the syntax is available, so a type is a path: a local type
+// name, then for each elided level ([]T{{...}}, M{"k": {...}} with M a named
+// map) "/e" for an element or "/k" for a map key, resolved against the
+// package's types by resolveLiteralPath.
+func scanOtherBuild(path string) otherBuildScan {
+	src, err := os.ReadFile(path)
+	if err != nil || neverBuilt(src) {
+		return otherBuildScan{}
+	}
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, path, src, parser.SkipObjectResolution)
+	if err != nil {
+		return otherBuildScan{}
+	}
+	found := make(map[string]string)
+	// visit records lit, of type typ or, for an elided literal (typ nil), of
+	// the type path implied, and descends into elided element literals.
+	var visit func(lit *ast.CompositeLit, typ ast.Expr, implied string)
+	visit = func(lit *ast.CompositeLit, typ ast.Expr, implied string) {
+		var key, elem ast.Expr
+		switch t := ast.Unparen(typ).(type) {
+		case *ast.ArrayType:
+			elem = t.Elt
+		case *ast.MapType:
+			key, elem = t.Key, t.Value
+		case nil:
+		default:
+			implied = literalTypeName(typ)
+		}
+		if implied != "" && len(lit.Elts) > 0 {
+			if _, keyed := lit.Elts[0].(*ast.KeyValueExpr); !keyed {
+				if _, seen := found[implied]; !seen {
+					found[implied] = fset.Position(lit.Pos()).String()
+				}
+			}
+		}
+		// child visits an elided literal of syntactic type t or, when the
+		// container's type is only known by name, of implied+step.
+		child := func(e, t ast.Expr, step string) {
+			c, ok := ast.Unparen(e).(*ast.CompositeLit)
+			if !ok || c.Type != nil {
+				return
+			}
+			switch {
+			case t != nil:
+				visit(c, t, "")
+			case implied != "":
+				visit(c, nil, implied+step)
+			}
+		}
+		for _, e := range lit.Elts {
+			if kv, ok := e.(*ast.KeyValueExpr); ok {
+				child(kv.Key, key, "/k")
+				e = kv.Value
+			}
+			child(e, elem, "/e")
+		}
+	}
+	ast.Inspect(f, func(n ast.Node) bool {
+		if lit, ok := n.(*ast.CompositeLit); ok && lit.Type != nil {
+			visit(lit, lit.Type, "")
+		}
+		return true
+	})
+	return otherBuildScan{pkg: f.Name.Name, lits: found}
+}
+
+// resolveLiteralPath resolves a scanOtherBuild type path in pkg's scope to the
+// struct its literal builds, or nil. A field's key is ignored: only array,
+// slice and map literals elide their elements' types.
+func resolveLiteralPath(pkg *types.Package, path string) *types.Struct {
+	name, steps, _ := strings.Cut(path, "/")
+	tn, ok := pkg.Scope().Lookup(name).(*types.TypeName)
+	if !ok {
+		return nil
+	}
+	t := tn.Type()
+	for step := range strings.SplitSeq(steps, "/") {
+		if step == "" {
+			break
+		}
+		u := t.Underlying()
+		if p, ok := u.(*types.Pointer); ok {
+			u = p.Elem().Underlying()
+		}
+		switch u := u.(type) {
+		case *types.Slice:
+			t = u.Elem()
+		case *types.Array:
+			t = u.Elem()
+		case *types.Map:
+			if t = u.Elem(); step == "k" {
+				t = u.Key()
+			}
+		default:
+			return nil
+		}
+	}
+	return canonicalStructType(t)
 }
 
 // neverBuilt reports whether src opts out of every build with the

@@ -44,3 +44,31 @@ type Never struct { // want `struct of size 24 could be 16$`
 	Q int64
 	R bool
 }
+
+// Elided under named containers: the element type is only known by name in
+// tagged.go, so it is resolved against this package's types.
+type InSlice struct { // want `reorder skipped: positional composite literal at .*tagged.go`
+	S bool
+	T int64
+	U bool
+}
+
+type InMapKey struct { // want `reorder skipped: positional composite literal at .*tagged.go`
+	V bool
+	W int64
+	X bool
+}
+
+type (
+	Slices []InSlice
+	Nested [][]InSlice
+	Keys   map[*InMapKey]int
+)
+
+// Built positionally only in negated.go, behind a tag's negation: a run that
+// sets the tag excludes it (TestOtherBuildPositionalNegatedTag).
+type Negated struct { // want `reorder skipped: positional composite literal at .*negated.go`
+	Y bool
+	Z int64
+	Q bool
+}

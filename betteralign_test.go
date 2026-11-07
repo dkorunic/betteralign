@@ -966,6 +966,15 @@ func TestOtherBuildPositional(t *testing.T) {
 	analysistest.Run(t, analysistest.TestData(), NewTestAnalyzer(), "otherbuild")
 }
 
+// TestOtherBuildPositionalNegatedTag runs the otherbuild fixture with a tag
+// set that negated.go excludes itself by: its literal is outside this build
+// though go/build's defaults would include it, so the excluded files must be
+// the load's own (pass.IgnoredFiles).
+func TestOtherBuildPositionalNegatedTag(t *testing.T) {
+	t.Setenv("GOFLAGS", "-tags=betteralign_set")
+	analysistest.Run(t, analysistest.TestData(), NewTestAnalyzer(), "otherbuild")
+}
+
 // TestNested checks the diagnostics of structs holding another struct by value:
 // an inner struct the run rewrites is measured at its new layout, one it
 // leaves alone (ignored, single-line, generated) as declared.
