@@ -3,7 +3,7 @@ module github.com/dkorunic/betteralign
 go 1.27
 
 require (
-	github.com/KimMachineGun/automemlimit v1.0.0
+	github.com/KimMachineGun/automemlimit v1.0.1
 	github.com/google/renameio/v2 v2.0.2
 	golang.org/x/tools v0.52.0
 	gotest.tools/v3 v3.5.2
