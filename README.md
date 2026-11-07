@@ -18,6 +18,7 @@ It is a fork of the official Go [fieldalignment](https://cs.opensource.google/go
 
 **Safety and robustness**
 
+- respects **layout contracts**: structs carrying a `structs.HostLayout` marker or explicit blank padding (`_ [56]byte` cache-line pads, `_ uint32` alignment pads) are left alone entirely, and structs whose field offsets are taken with `unsafe.Offsetof` are reported but never rewritten,
 - detects positional composite literals (`T{1, 2, 3}` rather than `T{a: 1, b: 2, c: 3}`) anywhere in the package and **reports the would-be saving without rewriting the struct** — reordering its fields would silently re-map the literal's elements at the next build,
 - analyzes only named struct types declared with `type T struct { ... }`; anonymous structs (nested struct-typed fields, struct literals, `var x struct{...}` declarations) are skipped, so it never rewrites the riskier unnamed shapes,
 - when `-apply` rewrites a struct, fields declared with multiple names (`A, B int`) are kept together as a single grouped declaration and moved as a unit — the byte-span reorder never splits them,
@@ -141,7 +142,14 @@ has 24 pointer bytes because it has to scan further through the *uint32.
 
         struct { string; uint32 }
 
-has 8 because it can stop immediately after the string pointer.
+has 8 because the pointer bytes end immediately after the string pointer.
+
+This "pointer bytes" figure is the type's ptrdata. On Go before 1.26 it was
+also the number of bytes the collector scanned per value; under the Green Tea
+GC (default in Go 1.26) marking is span-based rather than per-value, so a
+smaller ptrdata lowers the ptrdata-based scan-work estimate the runtime uses
+for GC pacing rather than the bytes physically scanned. betteralign frames the
+pointer-bytes diagnostic to match the Go version of the analyzed package.
 
 Be aware that the most compact order is not always the most efficient.
 In rare cases it may cause two variables each updated by its own goroutine
@@ -162,6 +170,14 @@ are analyzed. Anonymous structs (nested struct-typed fields, struct literals,
 skipped. To enable analysis of one of those, lift it into a named type
 declaration.
 
+A generic struct whose layout depends on a type parameter — one with a type
+parameter in a by-value field position (`B T`, `B [4]T`, or a by-value
+struct holding one) — is also skipped. Such a field is sized from the
+constraint's underlying (`T any` as `interface{}`), so its size and
+pointer-bytes figures would be per-instantiation guesses. Fields that hold a
+type parameter only indirectly (`*T`, `[]T`, `map[K]T`) have a fixed
+layout and are still analyzed.
+
 If a struct is constructed somewhere in the package with a positional
 composite literal (`T{1, 2, 3}` rather than `T{a: 1, b: 2, c: 3}`),
 the reorder is reported but never applied: rewriting the field order would
@@ -169,6 +185,31 @@ re-map the literal's elements to different fields, breaking the build (or
 worse, silently mis-assigning values when the new field types still happen
 to accept the old element types). Convert the literal to keyed form and
 rerun to enable the reorder.
+
+This positional-literal guard only sees the package that declares the struct
+and its in-package tests. A positional literal of an exported struct used from
+another package (an ordinary importer, or an external `package p_test`) is
+invisible to the pass that rewrites the struct, so `-apply` may reorder it and
+break — or silently mis-assign — that caller. Unexported structs are safe. When
+running `-apply ./...` across a multi-package module, gate it with a
+`go build ./...` (and your tests) afterwards, or convert positional literals
+to keyed form first. The in-package test guard also relies on the test files
+being loaded, so a driver run with -test=false can still rewrite a struct
+pinned by a literal in an in-package test.
+
+A struct with a `structs.HostLayout` field declares that its layout must
+follow the platform's C ABI, so it is neither reported nor rewritten. A struct
+with explicit padding (a blank `_` field of non-zero size, such as a
+cache-line pad) is skipped the same way, since its layout is deliberate. A
+struct whose field offset is taken with `unsafe.Offsetof` anywhere in the
+package is reported but never rewritten: reordering would shift offsets the
+code depends on.
+
+Under `-apply` (or `-fix`), `-diff` prints a unified diff of each rewrite
+to stdout (stderr with `-json`) instead of updating the files.
+
+Windows-line-ending (CRLF) files are reported but never rewritten under
+`-apply`; normalise them to LF to enable the reorder.
 
 
 
@@ -227,6 +268,14 @@ To automatically rewrite files (excluding test and generated files):
 betteralign -apply ./...
 ```
 
+To preview the rewrite as a unified diff without touching any file:
+
+```shell
+betteralign -apply -diff ./...
+```
+
+With `-json`, the diff goes to stderr so stdout stays valid JSON.
+
 Generated and test files can be included with the `-generated_files` and `-test_files` flags respectively. Use `-exclude_dirs` and `-exclude_files` to skip specific paths. For `-exclude_dirs`, a separator-free pattern (`vendor`, `internal`, `test*`) matches a directory of that name at any depth, gitignore-style, while a pattern containing a separator (`a/internal`) matches only that exact path relative to the working directory. Use `-opt_in` to check only structs explicitly annotated with `// betteralign:check`.
 
 Structs constructed via positional composite literals are reported but never rewritten under `-apply`; the diagnostic points at the offending literal so it can be converted to keyed form (`T{Field: value}`), after which a rerun will enable the reorder.
@@ -235,10 +284,10 @@ Structs constructed via positional composite literals are reported but never rew
 
 - **Cross-package positional literals are not detected.** The positional-literal guard sees only the package that declares the struct plus its in-package tests. A positional literal of an **exported** struct used from *another* package (an ordinary importer, or an external `package p_test`) is invisible to the pass that rewrites the struct, because Go's static-analysis facts flow with the import graph, not against it. If such a literal exists, `-apply` will reorder the struct and either break the build or — when the reordered field types still accept the old element types — **silently mis-assign values** with a clean compile. This is the most dangerous outcome the tool can produce. Unexported structs are safe (their positional usage is confined to the defining package). When running `-apply ./...` across a multi-package module, gate it with a `go build ./...` (and your test suite) afterwards, or convert exported structs' positional literals to keyed form first.
 - **In-package test literals require the test variant to be loaded.** The deferral that protects a positional literal living only in an in-package `*_test.go` keys on test files actually loaded by the driver. Running with the driver's `-test=false` (which loads no test files) defeats it, so `-apply` may rewrite a struct pinned by such a literal and break the test build. Leave test loading enabled when applying fixes.
-- **A struct pinned by an in-package test literal may be reported twice.** Only `-apply` is deferred to the `[pkg.test]` variant, not reporting — so healthy code stays covered even when a broken test file makes the driver skip that variant. When the variant *does* run, both it and the base pass report the struct: the base plain, the variant with the `reorder skipped` caveat. The caveated one is authoritative; neither rewrites the struct.
+- **A struct pinned by an in-package test literal or `unsafe.Offsetof` may be reported twice.** Only `-apply` is deferred to the `[pkg.test]` variant, not reporting — so healthy code stays covered even when a broken test file makes the driver skip that variant. When the variant *does* run, both it and the base pass report the struct: the base plain, the variant with the `reorder skipped` caveat. The caveated one is authoritative; neither rewrites the struct.
 - **CRLF (Windows line-ending) files are report-only.** The reprint engine rejects any `\r` in a struct body, so a file checked out with CRLF endings is reported but never rewritten under `-apply`. Normalise to LF to enable the rewrite.
 - **Generic structs whose layout depends on a type parameter are skipped.** A field holding a type parameter by value (`B T`, `B [4]T`, or a by-value struct containing one) is sized from the constraint's underlying (`T any` becomes `interface{}`), so any size or pointer-bytes figure would be a per-instantiation guess. Such structs are neither reported nor rewritten. Type parameters held only indirectly (`*T`, `[]T`, `map[K]T`) have a fixed layout and are still analyzed.
-- **Structs with a layout contract are reordered anyway.** betteralign has no way to know a struct's field order is fixed by an external contract, so `-apply` will reorder cgo C-struct mirrors, syscall/ABI layouts, memory-mapped or wire-format structs, and any type whose fields are accessed by index via `reflect` or by offset via `unsafe.Offsetof`/pointer arithmetic. This can silently break such code. Mark these with `// betteralign:ignore` (or use `-opt_in`) before running `-apply`. Same exposure as upstream `fieldalignment`.
+- **Most layout contracts are invisible.** betteralign detects three: a `structs.HostLayout` field and a blank padding field of non-zero size (the struct is skipped), and an `unsafe.Offsetof` use within the package or its in-package tests (reported, not rewritten — and, like a positional literal in a test, possibly reported twice). Anything else — cgo C-struct mirrors without `structs.HostLayout`, syscall/ABI layouts, memory-mapped or wire-format structs, fields accessed by index via `reflect`, hard-coded offsets or pointer arithmetic, `Offsetof` in another package — is reordered by `-apply` and can silently break. Mark these with `// betteralign:ignore` (or use `-opt_in`) before running `-apply`.
 
 ## Star history
 

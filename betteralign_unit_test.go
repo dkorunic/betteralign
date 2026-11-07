@@ -384,7 +384,7 @@ func TestAlignSaturationBoundary(t *testing.T) {
 func TestAddSizeArgOrder(t *testing.T) {
 	const a int64 = math.MaxInt64 - 20
 	const b int64 = 10
-	const want = math.MaxInt64 - 10
+	const want int64 = math.MaxInt64 - 10
 
 	if got := addSize(a, b); got != want {
 		t.Errorf("addSize(%d, %d) = %d, want %d (typo `a > MaxInt64-a` would saturate)", a, b, got, want)
@@ -915,42 +915,60 @@ func TestCommentGroupHasOptInPrefix(t *testing.T) {
 	}
 }
 
-// fixGlobalFlag stands in for the -fix flag x/tools drivers register on the
-// process-global set.
-var fixGlobalFlag = flag.Bool("fix", false, "test stand-in for the driver's -fix")
+// fixGlobalFlag and diffGlobalFlag stand in for the -fix / -diff flags x/tools
+// drivers register on the process-global set.
+var (
+	fixGlobalFlag  = flag.Bool("fix", false, "test stand-in for the driver's -fix")
+	diffGlobalFlag = flag.Bool("diff", false, "test stand-in for the driver's -diff")
+)
 
-// TestFixRequestedGlobalFlag guards the production path: fixRequested must see
-// -fix on the global set, where drivers register it — not only Analyzer.Flags.
-func TestFixRequestedGlobalFlag(t *testing.T) {
-	pass := &analysis.Pass{Analyzer: &analysis.Analyzer{}}
+// TestFlagRequestedGlobalFlag guards the production path: flagRequested must
+// see -fix and -diff on the global set, where drivers register them — not only
+// Analyzer.Flags. Each flag is checked in isolation so a name mix-up (reading
+// -fix for -diff) fails.
+func TestFlagRequestedGlobalFlag(t *testing.T) {
+	for name, global := range map[string]*bool{"fix": fixGlobalFlag, "diff": diffGlobalFlag} {
+		t.Run(name, func(t *testing.T) {
+			pass := &analysis.Pass{Analyzer: &analysis.Analyzer{}}
 
-	if fixRequested(pass) {
-		t.Error("fixRequested = true with -fix unset, want false")
-	}
+			if flagRequested(pass, name) {
+				t.Errorf("flagRequested(%q) = true with flag unset, want false", name)
+			}
 
-	*fixGlobalFlag = true
-	defer func() { *fixGlobalFlag = false }()
-	if !fixRequested(pass) {
-		t.Error("fixRequested = false with global -fix set, want true")
+			*global = true
+			defer func() { *global = false }()
+			if !flagRequested(pass, name) {
+				t.Errorf("flagRequested(%q) = false with global flag set, want true", name)
+			}
+			for other := range map[string]struct{}{"fix": {}, "diff": {}} {
+				if other != name && flagRequested(pass, other) {
+					t.Errorf("flagRequested(%q) = true with only -%s set", other, name)
+				}
+			}
+		})
 	}
 }
 
-// TestFixRequestedAnalyzerFlag covers the host-registered variant, where -fix
-// lives on Analyzer.Flags (as the TestApply harness wires it).
-func TestFixRequestedAnalyzerFlag(t *testing.T) {
-	analyzer := &analysis.Analyzer{}
-	var fix bool
-	analyzer.Flags.BoolVar(&fix, "fix", false, "host-registered alias")
-	pass := &analysis.Pass{Analyzer: analyzer}
+// TestFlagRequestedAnalyzerFlag covers the host-registered variant, where the
+// flag lives on Analyzer.Flags (as the TestApply harness wires it).
+func TestFlagRequestedAnalyzerFlag(t *testing.T) {
+	for _, name := range []string{"fix", "diff"} {
+		t.Run(name, func(t *testing.T) {
+			analyzer := &analysis.Analyzer{}
+			var v bool
+			analyzer.Flags.BoolVar(&v, name, false, "host-registered flag")
+			pass := &analysis.Pass{Analyzer: analyzer}
 
-	if fixRequested(pass) {
-		t.Error("fixRequested = true with analyzer -fix unset, want false")
-	}
-	if err := analyzer.Flags.Set("fix", "true"); err != nil {
-		t.Fatal(err)
-	}
-	if !fixRequested(pass) {
-		t.Error("fixRequested = false with analyzer -fix set, want true")
+			if flagRequested(pass, name) {
+				t.Errorf("flagRequested(%q) = true with analyzer flag unset, want false", name)
+			}
+			if err := analyzer.Flags.Set(name, "true"); err != nil {
+				t.Fatal(err)
+			}
+			if !flagRequested(pass, name) {
+				t.Errorf("flagRequested(%q) = false with analyzer flag set, want true", name)
+			}
+		})
 	}
 }
 
@@ -2038,9 +2056,9 @@ type Inst = Box[int32]
 	}
 }
 
-// TestCollectPositionalUsersFirstWins pins "first occurrence wins" — the diagnostic must
+// TestCollectLayoutPinsFirstWins pins "first occurrence wins" — the diagnostic must
 // point at the canonical (earliest) positional literal, not the last seen.
-func TestCollectPositionalUsersFirstWins(t *testing.T) {
+func TestCollectLayoutPinsFirstWins(t *testing.T) {
 	src := `package test
 
 type T struct {
@@ -2073,14 +2091,17 @@ var _ = T{4, 5, 6} // second literal — line 10
 	insp := inspector.New([]*ast.File{f})
 	pass := &analysis.Pass{Fset: fset, Pkg: pkg, TypesInfo: info, Files: []*ast.File{f}}
 
-	users := collectPositionalUsers(insp, pass)
+	pins := collectLayoutPins(insp, pass)
 	tStruct := pkg.Scope().Lookup("T").Type().(*types.Named).Underlying().(*types.Struct)
 
-	pos, ok := users[tStruct]
+	pin, ok := pins[tStruct]
 	if !ok {
-		t.Fatal("collectPositionalUsers did not record T at all")
+		t.Fatal("collectLayoutPins did not record T at all")
 	}
-	gotLine := fset.Position(pos).Line
+	if pin.format != pinPositional {
+		t.Errorf("pins[T].format = %q, want pinPositional", pin.format)
+	}
+	gotLine := fset.Position(pin.pos).Line
 	if gotLine != 9 {
 		t.Errorf("users[T] line = %d, want 9 (first literal); a last-wins mutation would report line 10", gotLine)
 	}
@@ -2212,4 +2233,27 @@ type NoParam struct { A bool; B int64; C bool }
 			t.Errorf("layoutDependsOnTypeParam(%s) = %v, want %v", name, got, exp)
 		}
 	}
+}
+
+// failWriter fails every write, standing in for a closed stdout.
+type failWriter struct{}
+
+func (failWriter) Write([]byte) (int, error) { return 0, errors.New("closed") }
+
+// TestWriteDiff pins writeDiff's edges: identical input prints nothing (no
+// empty "diff" header), a change prints a gofmt -d style header, and a failing
+// writer is reported rather than panicking.
+func TestWriteDiff(t *testing.T) {
+	var buf strings.Builder
+	writeDiff(&buf, "f.go", []byte("a\n"), []byte("a\n"))
+	if buf.Len() != 0 {
+		t.Errorf("identical input printed %q, want nothing", buf.String())
+	}
+
+	writeDiff(&buf, "f.go", []byte("a\nb\n"), []byte("b\na\n"))
+	if got := buf.String(); !strings.HasPrefix(got, "diff f.go.orig f.go\n--- f.go.orig\n+++ f.go\n") {
+		t.Errorf("diff header = %q", got)
+	}
+
+	writeDiff(failWriter{}, "f.go", []byte("a\n"), []byte("b\n")) // must not panic
 }

@@ -606,6 +606,12 @@ func hasBuildConstraintComment(st *ast.StructType, comments []*ast.CommentGroup)
 	return false
 }
 
+// Source returns the original bytes df was decorated from; callers must not
+// mutate them.
+func (df *File) Source() []byte {
+	return df.source
+}
+
 // offsetOf returns pos's byte offset. pos must belong to df.tf, else
 // token.File.Offset panics.
 func (df *File) offsetOf(pos token.Pos) int {

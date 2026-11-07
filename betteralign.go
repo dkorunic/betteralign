@@ -40,6 +40,7 @@ import (
 	"go/token"
 	"go/types"
 	"go/version"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -48,11 +49,13 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/dkorunic/betteralign/internal/diff"
 	dst "github.com/dkorunic/betteralign/internal/dstmin"
 	"github.com/google/renameio/v2/maybe"
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/inspect"
 	"golang.org/x/tools/go/ast/inspector"
+	"golang.org/x/tools/go/types/typeutil"
 )
 
 const Doc = `find structs that would use less memory if their fields were sorted
@@ -129,6 +132,17 @@ running ` + "`-apply ./...`" + ` across a multi-package module, gate it with a
 to keyed form first. The in-package test guard also relies on the test files
 being loaded, so a driver run with -test=false can still rewrite a struct
 pinned by a literal in an in-package test.
+
+A struct with a ` + "`structs.HostLayout`" + ` field declares that its layout must
+follow the platform's C ABI, so it is neither reported nor rewritten. A struct
+with explicit padding (a blank ` + "`_`" + ` field of non-zero size, such as a
+cache-line pad) is skipped the same way, since its layout is deliberate. A
+struct whose field offset is taken with ` + "`unsafe.Offsetof`" + ` anywhere in the
+package is reported but never rewritten: reordering would shift offsets the
+code depends on.
+
+Under ` + "`-apply`" + ` (or ` + "`-fix`" + `), ` + "`-diff`" + ` prints a unified diff of each rewrite
+to stdout (stderr with ` + "`-json`" + `) instead of updating the files.
 
 Windows-line-ending (CRLF) files are reported but never rewritten under
 ` + "`-apply`" + `; normalise them to LF to enable the reorder.
@@ -237,8 +251,15 @@ func init() {
 // like golangci-lint may share flag state.
 func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 	apply := cfg.apply
-	if fixRequested(pass) {
+	if flagRequested(pass, "fix") {
 		apply = true
+	}
+	// -diff previews a rewrite; never write files under it. Under -json the
+	// diff goes to stderr so stdout stays parseable JSON.
+	showDiff := apply && flagRequested(pass, "diff")
+	diffTo := diffOut
+	if flagRequested(pass, "json") {
+		diffTo = diffJSONOut
 	}
 	// Defer only -apply, never reporting, to the test variant; see
 	// deferToTestVariant.
@@ -255,13 +276,13 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 
 	inspect := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 
-	// Built lazily so clean packages skip the composite-literal walk.
-	var positionalUsers map[*types.Struct]token.Pos
-	ensurePositionalUsers := func() map[*types.Struct]token.Pos {
-		if positionalUsers == nil {
-			positionalUsers = collectPositionalUsers(inspect, pass)
+	// Built lazily so clean packages skip the composite-literal/call walk.
+	var layoutPins map[*types.Struct]layoutPin
+	ensureLayoutPins := func() map[*types.Struct]layoutPin {
+		if layoutPins == nil {
+			layoutPins = collectLayoutPins(inspect, pass)
 		}
-		return positionalUsers
+		return layoutPins
 	}
 
 	// Lazy: nil until the first misaligned struct.
@@ -396,6 +417,13 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 			return
 		}
 
+		// structs.HostLayout (a C-ABI contract) and explicit blank padding make
+		// the layout deliberate: nothing to report, since the user can't act on
+		// it and the "could be" figure would need breaking that contract.
+		if hasHostLayout(typ) || hasBlankPadding(typ, sizes) {
+			return
+		}
+
 		var message string
 		if sz := sizes.Sizeof(typ); sz != optsz {
 			message = fmt.Sprintf("%d bytes saved: struct of size %d could be %d", sz-optsz, sz, optsz)
@@ -416,15 +444,12 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 			return
 		}
 
-		// Positional literal pins layout: safe to report, unsafe to mutate.
-		if litPos, blocked := ensurePositionalUsers()[typ]; blocked {
+		// A pinned layout is safe to report, unsafe to mutate.
+		if pin, pinned := ensureLayoutPins()[typ]; pinned {
 			pass.Report(analysis.Diagnostic{
-				Pos: s.Pos(),
-				End: s.Pos() + structKeywordLen,
-				Message: fmt.Sprintf(
-					"%s; reorder skipped: positional composite literal at %s would break, convert to keyed form first",
-					message, pass.Fset.Position(litPos),
-				),
+				Pos:            s.Pos(),
+				End:            s.Pos() + structKeywordLen,
+				Message:        message + "; reorder skipped: " + fmt.Sprintf(pin.format, pass.Fset.Position(pin.pos)),
 				SuggestedFixes: nil,
 			})
 			return
@@ -527,6 +552,10 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 				fmt.Fprintf(os.Stderr, "failed to print %s: %v\n", fn, err)
 				continue
 			}
+			if showDiff {
+				writeDiff(diffTo, fn, df.Source(), buf.Bytes())
+				continue
+			}
 			if err := applyToFile(fn, buf.Bytes()); err != nil {
 				fmt.Fprintf(os.Stderr, "error applying fixes to %v: %v\n", fn, err)
 			}
@@ -536,20 +565,43 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 	return nil, nil
 }
 
-// fixRequested reports whether the -fix alias of -apply is active. Both flag
-// sets matter: x/tools drivers register -fix on the process-global set (via
-// analysisflags), while hosts and the test harness wire it onto Analyzer.Flags.
-// Checking only Analyzer.Flags makes -fix a silent no-op in the shipped binary,
-// since the driver then applies the (always nil) SuggestedFixes instead of
-// reporting diagnostics.
-func fixRequested(pass *analysis.Pass) bool {
-	if a := pass.Analyzer.Flags.Lookup("fix"); a != nil && a.Value.String() == "true" {
+// flagRequested reports whether a driver-owned boolean flag (-fix, the alias
+// of -apply, or -diff) is set. Both flag sets matter: x/tools drivers register
+// them on the process-global set (via analysisflags), while hosts and the test
+// harness wire them onto Analyzer.Flags. Checking only Analyzer.Flags makes
+// -fix a silent no-op in the shipped binary, since the driver then applies the
+// (always nil) SuggestedFixes instead of reporting diagnostics — and makes
+// -fix -diff overwrite the files it was asked only to preview.
+func flagRequested(pass *analysis.Pass, name string) bool {
+	if a := pass.Analyzer.Flags.Lookup(name); a != nil && a.Value.String() == "true" {
 		return true
 	}
-	if a := flag.Lookup("fix"); a != nil && a.Value.String() == "true" {
+	if a := flag.Lookup(name); a != nil && a.Value.String() == "true" {
 		return true
 	}
 	return false
+}
+
+// diffOut receives -diff output, and diffJSONOut it under -json, where stdout
+// carries the driver's JSON; variables so tests can capture them.
+var (
+	diffOut     io.Writer = os.Stdout
+	diffJSONOut io.Writer = os.Stderr
+	diffMu      sync.Mutex
+)
+
+// writeDiff prints the unified diff of one rewrite to w in gofmt -d form. The
+// lock keeps whole-file diffs from interleaving across concurrent passes.
+func writeDiff(w io.Writer, fn string, orig, rewritten []byte) {
+	d := diff.Diff(fn+".orig", orig, fn, rewritten)
+	if d == nil {
+		return
+	}
+	diffMu.Lock()
+	defer diffMu.Unlock()
+	if _, err := w.Write(d); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to write diff for %s: %v\n", fn, err)
+	}
 }
 
 // unsafePointerTyp anchors word-size and pointer-alignment lookups via pass.TypesSizes.
@@ -586,20 +638,70 @@ var fieldSlicePool = sync.Pool{
 	New: func() any { s := []*dst.Field(nil); return &s },
 }
 
-// collectPositionalUsers maps each *types.Struct pinned by a positional
-// composite literal (`T{1, 2, 3}`, not keyed) to its first such literal's
-// position. Reordering those structs would re-map literal elements to other
-// fields, so the diagnostic path consults this set and surfaces the position as
-// a jump target.
+// layoutPin records why a struct's field order must not change: pos is the
+// offending source position and format the diagnostic suffix, taking pos as %s.
+type layoutPin struct {
+	format string
+	pos    token.Pos
+}
+
+const (
+	pinPositional = "positional composite literal at %s would break, convert to keyed form first"
+	pinOffsetof   = "unsafe.Offsetof at %s depends on field order"
+)
+
+// unsafeOffsetof is the unsafe.Offsetof builtin; go/types records every use of
+// it (qualified or dot-imported) against this one object.
+var unsafeOffsetof = types.Unsafe.Scope().Lookup("Offsetof")
+
+// collectLayoutPins maps each *types.Struct whose field order the package
+// relies on to the first such use, which the diagnostic surfaces as a jump
+// target. Two uses pin a struct:
+//
+//   - a positional composite literal (`T{1, 2, 3}`, not keyed): reordering
+//     would re-map its elements to other fields.
+//   - unsafe.Offsetof(x.f): pins x's struct and, for a promoted f, every
+//     embedded struct on the path. Offsetof itself recomputes, but the code
+//     around it (constant offset asserts, 64-bit atomic alignment checks,
+//     offsets shared with assembly or C) usually assumes today's layout.
 //
 // Per-file skip flags deliberately do not apply: an excluded file still
-// compiles against the layout, so its positional literal would break just the
-// same. Elts[0] classifies the whole literal (Go forbids mixing keyed and
-// positional). Returns a fresh map; one per pass.
-func collectPositionalUsers(inspect *inspector.Inspector, pass *analysis.Pass) map[*types.Struct]token.Pos {
-	users := make(map[*types.Struct]token.Pos)
+// compiles against the layout, so its use would break just the same. Elts[0]
+// classifies the whole literal (Go forbids mixing keyed and positional).
+// Returns a fresh map; one per pass.
+func collectLayoutPins(inspect *inspector.Inspector, pass *analysis.Pass) map[*types.Struct]layoutPin {
+	pins := make(map[*types.Struct]layoutPin)
+	pin := func(st *types.Struct, p layoutPin) {
+		if _, seen := pins[st]; !seen {
+			pins[st] = p
+		}
+	}
 
-	inspect.Preorder([]ast.Node{(*ast.CompositeLit)(nil)}, func(node ast.Node) {
+	inspect.Preorder([]ast.Node{(*ast.CompositeLit)(nil), (*ast.CallExpr)(nil)}, func(node ast.Node) {
+		if call, ok := node.(*ast.CallExpr); ok {
+			if len(call.Args) != 1 || typeutil.Callee(pass.TypesInfo, call) != unsafeOffsetof {
+				return
+			}
+			sel, ok := ast.Unparen(call.Args[0]).(*ast.SelectorExpr)
+			if !ok {
+				return
+			}
+			selection := pass.TypesInfo.Selections[sel]
+			if selection == nil || selection.Kind() != types.FieldVal {
+				return
+			}
+			t := selection.Recv()
+			for _, idx := range selection.Index() {
+				st := canonicalStructType(t)
+				if st == nil || idx >= st.NumFields() {
+					return
+				}
+				pin(st, layoutPin{format: pinOffsetof, pos: call.Pos()})
+				t = st.Field(idx).Type()
+			}
+			return
+		}
+
 		lit := node.(*ast.CompositeLit)
 		if len(lit.Elts) == 0 {
 			return
@@ -615,12 +717,42 @@ func collectPositionalUsers(inspect *inspector.Inspector, pass *analysis.Pass) m
 		if st == nil {
 			return
 		}
-		if _, seen := users[st]; !seen {
-			users[st] = lit.Pos()
-		}
+		pin(st, layoutPin{format: pinPositional, pos: lit.Pos()})
 	})
 
-	return users
+	return pins
+}
+
+// hasBlankPadding reports whether str has a blank field of non-zero size. A
+// `_` field can't be read or written, so it exists only to shape the layout
+// (cache-line pads against false sharing, alignment pads); sorting would move
+// it and undo that. Zero-sized blank markers such as `_ [0]func()` or a noCopy
+// guard carry no padding and don't count.
+func hasBlankPadding(str *types.Struct, sizes *gcSizes) bool {
+	for f := range str.Fields() {
+		if f.Name() == "_" && sizes.Sizeof(f.Type()) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// hasHostLayout reports whether str has a direct structs.HostLayout field,
+// which declares its layout fixed to the platform C ABI. Per the structs
+// package, the marker applies only to the struct directly containing it, so
+// nested structs aren't searched.
+func hasHostLayout(str *types.Struct) bool {
+	for f := range str.Fields() {
+		named, ok := types.Unalias(f.Type()).(*types.Named)
+		if !ok {
+			continue
+		}
+		obj := named.Obj()
+		if obj.Name() == "HostLayout" && obj.Pkg().Path() == "structs" {
+			return true
+		}
+	}
+	return false
 }
 
 // deferToTestVariant reports whether this pass should skip -apply and leave the

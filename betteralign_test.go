@@ -6,6 +6,7 @@
 package betteralign_test
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -13,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/dkorunic/betteralign"
+	"github.com/dkorunic/betteralign/internal/diff"
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/analysistest"
 	"golang.org/x/tools/go/analysis/checker"
@@ -633,4 +635,210 @@ func TestSingleLineStructReported(t *testing.T) {
 	testdata := analysistest.TestData()
 	analyzer := NewTestAnalyzer()
 	analysistest.Run(t, testdata, analyzer, filepath.Join(filepath.Base(tmpDir), "singleline"))
+}
+
+// TestLayoutPins pins the three layout contracts betteralign must respect:
+// structs.HostLayout structs and structs with a non-zero blank padding field
+// are not reported at all, while structs with an unsafe.Offsetof use are
+// reported with a "reorder skipped" caveat naming the offending position.
+// Negative cases (zero-sized blank markers, named pads, a look-alike
+// HostLayout, Sizeof and Alignof, a user method named Offsetof) keep the plain
+// diagnostic.
+func TestLayoutPins(t *testing.T) {
+	skipUnless64Bit(t)
+	testdata := analysistest.TestData()
+	analyzer := NewTestAnalyzer()
+	analysistest.Run(t, testdata, analyzer, "layoutpin")
+}
+
+// TestApplyLayoutPins pins the rewrite half of TestLayoutPins: under -apply the
+// pinned structs keep their source order byte for byte, while the unpinned
+// controls in the same files are still reordered, proving the rewrite ran.
+func TestApplyLayoutPins(t *testing.T) {
+	skipUnless64Bit(t)
+	tmpPkg, paths := copyTestPackage(t, "layoutpin")
+
+	analyzer := NewTestAnalyzer()
+	_ = analyzer.Flags.Set("apply", "true")
+	analysistest.Run(t, analysistest.TestData(), analyzer, tmpPkg)
+
+	for _, path := range paths {
+		got, err := os.ReadFile(filepath.Join(analysistest.TestData(), "src", tmpPkg, filepath.Base(path)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		golden.Assert(t, string(got), filepath.Join("src", "layoutpin", filepath.Base(path)+".golden"))
+	}
+}
+
+// skipUnless64Bit skips fixtures whose sizes assume an 8-byte word.
+func skipUnless64Bit(t *testing.T) {
+	t.Helper()
+	if runtime.GOARCH != "amd64" && runtime.GOARCH != "arm64" {
+		t.Skipf("fixture assumes 64-bit word size, GOARCH=%s", runtime.GOARCH)
+	}
+}
+
+// copyTestPackage copies testdata/src/<name>/*.go into a fresh temp package
+// under testdata/src (removed on cleanup) and returns its import path relative
+// to testdata/src together with the copied source paths.
+func copyTestPackage(t *testing.T, name string) (string, []string) {
+	t.Helper()
+	srcDir := filepath.Join("testdata", "src")
+	tmpDir, err := os.MkdirTemp(srcDir, name+"-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(tmpDir) })
+
+	tmpPkg := filepath.Join(filepath.Base(tmpDir), name)
+	if err := os.Mkdir(filepath.Join(srcDir, tmpPkg), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	paths, err := filepath.Glob(filepath.Join(srcDir, name, "*.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range paths {
+		src, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(srcDir, tmpPkg, filepath.Base(path)), src, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return tmpPkg, paths
+}
+
+// runDiffMode runs the analyzer over a temp copy of layoutpin with stdout
+// diffs captured, after configure has set the flags under test. It returns the
+// captured output and fails if any source file changed on disk.
+func runDiffMode(t *testing.T, configure func(*analysis.Analyzer)) (string, []string, string) {
+	t.Helper()
+	out, jsonOut, paths, tmpDir := runDiffModeJSON(t, configure)
+	if jsonOut != "" {
+		t.Errorf("diff went to the -json sink without -json:\n%s", jsonOut)
+	}
+	return out, paths, tmpDir
+}
+
+// runDiffModeJSON is runDiffMode that also returns what went to the -json
+// diff sink (stderr in production).
+func runDiffModeJSON(t *testing.T, configure func(*analysis.Analyzer)) (string, string, []string, string) {
+	t.Helper()
+	skipUnless64Bit(t)
+	tmpPkg, paths := copyTestPackage(t, "layoutpin")
+
+	var out, jsonOut bytes.Buffer
+	saved, savedJSON := *betteralign.DiffOut, *betteralign.DiffJSONOut
+	*betteralign.DiffOut, *betteralign.DiffJSONOut = &out, &jsonOut
+	t.Cleanup(func() { *betteralign.DiffOut, *betteralign.DiffJSONOut = saved, savedJSON })
+
+	analyzer := NewTestAnalyzer()
+	configure(analyzer)
+	analysistest.Run(t, analysistest.TestData(), analyzer, tmpPkg)
+
+	tmpDir := filepath.Join(analysistest.TestData(), "src", tmpPkg)
+	for _, path := range paths {
+		want, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := os.ReadFile(filepath.Join(tmpDir, filepath.Base(path)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Errorf("%s was modified on disk; -diff must only preview", filepath.Base(path))
+		}
+	}
+	return out.String(), jsonOut.String(), paths, tmpDir
+}
+
+// wantLayoutPinDiff builds the expected -diff output: one gofmt -d style diff
+// per file whose -apply golden differs, in the sorted order run writes them.
+// Files the rewrite leaves alone (dotimport.go) contribute nothing.
+func wantLayoutPinDiff(t *testing.T, paths []string, tmpDir string) string {
+	t.Helper()
+	var want bytes.Buffer
+	for _, path := range paths { // filepath.Glob returns sorted paths
+		orig, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rewritten, err := os.ReadFile(path + ".golden")
+		if err != nil {
+			t.Fatal(err)
+		}
+		fn := filepath.Join(tmpDir, filepath.Base(path))
+		want.Write(diff.Diff(fn+".orig", orig, fn, rewritten))
+	}
+	if want.Len() == 0 {
+		t.Fatal("fixture produced no expected diff; the test would prove nothing")
+	}
+	return want.String()
+}
+
+// TestApplyDiff pins -apply -diff: the rewrite is printed as a unified diff
+// matching the -apply golden output, and no file is written.
+func TestApplyDiff(t *testing.T) {
+	got, paths, tmpDir := runDiffMode(t, func(a *analysis.Analyzer) {
+		var d bool
+		a.Flags.BoolVar(&d, "diff", false, "host-registered -diff (test harness only)")
+		_ = a.Flags.Set("apply", "true")
+		_ = a.Flags.Set("diff", "true")
+	})
+	if want := wantLayoutPinDiff(t, paths, tmpDir); got != want {
+		t.Errorf("diff output mismatch\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
+// TestFixDiffGlobalFlags is the regression for `betteralign -fix -diff`: the
+// driver registers both flags on the process-global set, and -fix used to
+// rewrite files the user asked only to preview.
+func TestFixDiffGlobalFlags(t *testing.T) {
+	got, paths, tmpDir := runDiffMode(t, func(*analysis.Analyzer) {
+		*betteralign.FixGlobalFlag = true
+		*betteralign.DiffGlobalFlag = true
+		t.Cleanup(func() {
+			*betteralign.FixGlobalFlag = false
+			*betteralign.DiffGlobalFlag = false
+		})
+	})
+	if want := wantLayoutPinDiff(t, paths, tmpDir); got != want {
+		t.Errorf("diff output mismatch\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
+// TestDiffWithoutApply pins that -diff alone stays report-only: it neither
+// prints a diff nor writes files, matching the driver's "-diff needs -fix".
+func TestDiffWithoutApply(t *testing.T) {
+	got, _, _ := runDiffMode(t, func(a *analysis.Analyzer) {
+		var d bool
+		a.Flags.BoolVar(&d, "diff", false, "host-registered -diff (test harness only)")
+		_ = a.Flags.Set("diff", "true")
+	})
+	if got != "" {
+		t.Errorf("-diff without -apply printed output:\n%s", got)
+	}
+}
+
+// TestApplyDiffJSON pins that under -json the diff goes to the stderr sink,
+// leaving stdout to the driver's JSON, and is otherwise the same diff.
+func TestApplyDiffJSON(t *testing.T) {
+	out, jsonOut, paths, tmpDir := runDiffModeJSON(t, func(a *analysis.Analyzer) {
+		var d, j bool
+		a.Flags.BoolVar(&d, "diff", false, "host-registered -diff (test harness only)")
+		a.Flags.BoolVar(&j, "json", false, "host-registered -json (test harness only)")
+		_ = a.Flags.Set("apply", "true")
+		_ = a.Flags.Set("diff", "true")
+		_ = a.Flags.Set("json", "true")
+	})
+	if out != "" {
+		t.Errorf("-json -diff wrote to stdout, corrupting the JSON stream:\n%s", out)
+	}
+	if want := wantLayoutPinDiff(t, paths, tmpDir); jsonOut != want {
+		t.Errorf("diff output mismatch\n--- got ---\n%s\n--- want ---\n%s", jsonOut, want)
+	}
 }

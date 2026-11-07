@@ -53,6 +53,7 @@ The `afl-fuzz-*` tasks run the same targets under gosentry/LibAFL (`CGO_ENABLED=
 
 - **`betteralign` (root)** — the core `analysis.Analyzer`: alignment analysis, layout/ptrdata math, file I/O, flags.
 - **`internal/dstmin/`** — the in-tree comment-preserving reprint engine, imported as `dst`. It replaced a `github.com/sirkon/dst` dependency. It decorates an `*ast.File` with per-field byte-range spans, then reprints by byte-splicing reordered struct bodies into the original source and finishing with `go/format.Source`. It supports exactly one mutation (reordering a struct's field list) and deliberately rejects shapes it cannot splice safely (single-line structs, fields sharing a line, block comments crossing a brace, mid-body build constraints / `//line` directives, bodies with `\r`/`\f`/`*//`). See `internal/dstmin/README.md`.
+- **`internal/diff/`** — verbatim copy of the stdlib's `internal/diff` (the anchored diff behind `gofmt -d`), backing `-diff`. Keep it verbatim apart from the package doc; refresh by re-copying from `$(go env GOROOT)/src/internal/diff`.
 - **`cmd/betteralign/`** — thin CLI wrapper. Wires up the memory limit (`automemlimit`), handles `-V`/`--version`, and calls `singlechecker.Main(betteralign.Analyzer)`.
 
 ### Key files
@@ -70,7 +71,7 @@ The `afl-fuzz-*` tasks run the same targets under gosentry/LibAFL (`CGO_ENABLED=
 1. The `inspect.Analyzer` traverses the AST; `betteralign` hooks `Preorder` on `*ast.File`, `*ast.GenDecl`, and `*ast.StructType` nodes.
 2. Optimality is computed from type info alone, so report-only mode never reads source bytes or builds DST. The hot path uses `layoutMetrics`, which decides optimality (and the optimal size/ptrdata) without allocating a field permutation; `optimalOrder` — which allocates the `[]int` permutation that drives the reorder — runs only under `-apply` for a misaligned struct. Both share the `compareFieldElem` comparator and a per-pass `gcSizes`, whose memoisation caches are created once per pass and are **not** concurrency-safe.
 3. Only under `-apply` is a `dstmin` decorator built — lazily, on the first misaligned struct in a file. The reordered DST is serialized into a per-file buffer keyed by filename in `dirtyFiles`.
-4. After the pass, if `-apply` is set, each buffer is atomically written via `github.com/google/renameio/v2/maybe` (atomic on POSIX, best-effort on Windows). `Fprint` re-parses its own gofmt output, so a successful `Fprint` already guarantees the bytes parse.
+4. After the pass, if `-apply` is set, each buffer is atomically written via `github.com/google/renameio/v2/maybe` (atomic on POSIX, best-effort on Windows). With `-diff` (the driver's flag, read via `flagRequested` like `-fix`), nothing is written: each rewrite is printed to `diffOut` (stdout) as a gofmt-style unified diff — or to `diffJSONOut` (stderr) under `-json`, so stdout stays valid JSON — serialised by `diffMu` across concurrent passes. `-diff` without `-apply`/`-fix` does nothing. `Fprint` re-parses its own gofmt output, so a successful `Fprint` already guarantees the bytes parse.
 
 ### Why a whole-file reprint instead of SuggestedFixes
 
@@ -96,6 +97,16 @@ The pointer-bytes diagnostic is framed by the **analyzed** package's Go version,
 A struct constructed anywhere in the package via a *positional* composite literal (`T{1, 2, 3}` rather than keyed) is reported but **never** rewritten under `-apply`, since reordering would silently re-map the literal's elements. The diagnostic points at the offending literal.
 
 The check scans only the current pass's files, and go/packages runs the analyzer once per variant — base `p` (non-test files) and `p [p.test]` (non-test + in-package test files). Since the base pass can't see a positional literal in an in-package `*_test.go`, `deferToTestVariant` makes the base pass skip **only `-apply`** (not reporting) whenever such a test file is loaded, leaving the rewrite to the `[p.test]` variant, which sees the tests. Reporting is deliberately **not** deferred: if the base pass went silent and the driver then skipped the `[p.test]` variant as ill-typed (e.g. a test file broken mid-edit), healthy non-test code would get no diagnostic at all — an earlier whole-package deferral did exactly that and was reverted. The trade-off is a possible duplicate diagnostic for a struct pinned by a test literal: the base reports it plain, the variant with the `reorder skipped` caveat. Because the deferral keys on *loaded* test files, a driver run with `-test=false` loads none and the base pass no longer defers. Literals in *external* test packages (`package p_test`) load separately and never rewrite `p`'s structs, so they remain the documented cross-package limitation — as are positional literals of exported structs in ordinary importing packages.
+
+### Layout pins
+
+Beyond positional literals, three layout contracts stop a rewrite. Each is checked only on the misaligned path:
+
+- **`structs.HostLayout`** — a direct field of that type (blank, named, embedded, or via alias) means the C-ABI layout is the contract: the struct is **neither reported nor rewritten** (`hasHostLayout`). Per the `structs` docs the marker does not propagate to enclosing structs.
+- **Blank padding** — a `_` field of non-zero size (cache-line or alignment pad) makes the waste deliberate: like `HostLayout`, the struct is **neither reported nor rewritten** (`hasBlankPadding`), since its "could be" figure would require moving the pad. Zero-sized blank markers (`_ [0]func()`, `_ noCopy`) don't count.
+- **`unsafe.Offsetof(x.f)`** anywhere in the package (excluded files included, like positional literals) pins x's struct and every embedded struct on the path to a promoted `f`, but not `f`'s own type (`collectLayoutPins`, which also gathers positional literals; first use in source order wins). Reported with a `reorder skipped: unsafe.Offsetof at …` caveat. An `Offsetof` in an in-package `*_test.go` follows the positional-literal deferral exactly, including its duplicate-diagnostic trade-off (base pass plain, `[p.test]` variant caveated).
+
+Coverage: `TestLayoutPins` / `TestApplyLayoutPins` (fixture `testdata/src/layoutpin/`, 64-bit only) and the `-diff` tests `TestApplyDiff`, `TestApplyDiffJSON`, `TestFixDiffGlobalFlags`, `TestDiffWithoutApply`, which reach unexported state through `export_test.go`.
 
 ### Type-parameter layouts
 
