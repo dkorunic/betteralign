@@ -818,7 +818,8 @@ func collectLayoutPins(inspect *inspector.Inspector, pass *analysis.Pass, sizes 
 	// through slice fields are pinned as well.
 	var pinLayout func(t types.Type, p layoutPin, followSlices bool, seen map[*types.Struct]bool)
 	pinLayout = func(t types.Type, p layoutPin, followSlices bool, seen map[*types.Struct]bool) {
-		for {
+		var visited map[*types.Named]bool
+		for !revisits(t, &visited) {
 			switch u := types.Unalias(t).Underlying().(type) {
 			case *types.Array:
 				t = u.Elem()
@@ -884,7 +885,8 @@ func collectLayoutPins(inspect *inspector.Inspector, pass *analysis.Pass, sizes 
 						continue
 					}
 					// Values arrive by pointer, slice or array; walk to the element.
-					for {
+					var visited map[*types.Named]bool
+					for !revisits(t, &visited) {
 						switch u := types.Unalias(t).Underlying().(type) {
 						case *types.Pointer:
 							t = u.Elem()
@@ -1211,6 +1213,27 @@ func scanTestFiles(fset *token.FileSet) map[string][]testFileEntry {
 // *types.Pointer arm is load-bearing: in `[]*T{{...}}` the type-checker records
 // the inner literal as *T, and without the unwrap the analyzer would reorder T
 // and break the build.
+// revisits reports whether t is a defined type the walk already passed,
+// recording it otherwise. A defined type can be its own element (type S []S,
+// type P *P), so a loop unwrapping pointers or slices needs it to terminate;
+// every such cycle runs through a defined type. Instances are keyed by their
+// origin, so the map is allocated only when a defined type is seen.
+func revisits(t types.Type, visited *map[*types.Named]bool) bool {
+	n, ok := types.Unalias(t).(*types.Named)
+	if !ok {
+		return false
+	}
+	n = n.Origin()
+	if (*visited)[n] {
+		return true
+	}
+	if *visited == nil {
+		*visited = make(map[*types.Named]bool)
+	}
+	(*visited)[n] = true
+	return false
+}
+
 func canonicalStructType(t types.Type) *types.Struct {
 	t = types.Unalias(t)
 	if p, ok := t.(*types.Pointer); ok {
