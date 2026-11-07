@@ -7,6 +7,8 @@ package betteralign_test
 
 import (
 	"bytes"
+	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -952,6 +954,190 @@ func TestFixWithGeneratedFiles(t *testing.T) {
 	if y, x := strings.Index(string(got), "y int32"), strings.Index(string(got), "x byte"); y < 0 || x < 0 || y > x {
 		t.Errorf("generated file was not rewritten under -fix -generated_files:\n%s", got)
 	}
+}
+
+// TestNested checks the diagnostics of structs holding another struct by value:
+// an inner struct the run rewrites is measured at its new layout, one it
+// leaves alone (ignored, single-line, generated) as declared.
+func TestNested(t *testing.T) {
+	analysistest.Run(t, analysistest.TestData(), NewTestAnalyzer(), "nested")
+}
+
+// TestApplyNested checks the -apply output for the nested fixture: inner
+// structs reordered, outers left where the reordered inner already fits.
+func TestApplyNested(t *testing.T) {
+	skipUnless64Bit(t)
+	tmpPkg, paths := copyTestPackage(t, "nested")
+
+	analyzer := NewTestAnalyzer()
+	_ = analyzer.Flags.Set("apply", "true")
+	analysistest.Run(t, analysistest.TestData(), analyzer, tmpPkg)
+
+	for _, path := range paths {
+		got, err := os.ReadFile(filepath.Join(analysistest.TestData(), "src", tmpPkg, filepath.Base(path)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		golden.Assert(t, string(got), filepath.Join("src", "nested", filepath.Base(path)+".golden"))
+	}
+}
+
+// TestApplyIsFixedPoint pins one-run convergence: a second -apply over the
+// first one's output changes nothing. An enclosing struct used to be laid out
+// against its inner struct's old layout, which the same run then changed, so
+// the next run moved it again (x/tools needed four runs) and a CI check
+// failed right after -fix.
+func TestApplyIsFixedPoint(t *testing.T) {
+	skipUnless64Bit(t)
+	for _, name := range []string{"a", "layoutpin", "nested"} {
+		t.Run(name, func(t *testing.T) {
+			tmpPkg, paths := copyTestPackage(t, name)
+			dir := filepath.Join(analysistest.TestData(), "src", tmpPkg)
+			apply := func() map[string]string {
+				analyzer := NewTestAnalyzer()
+				_ = analyzer.Flags.Set("apply", "true")
+				// The want comments describe the pristine sources; once
+				// rewritten they no longer match, so only load and type
+				// errors matter here.
+				rec := &errorRecorder{}
+				analysistest.Run(rec, analysistest.TestData(), analyzer, tmpPkg)
+				for _, msg := range rec.loadErrors() {
+					t.Errorf("after -apply: %s", msg)
+				}
+				return readGoFiles(t, dir)
+			}
+			pristine := readGoFiles(t, dir)
+			first := apply()
+			if len(paths) > 0 && maps.Equal(pristine, first) {
+				t.Fatalf("first -apply changed nothing in %s; the fixture no longer exercises a rewrite", name)
+			}
+			second := apply()
+			for fn, src := range second {
+				if src != first[fn] {
+					t.Errorf("second -apply changed %s:\n%s", fn, diff.Diff("first", []byte(first[fn]), "second", []byte(src)))
+				}
+			}
+		})
+	}
+}
+
+// TestNestedConversionStaysInStep applies both sides of a cross-package
+// conversion whose structs hold an inner struct the run reorders. Each pass
+// must reach the same verdict on the pair, or the conversion stops
+// compiling: the prediction behind the inner struct's measured layout uses
+// only what both packages see alike.
+func TestNestedConversionStaysInStep(t *testing.T) {
+	skipUnless64Bit(t)
+	srcDir := filepath.Join("testdata", "src")
+	tmpDir, err := os.MkdirTemp(srcDir, "xconv-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(tmpDir) })
+	root := filepath.Base(tmpDir)
+	for _, pkg := range []string{"dep", "user"} {
+		paths, err := filepath.Glob(filepath.Join(srcDir, "xconv", pkg, "*.go"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(tmpDir, "xconv", pkg), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		for _, path := range paths {
+			src, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			src = bytes.ReplaceAll(src, []byte(`"xconv/dep"`), []byte(`"`+root+`/xconv/dep"`))
+			if err := os.WriteFile(filepath.Join(tmpDir, "xconv", pkg, filepath.Base(path)), src, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	pkgs := []string{root + "/xconv/dep", root + "/xconv/user"}
+
+	analyzer := NewTestAnalyzer()
+	_ = analyzer.Flags.Set("apply", "true")
+	analysistest.Run(&errorRecorder{}, analysistest.TestData(), analyzer, pkgs...)
+
+	// Reload the rewritten pair: a mismatched order is a type error.
+	rec := &errorRecorder{}
+	analysistest.Run(rec, analysistest.TestData(), NewTestAnalyzer(), pkgs...)
+	for _, msg := range rec.loadErrors() {
+		t.Errorf("after -apply: %s", msg)
+	}
+	user, err := os.ReadFile(filepath.Join(tmpDir, "xconv", "user", "user.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(user), "type NT struct {\n\tF  dep.Four\n\tIn dep.Inner\n}") {
+		t.Errorf("NT was reordered although dep.NU stays in place:\n%s", user)
+	}
+}
+
+// TestLineDirectiveWithoutColumn is the end-to-end regression for BUG-45: a
+// struct after a //line directive naming an absolute file but no column has
+// column 0 ("unknown"), and measuring an enclosing struct read its
+// declaration with that column and panicked, killing the run.
+func TestLineDirectiveWithoutColumn(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "src", "linedir")
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(dir, "a.go")
+	src := "package linedir\n\n//line " + file + ":4\ntype inner struct {\n\tp *int\n\ta bool\n\tq *int\n}\n\n" +
+		"type outer struct {\n\tf  [4]*int\n\tin inner\n}\n"
+	if err := os.WriteFile(file, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rec := &errorRecorder{}
+	analysistest.Run(rec, root, NewTestAnalyzer(), "linedir")
+	if errs := rec.loadErrors(); len(errs) > 0 {
+		t.Errorf("load errors: %v", errs)
+	}
+	if !slices.ContainsFunc(rec.msgs, func(m string) bool { return strings.Contains(m, "struct with 24 pointer bytes could be 16") }) {
+		t.Errorf("inner not reported; got %q", rec.msgs)
+	}
+}
+
+// errorRecorder is an analysistest.Testing that collects messages instead of
+// failing, for runs whose want comments are knowingly stale.
+type errorRecorder struct{ msgs []string }
+
+func (r *errorRecorder) Errorf(format string, args ...any) {
+	r.msgs = append(r.msgs, fmt.Sprintf(format, args...))
+}
+
+// loadErrors returns the messages that are not want-comment mismatches: load
+// and type-check failures.
+func (r *errorRecorder) loadErrors() []string {
+	var out []string
+	for _, m := range r.msgs {
+		if strings.Contains(m, "unexpected diagnostic") || strings.Contains(m, "no diagnostic was reported") || strings.Contains(m, "does not match pattern") {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// readGoFiles returns dir's .go files by base name.
+func readGoFiles(t *testing.T, dir string) map[string]string {
+	t.Helper()
+	paths, err := filepath.Glob(filepath.Join(dir, "*.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := make(map[string]string, len(paths))
+	for _, p := range paths {
+		src, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out[filepath.Base(p)] = string(src)
+	}
+	return out
 }
 
 // TestCrossPackageConversionFollowsPartner pins the fix for a regression the

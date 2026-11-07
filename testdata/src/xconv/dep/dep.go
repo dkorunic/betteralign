@@ -70,3 +70,45 @@ type Deep struct {
 		Z3 bool
 	}
 }
+
+// Four is optimal; Inner is reordered by this package's pass, ending in 8
+// pointer-free bytes. NU holds both; measured as the run leaves Inner, NU is
+// already in place — and an importer's identical struct converted to NU must
+// reach the same verdict, or the conversion breaks.
+type Four struct {
+	P, Q, R *int
+	X       int64
+}
+
+type Inner struct {
+	P *int
+	A bool
+	Q *int
+}
+
+type NU struct {
+	F  Four
+	In Inner
+}
+
+// Ignored is never reordered by this package's pass, which an importer can
+// see in the source: a struct converted to it must stay put.
+type Ignored struct { // betteralign:ignore
+	I1 bool
+	I2 int64
+	I3 bool
+}
+
+// Unnamed struct elements of an array variable and a channel: assigning an
+// element or sending links an importer's struct to them.
+var Arr [2]struct {
+	R1 bool
+	R2 int64
+	R3 bool
+}
+
+var Ch chan struct {
+	S1 bool
+	S2 int64
+	S3 bool
+}

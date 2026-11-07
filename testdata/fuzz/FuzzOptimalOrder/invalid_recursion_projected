@@ -1,0 +1,2 @@
+go test fuzz v1
+string("package A\ntype e struct{A\nB\ne}\nvar A=e{}")

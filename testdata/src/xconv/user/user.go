@@ -88,3 +88,39 @@ type Z struct { // want `struct of size 24 could be 16$`
 }
 
 var _ dep.Shallow
+
+// Identical to dep.NU and converted to it: both passes measure dep.Inner as
+// reordered, so both leave the order alone and the conversion still compiles.
+type NT struct {
+	F  dep.Four
+	In dep.Inner
+}
+
+func toNU(n NT) dep.NU { return dep.NU(n) }
+
+// Converted to dep.Ignored, which dep's pass leaves alone: pinned, so the
+// conversion keeps compiling.
+type ToIgnored struct { // want `reorder skipped: conversion at`
+	I1 bool
+	I2 int64
+	I3 bool
+}
+
+func toIgnored(t ToIgnored) dep.Ignored { return dep.Ignored(t) }
+
+type ArrElem struct { // want `reorder skipped: identical unnamed struct type at .*dep.go`
+	R1 bool
+	R2 int64
+	R3 bool
+}
+
+type ChElem struct { // want `reorder skipped: identical unnamed struct type at .*dep.go`
+	S1 bool
+	S2 int64
+	S3 bool
+}
+
+func elements(a ArrElem, c ChElem) {
+	dep.Arr[0] = a
+	dep.Ch <- c
+}

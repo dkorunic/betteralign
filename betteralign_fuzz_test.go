@@ -111,6 +111,25 @@ func typeCheckFuzzSource(src string) (pkg *types.Package, skip string) {
 	return pkg, ""
 }
 
+// typeChecksCleanly reports whether src type-checks without errors, the only
+// packages an analysis driver hands the analyzer.
+func typeChecksCleanly(src string) bool {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "input.go", src, parser.SkipObjectResolution)
+	if err != nil {
+		return false
+	}
+	clean := true
+	conf := types.Config{Error: func(error) { clean = false }, IgnoreFuncBodies: true}
+	defer func() {
+		if recover() != nil {
+			clean = false
+		}
+	}()
+	_, _ = conf.Check("fuzz", fset, []*ast.File{file}, nil)
+	return clean
+}
+
 // typeCheckFuzzInput type-checks src for the fuzz targets, delegating to
 // typeCheckFuzzSource and translating an uninteresting-input signal into t.Skip.
 // It must be called from the goroutine running the fuzz/test function, because
@@ -133,6 +152,11 @@ func typeCheckFuzzInput(t *testing.T, src string) *types.Package {
 //   - returned optSize never exceeds the struct's original Sizeof
 //   - returned optPtrdata never exceeds the struct's original ptrdata
 //
+// each under 64-bit sizes, 32-bit sizes (where only an align64 type, which
+// needs sync/atomic and so never appears here, may break the last two), and
+// 64-bit sizes measuring every named struct as reordered (gcSizes.projected),
+// which recurses through rewriteCandidate on inner structs.
+//
 // Skip conditions (treated as "uninteresting input"): parser failure,
 // type-checker producing nil package, struct with zero fields.
 func FuzzOptimalOrder(f *testing.F) {
@@ -150,25 +174,35 @@ func FuzzOptimalOrder(f *testing.F) {
 			t.Skip("type-check produced nil package")
 		}
 		markPhase("walk")
-		sizes := newGCSizes(8, 8)
-		for _, name := range pkg.Scope().Names() {
-			tn, ok := pkg.Scope().Lookup(name).(*types.TypeName)
-			if !ok {
-				continue
+		models := []*gcSizes{newGCSizes(8, 8), newGCSizes(4, 4)}
+		// Projection runs only where the analyzer does: drivers skip packages
+		// with type errors (no RunDespiteErrors), and an invalid by-value
+		// cycle (type e struct{ e }) yields figures no real pass can see.
+		if typeChecksCleanly(src) {
+			projected := newGCSizes(8, 8)
+			projected.rewritten = func(*types.Struct) bool { return true }
+			models = append(models, projected)
+		}
+		for _, sizes := range models {
+			for _, name := range pkg.Scope().Names() {
+				tn, ok := pkg.Scope().Lookup(name).(*types.TypeName)
+				if !ok {
+					continue
+				}
+				named, ok := tn.Type().(*types.Named)
+				if !ok {
+					continue
+				}
+				st, ok := named.Origin().Underlying().(*types.Struct)
+				if !ok {
+					continue
+				}
+				if st.NumFields() == 0 {
+					continue
+				}
+				markPhase("check")
+				checkOptimalOrderInvariants(t, name, st, sizes)
 			}
-			named, ok := tn.Type().(*types.Named)
-			if !ok {
-				continue
-			}
-			st, ok := named.Origin().Underlying().(*types.Struct)
-			if !ok {
-				continue
-			}
-			if st.NumFields() == 0 {
-				continue
-			}
-			markPhase("check")
-			checkOptimalOrderInvariants(t, name, st, sizes)
 		}
 		markPhase("done")
 	})
@@ -308,5 +342,21 @@ func FuzzGeneratedByMatcher(f *testing.F) {
 		if got, want := reGeneratedBy(s), ref.MatchString(s); got != want {
 			t.Errorf("reGeneratedBy(%q) = %v, regexp = %v", s, got, want)
 		}
+	})
+}
+
+// FuzzReorderableAt feeds declSource.reorderableAt arbitrary file text and
+// positions: it reads whatever file a type's position names, so it must not
+// panic on any line or column, however inconsistent with the text.
+func FuzzReorderableAt(f *testing.F) {
+	f.Add("type T struct { // betteralign:ignore\n\ta bool\n}", 2, 2)
+	f.Add("type T struct{ a bool; b int64 }", 1, 16)
+	f.Add("", 0, 0)
+	f.Fuzz(func(t *testing.T, src string, line, column int) {
+		if line < 1 {
+			return // declRewritable only calls it for valid positions
+		}
+		ds := &declSource{lines: strings.Split(src, "\n")}
+		_ = ds.reorderableAt(line, column)
 	})
 }

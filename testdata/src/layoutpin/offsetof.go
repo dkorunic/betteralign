@@ -30,19 +30,22 @@ type Asserted struct { // want `struct of size 12 could be 8; reorder skipped: u
 var _ [unsafe.Offsetof(Asserted{}.b) - 4]byte
 
 // A promoted field pins the outer struct and every embedded struct on the path.
-type Inner struct { // want `struct of size 12 could be 8; reorder skipped: unsafe.Offsetof at .*offsetof.go:51:`
+// Middle and Outer measure Inner and Middle at their reordered layout: the
+// prediction that sizes enclosing structs must agree across packages, so it
+// can't see this package's pins (README: layout of a pinned inner struct).
+type Inner struct { // want `struct of size 12 could be 8; reorder skipped: unsafe.Offsetof at .*offsetof.go:54:`
 	x bool
 	y int32
 	z bool
 }
 
-type Middle struct { // want `struct of size 20 could be 16; reorder skipped: unsafe.Offsetof at .*offsetof.go:51:`
+type Middle struct { // want `struct of size 16 could be 12; reorder skipped: unsafe.Offsetof at .*offsetof.go:54:`
 	m bool
 	Inner
 	n bool
 }
 
-type Outer struct { // want `struct of size 28 could be 24; reorder skipped: unsafe.Offsetof at .*offsetof.go:51:`
+type Outer struct { // want `struct of size 20 could be 16; reorder skipped: unsafe.Offsetof at .*offsetof.go:54:`
 	o bool
 	Middle
 	p bool
@@ -102,7 +105,7 @@ func (WithMethod) M() {}
 var _ = WithMethod{}.M
 
 // Positional literal and Offsetof on one struct: the first in source wins.
-type Both struct { // want `reorder skipped: positional composite literal at .*offsetof.go:112:`
+type Both struct { // want `reorder skipped: positional composite literal at .*offsetof.go:115:`
 	a bool
 	b int32
 	c bool

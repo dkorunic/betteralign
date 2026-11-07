@@ -37,6 +37,7 @@ import (
 	"flag"
 	"fmt"
 	"go/ast"
+	"go/build"
 	"go/parser"
 	"go/token"
 	"go/types"
@@ -361,6 +362,30 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 		}
 	}
 
+	// Measure each named struct this run will reorder at its post-reorder
+	// layout, so enclosing structs settle in one run (gcSizes.projected).
+	// The prediction must come out the same in every pass — the two sides of a
+	// cross-package conversion sort identical fields, and must sort them
+	// identically — so it uses only the struct's own layout and what its
+	// declaring file shows to anyone (declRewritable), never this package's
+	// pins. -opt_in disables it: another package's opt-in marks are invisible.
+	if !optInMode {
+		skipFile := func(fn string) bool {
+			return (!testFiles && hasSuffix(fn, testSuffixes)) ||
+				(!generatedFiles && hasSuffix(fn, generatedSuffixes)) ||
+				(wd != "" && isExcluded(wd, fn, excludeDirs, excludeFiles))
+		}
+		rewrites := make(map[*types.Struct]bool)
+		sizes.rewritten = func(decl *types.Struct) bool {
+			v, ok := rewrites[decl]
+			if !ok {
+				v = declRewritable(pass, decl, skipFile, generatedFiles)
+				rewrites[decl] = v
+			}
+			return v
+		}
+	}
+
 	// Per-file state set on *ast.File visit; reused by child node visits.
 	var (
 		currentFn      string
@@ -661,7 +686,16 @@ func rewriteCandidate(str *types.Struct, sizes *gcSizes) (ok bool, optSize, optP
 	if hasHostLayout(str) || hasBlankPadding(str, sizes) || isASN1Struct(str) {
 		return false, 0, 0
 	}
-	if sizes.Sizeof(str) == optSize && sizes.ptrdata(str) == optPtrdata {
+	size, ptrdata := sizes.Sizeof(str), sizes.ptrdata(str)
+	if size == optSize && ptrdata == optPtrdata {
+		return false, 0, 0
+	}
+	// The sort never makes either figure worse except on 32-bit, where an
+	// 8-aligned atomic.Int64 (align64) sorts ahead of 4-aligned pointers and
+	// can push them later. Size, the real memory, still decides: a smaller
+	// struct is worth more pointer bytes, but a reorder that saves no memory
+	// and raises them ("-4 bytes saved") is not offered.
+	if optSize > size || optSize == size && optPtrdata > ptrdata {
 		return false, 0, 0
 	}
 	return true, optSize, optPtrdata
@@ -1149,6 +1183,12 @@ func foreignRewritten(pass *analysis.Pass, t types.Type, st *types.Struct, sizes
 	if pkg == nil || pkg == pass.Pkg || !sameRun(pass, named.Obj()) {
 		return false
 	}
+	// What that package's file shows (an ignore directive, a generated-code
+	// header, an excluded path) is visible here too: such a struct is never
+	// reordered, so the local side must stay pinned to it.
+	if sizes.rewritten != nil && !sizes.rewritten(st) {
+		return false
+	}
 	ok, _, _ = rewriteCandidate(st, sizes)
 	return ok
 }
@@ -1374,10 +1414,10 @@ var testVariantCache sync.Map // map[*token.FileSet]func() map[string][]testFile
 // test file (85% of a report-only stdlib run). The FileSet is fully populated
 // before analysis, so the scan is a safe read. Unparsable files are dropped.
 func testFilesByDir(fset *token.FileSet) map[string][]testFileEntry {
-	build, _ := testVariantCache.LoadOrStore(fset, sync.OnceValue(func() map[string][]testFileEntry {
+	scan, _ := testVariantCache.LoadOrStore(fset, sync.OnceValue(func() map[string][]testFileEntry {
 		return scanTestFilesFn(fset)
 	}))
-	return build.(func() map[string][]testFileEntry)()
+	return scan.(func() map[string][]testFileEntry)()
 }
 
 // scanTestFilesFn indirects scanTestFiles so tests can count builds.
@@ -1688,8 +1728,55 @@ type gcSizes struct {
 	sizeCache  map[types.Type]int64
 	alignCache map[types.Type]int64
 	ptrCache   map[types.Type]int64
-	WordSize   int64
-	MaxAlign   int64
+	// rewritten, when set, reports whether the run will reorder the struct
+	// literal decl declares (a defined type's or a type alias's); such a
+	// struct is then measured at its post-reorder size and ptrdata (see
+	// projected). nil measures every type as declared.
+	rewritten func(decl *types.Struct) bool
+	WordSize  int64
+	MaxAlign  int64
+}
+
+// projected returns the size and ptrdata struct type T will have once this
+// run reorders it, when s.rewritten predicts that it will. An enclosing struct
+// is then laid out against the inner struct's final layout, not its current
+// one, so one run reaches the fixed point: measured as declared, the outer
+// order was chosen for an inner layout the same run changed, and the next run
+// moved it again (gorilla/mux's Router around routeConf; x/tools took four
+// runs to settle). T is a defined type or a type alias of a struct literal
+// (both declarations are rewritten); the decision is taken on the generic
+// declaration, the figures on T itself. Alignment needs no projection: a
+// reorder keeps the max.
+func (s *gcSizes) projected(T types.Type) (size, ptrdata int64, ok bool) {
+	if s.rewritten == nil {
+		return 0, 0, false
+	}
+	var st, decl *types.Struct
+	switch t := types.Unalias(T).(type) {
+	case *types.Named:
+		// Also reached through an alias of a defined type (type A = X).
+		st, _ = t.Underlying().(*types.Struct)
+		decl, _ = t.Origin().Underlying().(*types.Struct)
+	case *types.Struct:
+		// Only through an alias of a struct literal (type A = struct{...}),
+		// whose declaration is rewritten; a literal written in place is not.
+		if a, ok := T.(*types.Alias); ok {
+			st = t
+			decl, _ = types.Unalias(a.Origin()).(*types.Struct)
+		}
+	}
+	if st == nil || decl == nil || !s.rewritten(decl) {
+		return 0, 0, false
+	}
+	if decl != st {
+		// An instance: its declaration must be a candidate (not laid out by
+		// a type parameter) before the instance's own figures count.
+		if ok, _, _ := rewriteCandidate(decl, s); !ok {
+			return 0, 0, false
+		}
+	}
+	ok, size, ptrdata = rewriteCandidate(st, s)
+	return size, ptrdata, ok
 }
 
 // newGCSizes returns a *gcSizes with empty memoisation caches — required for
@@ -1823,6 +1910,9 @@ func (s *gcSizes) Sizeof(T types.Type) int64 {
 // struct gets one padding byte so its address can't alias the next allocation.
 // Unknown kinds fall back to one word.
 func (s *gcSizes) sizeofUncached(T types.Type) int64 {
+	if size, _, ok := s.projected(T); ok {
+		return size
+	}
 	switch t := T.Underlying().(type) {
 	case *types.Basic:
 		k := t.Kind()
@@ -1928,6 +2018,9 @@ func (s *gcSizes) ptrdata(T types.Type) int64 {
 // constraint's *types.Interface, caught above), but it over-reports rather than
 // panicking on any future kind.
 func (s *gcSizes) ptrdataUncached(T types.Type) int64 {
+	if _, ptrdata, ok := s.projected(T); ok {
+		return ptrdata
+	}
 	switch t := T.Underlying().(type) {
 	case *types.Basic:
 		switch t.Kind() {
@@ -2002,6 +2095,105 @@ func hasGeneratedComment(file *ast.File) bool {
 		}
 	}
 	return false
+}
+
+// declRewritable reports whether the struct literal decl is declared where its
+// own package's pass would rewrite it, judged only from facts every pass sees
+// alike: that package is in the run, its declaring file passes the run's file
+// filters (skipFile, the generated-code header), and the declaration is
+// multi-line without a betteralign:ignore. Pins and deferral are deliberately
+// not consulted — only the declaring package can see them. Layout is the
+// caller's part (rewriteCandidate).
+func declRewritable(pass *analysis.Pass, decl *types.Struct, skipFile func(string) bool, generatedFiles bool) bool {
+	if decl.NumFields() == 0 {
+		return false
+	}
+	// The first field locates the literal and its package, also for a type
+	// defined over another (type X otherpkg.Y) or an alias of one.
+	first := decl.Field(0)
+	if first.Pkg() == nil || first.Pkg() != pass.Pkg && !sameRun(pass, first) {
+		return false
+	}
+	pos := pass.Fset.Position(first.Pos())
+	fn := pos.Filename
+	if rest, ok := strings.CutPrefix(fn, "$GOROOT/"); ok {
+		fn = filepath.Join(build.Default.GOROOT, filepath.FromSlash(rest))
+	}
+	if !filepath.IsAbs(fn) || pos.Line < 1 || skipFile(fn) {
+		return false
+	}
+	src := readDeclSource(fn)
+	if !generatedFiles && src.generated {
+		return false
+	}
+	return src.reorderableAt(pos.Line, pos.Column)
+}
+
+// declSource is a declaring file as declRewritable reads it.
+type declSource struct {
+	lines     []string
+	generated bool
+}
+
+// declSourceCache memoises readDeclSource by path, size and modification
+// time, so a long-running host sees an edited file afresh.
+var declSourceCache sync.Map // map[declSourceKey]*declSource
+
+type declSourceKey struct {
+	name    string
+	size    int64
+	modTime int64
+}
+
+// readDeclSource loads fn's lines and generated-code header; an unreadable
+// file yields an empty declSource, which reorderableAt treats as plain.
+func readDeclSource(fn string) *declSource {
+	fi, err := os.Stat(fn)
+	if err != nil {
+		return &declSource{}
+	}
+	key := declSourceKey{fn, fi.Size(), fi.ModTime().UnixNano()}
+	if v, ok := declSourceCache.Load(key); ok {
+		return v.(*declSource)
+	}
+	ds := &declSource{}
+	if src, err := os.ReadFile(fn); err == nil {
+		ds.lines = strings.Split(string(src), "\n")
+		if f, err := parser.ParseFile(token.NewFileSet(), fn, src, parser.PackageClauseOnly|parser.ParseComments); err == nil {
+			ds.generated = hasGeneratedComment(f)
+		}
+	}
+	v, _ := declSourceCache.LoadOrStore(key, ds)
+	return v.(*declSource)
+}
+
+// reorderableAt reports whether the struct whose first field starts at line
+// and column (1-based) can be rewritten: its body does not start on the
+// opening-brace line (dstmin refuses single-line structs), and that line —
+// the nearest above the field, skipping blanks and the field's doc comment —
+// carries no betteralign:ignore.
+func (ds *declSource) reorderableAt(line, column int) bool {
+	if line > len(ds.lines) {
+		return true
+	}
+	// Column 0 is unknown (code after a //line directive without one): skip
+	// the single-line test rather than slice with it (BUG-45: it panicked).
+	if text := ds.lines[line-1]; column >= 1 && column-1 <= len(text) && strings.Contains(text[:column-1], "{") {
+		return false
+	}
+	for i := line - 2; i >= 0; i-- {
+		text := strings.TrimSpace(ds.lines[i])
+		if text == "" || strings.HasPrefix(text, "//") {
+			continue
+		}
+		brace := strings.LastIndex(text, "{")
+		if brace < 0 {
+			return true
+		}
+		comment := strings.TrimSpace(text[brace+1:])
+		return !commentHasDirective(comment, ignoreStruct)
+	}
+	return true
 }
 
 // normalizeExcludePaths canonicalises exclude-flag entries for filepath.Match:

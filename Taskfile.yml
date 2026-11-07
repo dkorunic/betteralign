@@ -101,6 +101,12 @@ tasks:
       - task: _clean-fuzz
       - go test -run='^$' -fuzz=^FuzzGCSizes$ -fuzztime={{.FUZZTIME}} .
 
+  fuzz-reorderableat:
+    desc: 'Run native FuzzReorderableAt. Override: task fuzz-reorderableat FUZZTIME=2h (default 3600s). CLEAN=true clears the coverage cache first.'
+    cmds:
+      - task: _clean-fuzz
+      - go test -run='^$' -fuzz=^FuzzReorderableAt$ -fuzztime={{.FUZZTIME}} .
+
   fuzz-decoratefileidentity:
     desc: 'Run native FuzzDecorateFileIdentity. Override: task fuzz-decoratefileidentity FUZZTIME=2h (default 3600s). CLEAN=true clears the coverage cache first.'
     cmds:
