@@ -54,6 +54,7 @@ import (
 	"github.com/dkorunic/betteralign/internal/diff"
 	dst "github.com/dkorunic/betteralign/internal/dstmin"
 	"github.com/google/renameio/v2/maybe"
+	"golang.org/x/mod/modfile"
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/inspect"
 	"golang.org/x/tools/go/ast/inspector"
@@ -1145,22 +1146,91 @@ func foreignRewritten(pass *analysis.Pass, t types.Type, st *types.Struct, sizes
 		return false
 	}
 	pkg := named.Obj().Pkg()
-	if pkg == nil || pkg == pass.Pkg || !sameRun(pass, pkg) {
+	if pkg == nil || pkg == pass.Pkg || !sameRun(pass, named.Obj()) {
 		return false
 	}
 	ok, _, _ = rewriteCandidate(st, sizes)
 	return ok
 }
 
-// sameRun guesses whether pkg is analyzed in the same run as pass: the same
-// module, or — without module information — the same side of the standard
-// library boundary (std builds and GOPATH-mode trees such as analysistest's).
-func sameRun(pass *analysis.Pass, pkg *types.Package) bool {
+// sameRun guesses whether obj's package is analyzed in the same run as pass:
+// the same module, another module of the active go.work workspace (`./...`
+// at its root analyzes them together), or — without module information — the
+// same side of the standard-library boundary (std builds and GOPATH-mode
+// trees such as analysistest's). A module only replaced to a local directory
+// is not in the run; neither is anything in the module cache or GOROOT, whose
+// files never sit in a used module's directory.
+func sameRun(pass *analysis.Pass, obj types.Object) bool {
+	pkg := obj.Pkg()
 	if pass.Module == nil || pass.Module.Path == "" {
 		return isStdPath(pass.Pkg.Path()) == isStdPath(pkg.Path())
 	}
 	m := pass.Module.Path
-	return pkg.Path() == m || strings.HasPrefix(pkg.Path(), m+"/")
+	if pkg.Path() == m || strings.HasPrefix(pkg.Path(), m+"/") {
+		return true
+	}
+	file := pass.Fset.Position(obj.Pos()).Filename
+	if !filepath.IsAbs(file) || len(pass.Files) == 0 {
+		return false
+	}
+	self := pass.Fset.File(pass.Files[0].Pos())
+	if self == nil {
+		return false
+	}
+	return slices.Contains(workspaceModules(filepath.Dir(self.Name())), moduleRoot(file))
+}
+
+// workspaceCache memoises workspaceModules by GOWORK and starting directory.
+var workspaceCache sync.Map // map[[2]string][]string
+
+// workspaceModules returns the directories of the modules used by the go.work
+// governing dir — GOWORK if set ("off" disables workspaces), else the nearest
+// go.work above dir, as the go command picks it — or nil outside a workspace.
+func workspaceModules(dir string) []string {
+	key := [2]string{os.Getenv("GOWORK"), dir}
+	if v, ok := workspaceCache.Load(key); ok {
+		return v.([]string)
+	}
+	var dirs []string
+	work := key[0]
+	if work == "" {
+		for d := dir; ; d = filepath.Dir(d) {
+			if _, err := os.Stat(filepath.Join(d, "go.work")); err == nil {
+				work = filepath.Join(d, "go.work")
+				break
+			}
+			if filepath.Dir(d) == d {
+				break
+			}
+		}
+	}
+	if work != "" && work != "off" {
+		if data, err := os.ReadFile(work); err == nil {
+			if wf, err := modfile.ParseWork(work, data, nil); err == nil {
+				for _, u := range wf.Use {
+					p := u.Path
+					if !filepath.IsAbs(p) {
+						p = filepath.Join(filepath.Dir(work), p)
+					}
+					dirs = append(dirs, filepath.Clean(p))
+				}
+			}
+		}
+	}
+	workspaceCache.Store(key, dirs)
+	return dirs
+}
+
+// moduleRoot returns the directory of the go.mod nearest above file, or "".
+func moduleRoot(file string) string {
+	for d := filepath.Dir(file); ; d = filepath.Dir(d) {
+		if _, err := os.Stat(filepath.Join(d, "go.mod")); err == nil {
+			return d
+		}
+		if filepath.Dir(d) == d {
+			return ""
+		}
+	}
 }
 
 // isStdPath reports whether path looks like a standard-library import path:

@@ -2432,12 +2432,63 @@ func TestSameRun(t *testing.T) {
 		{"std to third party", "", "net/http", "example.com/x", false},
 		{"GOPATH to GOPATH", "", "xconv/user", "xconv/dep", true},
 	} {
-		pass := &analysis.Pass{Pkg: types.NewPackage(tc.self, "self")}
+		pass := &analysis.Pass{Pkg: types.NewPackage(tc.self, "self"), Fset: token.NewFileSet()}
 		if tc.module != "" {
 			pass.Module = &analysis.Module{Path: tc.module}
 		}
-		if got := sameRun(pass, types.NewPackage(tc.other, "other")); got != tc.want {
+		obj := types.NewTypeName(token.NoPos, types.NewPackage(tc.other, "other"), "T", nil)
+		if got := sameRun(pass, obj); got != tc.want {
 			t.Errorf("%s: sameRun = %v, want %v", tc.name, got, tc.want)
 		}
 	}
+}
+
+// TestSameRunWorkspace pins the go.work case: `./...` at a workspace root
+// analyzes every used module together, so a partner declared in another used
+// module is rewritten by the same run. Predicting otherwise pinned the local
+// side of a conversion while the partner's pass reordered it, breaking a build
+// v0.15.4 left intact. A module merely replaced to a local directory, or
+// nested inside a used one without being used itself, is not in the run.
+func TestSameRunWorkspace(t *testing.T) {
+	root := t.TempDir()
+	write := func(rel, content string) string {
+		t.Helper()
+		p := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	write("ws/go.work", "go 1.24\n\nuse (\n\t./a\n\t./b\n)\n")
+	for _, m := range []string{"ws/a", "ws/b", "ws/b/sub", "ws/c", "solo/a", "solo/b"} {
+		write(m+"/go.mod", "module example.com/"+filepath.Base(m)+"\n\ngo 1.24\n")
+	}
+
+	check := func(name, self, other string, want bool) {
+		t.Helper()
+		fset := token.NewFileSet()
+		selfFile := fset.AddFile(filepath.Join(root, self), -1, 10)
+		otherFile := fset.AddFile(filepath.Join(root, other), -1, 10)
+		pass := &analysis.Pass{
+			Pkg:    types.NewPackage("example.com/a", "a"),
+			Module: &analysis.Module{Path: "example.com/a"},
+			Fset:   fset,
+			Files:  []*ast.File{{Package: selfFile.Pos(0), Name: ast.NewIdent("a")}},
+		}
+		obj := types.NewTypeName(otherFile.Pos(0), types.NewPackage("example.com/other", "other"), "U", nil)
+		if got := sameRun(pass, obj); got != want {
+			t.Errorf("%s: sameRun = %v, want %v", name, got, want)
+		}
+	}
+	check("used workspace module", "ws/a/a.go", "ws/b/b.go", true)
+	check("used module, nested package", "ws/a/a.go", "ws/b/x/y.go", true)
+	check("nested module not used", "ws/a/a.go", "ws/b/sub/s.go", false)
+	check("module outside use list", "ws/a/a.go", "ws/c/c.go", false)
+	check("replace without workspace", "solo/a/a.go", "solo/b/b.go", false)
+
+	t.Setenv("GOWORK", "off")
+	check("GOWORK=off", "ws/a/a.go", "ws/b/b.go", false)
 }
