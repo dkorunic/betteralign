@@ -117,16 +117,57 @@ func (dec *Decorator) DecorateFile(f *ast.File) (*File, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s: %w", ErrSourceRead, tf.Name(), err)
 	}
+	if !sourceMatchesAST(f, tf, src) {
+		return nil, fmt.Errorf("%w: %s: changed on disk since it was parsed", ErrSourceRead, tf.Name())
+	}
 	return dec.DecorateFileSrc(f, src), nil
+}
+
+// sourceMatchesAST reports whether src is still the text f was parsed from.
+// Every splice offset comes from the AST, so bytes from a file edited after
+// parsing (an editor save, a git checkout mid-run) would be sliced out of
+// range — a panic that kills the whole analysis — or, at the same length,
+// spliced into garbage. The length must equal what the parser saw, and every
+// identifier and struct brace must still sit at its parsed offset, which pins
+// the field-name and brace bytes the splice cuts around.
+func sourceMatchesAST(f *ast.File, tf *token.File, src []byte) bool {
+	if len(src) != tf.Size() {
+		return false
+	}
+	at := func(pos token.Pos, want string) bool {
+		if !pos.IsValid() {
+			return true
+		}
+		off := tf.Offset(pos)
+		return off+len(want) <= len(src) && string(src[off:off+len(want)]) == want
+	}
+	// Returning false only prunes a node's children, so the walk keeps visiting
+	// siblings; ok must latch false once any mismatch is seen.
+	ok := true
+	ast.Inspect(f, func(n ast.Node) bool {
+		if !ok {
+			return false
+		}
+		switch n := n.(type) {
+		case *ast.Ident:
+			ok = at(n.NamePos, n.Name)
+		case *ast.StructType:
+			if n.Fields != nil {
+				ok = at(n.Fields.Opening, "{") && at(n.Fields.Closing, "}")
+			}
+		}
+		return ok
+	})
+	return ok
 }
 
 // sourceCache memoises each file's first-read bytes by path, process-wide.
 var sourceCache sync.Map // map[string][]byte
 
 // readSourceOnce pins the bytes the splice runs against to the file as first
-// seen, so they still match the AST offsets after -fix rewrites it (issue #36).
+// seen, so they still match the AST offsets after -apply rewrites it (issue #36).
 //
-// Under `betteralign -fix ./...` a non-test file loads in several package
+// Under `betteralign -apply ./...` a non-test file loads in several package
 // variants (base + [p.test]), so independent passes decorate and rewrite the
 // same path. A fresh os.ReadFile would hand a later pass an earlier pass's
 // rewrite, and its stale offsets would duplicate/drop fields. Safe because a
@@ -692,31 +733,91 @@ func filterOutermost(dirty []*StructType) []*StructType {
 }
 
 // Fprint writes f's source with any Fields.List reorders applied, through gofmt
-// and a re-parse before handing bytes to w. The re-parse is deliberate: gofmt
-// can silently accept input it rewrites into broken Go (BUG-42's build-constraint
-// promotion), so a successful Fprint guarantees w received parsing bytes.
-//
-// With nothing dirty it writes f.source verbatim — a true identity with no
-// formatting drift. gofmt/re-parse failures wrap ErrFormat so callers can skip
-// the file. Each field emits both lead- and trail-blanks; gofmt coalesces the
-// duplicates, matching sirkon/dst's dual-decoration without a coalescer here.
+// and a re-parse before handing bytes to w; see Reprint.
 func Fprint(w io.Writer, f *File) error {
-	dirty := dirtyStructs(f)
-	if len(dirty) == 0 {
-		_, err := w.Write(f.source)
+	out, _, err := Reprint(f)
+	if err != nil {
 		return err
 	}
-	dirty = filterOutermost(dirty)
-	out := spliceDirty(f, dirty)
-	formatted, err := format.Source(out)
-	if err != nil {
-		return fmt.Errorf("%w: %w", ErrFormat, err)
-	}
-	if _, err := parser.ParseFile(token.NewFileSet(), "", formatted, parser.SkipObjectResolution); err != nil {
-		return fmt.Errorf("%w: re-parse: %w", ErrFormat, err)
-	}
-	_, err = w.Write(formatted)
+	_, err = w.Write(out)
 	return err
+}
+
+// BodyEdit replaces one reordered struct's body — the bytes strictly between
+// its braces — with its gofmt'd reprint. Pos/End are in the original file's
+// FileSet, so the edit maps directly onto an analysis.TextEdit.
+type BodyEdit struct {
+	Struct   *ast.StructType
+	Pos, End token.Pos
+	New      []byte
+}
+
+// Reprint returns f's source with any Fields.List reorders applied, plus one
+// BodyEdit per reordered (outermost) struct. The re-parse is deliberate: gofmt
+// can silently accept input it rewrites into broken Go (BUG-42's
+// build-constraint promotion), so a successful Reprint guarantees the bytes
+// parse.
+//
+// With nothing dirty it returns f.source verbatim — a true identity with no
+// formatting drift — and no edits. gofmt/re-parse failures wrap ErrFormat so
+// callers can skip the file. Each field emits both lead- and trail-blanks;
+// gofmt coalesces the duplicates, matching sirkon/dst's dual-decoration
+// without a coalescer here.
+//
+// Each edit's text is cut from the whole-file gofmt output, so its column
+// alignment and indentation are exactly gofmt's in context: applying all edits
+// to a gofmt-clean source reproduces the returned bytes without a further
+// format pass. Structs are matched between the two trees by their index in
+// ast.Inspect order, which gofmt cannot change; a count mismatch is ErrFormat.
+func Reprint(f *File) ([]byte, []BodyEdit, error) {
+	dirty := dirtyStructs(f)
+	if len(dirty) == 0 {
+		return f.source, nil, nil
+	}
+	dirty = filterOutermost(dirty)
+	formatted, err := format.Source(spliceDirty(f, dirty))
+	if err != nil {
+		return nil, nil, fmt.Errorf("%w: %w", ErrFormat, err)
+	}
+	outFset := token.NewFileSet()
+	outFile, err := parser.ParseFile(outFset, "", formatted, parser.SkipObjectResolution)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%w: re-parse: %w", ErrFormat, err)
+	}
+
+	before, after := structsInOrder(f.ast), structsInOrder(outFile)
+	if len(before) != len(after) {
+		return nil, nil, fmt.Errorf("%w: struct count changed %d -> %d", ErrFormat, len(before), len(after))
+	}
+	index := make(map[*ast.StructType]int, len(before))
+	for i, st := range before {
+		index[st] = i
+	}
+	outTF := outFset.File(outFile.Pos())
+	edits := make([]BodyEdit, 0, len(dirty))
+	for _, st := range dirty {
+		o := after[index[st.ast]]
+		edits = append(edits, BodyEdit{
+			Struct: st.ast,
+			Pos:    st.ast.Fields.Opening + 1,
+			End:    st.ast.Fields.Closing,
+			New:    formatted[outTF.Offset(o.Fields.Opening)+1 : outTF.Offset(o.Fields.Closing)],
+		})
+	}
+	return formatted, edits, nil
+}
+
+// structsInOrder lists f's struct types with a field list in ast.Inspect
+// order, the order Reprint matches the original and formatted trees by.
+func structsInOrder(f *ast.File) []*ast.StructType {
+	var out []*ast.StructType
+	ast.Inspect(f, func(n ast.Node) bool {
+		if st, ok := n.(*ast.StructType); ok && st.Fields != nil {
+			out = append(out, st)
+		}
+		return true
+	})
+	return out
 }
 
 // dirtyStructs collects structs whose Fields.List was reordered since

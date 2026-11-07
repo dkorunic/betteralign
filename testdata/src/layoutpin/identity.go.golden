@@ -1,0 +1,180 @@
+package layoutpin
+
+import (
+	"encoding/binary"
+	"io"
+	"unsafe"
+)
+
+// Assigning a named struct to an identical unnamed struct type relies on
+// identical field order. Each group uses its own field names: an unnamed
+// struct is identical to every struct with the same names, types and tags.
+type AnonRet struct { // want `struct of size 24 could be 16; reorder skipped: identical unnamed struct type at .*identity.go:18:`
+	ra bool
+	rb int64
+	rc bool
+}
+
+func anonRet(t AnonRet) struct { // @anonret
+	ra bool
+	rb int64
+	rc bool
+} {
+	return t
+}
+
+// An alias to an unnamed struct is identical to every matching literal.
+type AliasAnon = struct { // want `struct of size 24 could be 16; reorder skipped: identical unnamed struct type at .*identity.go:33:`
+	x bool
+	y int64
+	z bool
+}
+
+func useAliasAnon(v struct { // @useanon
+	x bool
+	y int64
+	z bool
+}) {
+}
+
+// A conversion between distinct named structs pins both sides.
+type ConvA struct { // want `reorder skipped: conversion at .*identity.go:53:`
+	ca bool
+	cb int64
+	cc bool
+}
+
+type ConvB struct { // want `reorder skipped: conversion at .*identity.go:53:`
+	ca bool
+	cb int64
+	cc bool
+}
+
+var _ = ConvB(ConvA{}) // @conv
+
+// Pointer conversions between identical structs pin both too.
+type PtrA struct { // want `reorder skipped: conversion at .*identity.go:68:`
+	pa bool
+	pb int64
+	pc bool
+}
+
+type PtrB struct { // want `reorder skipped: conversion at .*identity.go:68:`
+	pa bool
+	pb int64
+	pc bool
+}
+
+func ptrConv(p *PtrA) *PtrB { return (*PtrB)(p) } // @ptr
+
+// Identical named types that are never converted stay independent: each is
+// rewritten on its own (identically), so neither is pinned.
+type Twin1 struct { // want `struct of size 24 could be 16$`
+	tb int64
+	ta bool
+	tc bool
+}
+
+type Twin2 struct { // want `struct of size 24 could be 16$`
+	tb int64
+	ta bool
+	tc bool
+}
+
+// A no-op conversion to the same type pins nothing.
+type SelfConv struct { // want `struct of size 24 could be 16$`
+	sb int64
+	sa bool
+	sc bool
+}
+
+var _ = SelfConv(SelfConv{})
+
+// Type punning through unsafe.Pointer reads the layout directly, including
+// structs held by value; a pointer-held struct is not part of it.
+type Punned struct { // want `reorder skipped: unsafe.Pointer conversion at .*identity.go:114:`
+	a bool
+	n PunnedInner
+	c bool
+	p *PunnedViaPtr
+}
+
+type PunnedInner struct { // want `reorder skipped: unsafe.Pointer conversion at .*identity.go:114:`
+	ia bool
+	ib int64
+	ic bool
+}
+
+type PunnedViaPtr struct { // want `struct of size 24 could be 16$`
+	vb int64
+	va bool
+	vc bool
+}
+
+func pun(b []byte) *Punned { return (*Punned)(unsafe.Pointer(&b[0])) } // @pun
+
+// Converting *S to unsafe.Pointer pins S as well.
+type ToUnsafe struct { // want `reorder skipped: unsafe.Pointer conversion at .*identity.go:123:`
+	ua bool
+	ub int64
+	uc bool
+}
+
+var _ = unsafe.Pointer(&ToUnsafe{}) // @tounsafe
+
+// encoding/binary encodes in field order.
+type Wire struct { // want `reorder skipped: encoding/binary call at .*identity.go:139:`
+	wa bool
+	wb int64
+	wc bool
+}
+
+type WireElem struct { // want `reorder skipped: encoding/binary call at .*identity.go:140:`
+	ea bool
+	eb int64
+	ec bool
+}
+
+func wire(w io.Writer) {
+	_ = binary.Write(w, binary.LittleEndian, &Wire{})      // @wire
+	_ = binary.Write(w, binary.LittleEndian, []WireElem{}) // @wireelem
+}
+
+// binary.Size is the one single-argument encoding/binary function.
+type SizedWire struct { // want `reorder skipped: encoding/binary call at .*identity.go:150:`
+	sa1 bool
+	sb1 int64
+	sc1 bool
+}
+
+var _ = binary.Size(SizedWire{}) // @size
+
+// A Write method on another type is not encoding/binary.
+type NotWire struct { // want `struct of size 24 could be 16$`
+	nb int64
+	na bool
+	nc bool
+}
+
+type writer struct{}
+
+func (writer) Write(_ io.Writer, _ binary.ByteOrder, _ any) error { return nil }
+
+var _ = writer{}.Write(nil, nil, &NotWire{})
+
+// An alias identical only to a named type that is never rewritten (ignored
+// here) must not be reordered alone: the assignment below needs both to keep
+// one field order. The alias is unnamed, so identity pins it.
+type IgnoredNamed struct { // betteralign:ignore @ignorednamed
+	la bool
+	lb int64
+	lc bool
+}
+
+type AliasOfIgnored = struct { // want `reorder skipped: identical unnamed struct type at .*identity.go:168:`
+	la bool
+	lb int64
+	lc bool
+}
+
+var _ AliasOfIgnored = IgnoredNamed{}

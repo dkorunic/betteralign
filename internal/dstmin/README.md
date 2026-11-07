@@ -41,10 +41,15 @@ caller diff to two import lines and two call-site renames.
    - A final per-field pass computes `leadBlanks` / `trailBlanks` byte ranges
      for the dual-attachment emit.
 
-2. **`Fprint`** short-circuits to `w.Write(f.source)` when no struct was
-   mutated. For dirty files, it splices the original source around
-   synthesized struct bodies, runs `go/format.Source` for column
-   alignment, and re-parses to validate before writing.
+2. **`Reprint`** (and `Fprint`, which writes its result) short-circuits to
+   `f.source` when no struct was mutated. For dirty files, it splices the
+   original source around synthesized struct bodies, runs `go/format.Source`
+   for column alignment, and re-parses to validate. It also returns one
+   `BodyEdit` per reordered struct: the gofmt'd text between its braces, cut
+   from that whole-file output and matched back to the original by
+   `ast.Inspect` index. betteralign turns these into `SuggestedFixes`;
+   applied to gofmt-clean source they reproduce the output byte for byte
+   (checked by the reorder fuzz targets).
 
 ## Testing
 

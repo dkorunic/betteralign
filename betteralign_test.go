@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
@@ -77,10 +78,67 @@ func NewTestAnalyzer() *analysis.Analyzer {
 	return analyzer
 }
 
+// TestSuggestions checks the diagnostics of package a and that its
+// SuggestedFixes, once applied, reproduce the -apply goldens: the two rewrite
+// paths must agree.
 func TestSuggestions(t *testing.T) {
 	testdata := analysistest.TestData()
 	analyzer := NewTestAnalyzer()
-	analysistest.Run(t, testdata, analyzer, "a")
+	results := analysistest.RunWithSuggestedFixes(t, testdata, analyzer, "a")
+	assertRawFixesMatchGolden(t, results, "a")
+}
+
+// assertRawFixesMatchGolden applies each file's SuggestedFixes as plain byte
+// edits — no gofmt pass, unlike RunWithSuggestedFixes — and requires the
+// golden byte for byte. Hosts such as golangci-lint may apply edits without
+// formatting, so the edits themselves must carry gofmt's column alignment.
+// Files whose golden equals the source must receive no edits at all.
+func assertRawFixesMatchGolden(t *testing.T, results []*analysistest.Result, pkg string) {
+	t.Helper()
+	type edit struct {
+		start, end int
+		text       []byte
+	}
+	byFile := make(map[string][]edit)
+	for _, r := range results {
+		for _, d := range r.Diagnostics {
+			for _, f := range d.SuggestedFixes {
+				for _, e := range f.TextEdits {
+					tf := r.Pass.Fset.File(e.Pos)
+					byFile[tf.Name()] = append(byFile[tf.Name()], edit{tf.Offset(e.Pos), tf.Offset(e.End), e.NewText})
+				}
+			}
+		}
+	}
+
+	paths, err := filepath.Glob(filepath.Join(analysistest.TestData(), "src", pkg, "*.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range removeOtherArches(paths) {
+		src, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, err := os.ReadFile(path + ".golden")
+		if err != nil {
+			t.Fatal(err)
+		}
+		edits := byFile[path]
+		// Apply back to front so earlier offsets stay valid.
+		slices.SortFunc(edits, func(a, b edit) int { return b.start - a.start })
+		got := slices.Clone(src)
+		for i, e := range edits {
+			if i > 0 && e.end > edits[i-1].start {
+				t.Fatalf("%s: overlapping edits at %d and %d", path, e.start, edits[i-1].start)
+			}
+			got = slices.Concat(got[:e.start], e.text, got[e.end:])
+		}
+		if !bytes.Equal(got, want) {
+			t.Errorf("%s: raw SuggestedFixes differ from golden\n%s", filepath.Base(path),
+				diff.Diff("golden", want, "fixed", got))
+		}
+	}
 }
 
 // TestGreenTeaWording pins the Go 1.26+ scan-work framing of the pointer-bytes
@@ -164,71 +222,82 @@ func TestApply(t *testing.T) {
 	}
 }
 
-// TestApplyViaFixAlias pins `-fix` propagating into `apply` (host-registered flag → analyzer).
-func TestApplyViaFixAlias(t *testing.T) {
-	srcDir := filepath.Join("testdata", "src")
-	workDir := filepath.Join(srcDir, "a")
-
-	tmpDir, err := os.MkdirTemp(srcDir, "fix-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	tmpWorkDir := filepath.Join(tmpDir, "a")
-	if err := os.Mkdir(tmpWorkDir, 0o750); err != nil {
-		t.Fatal(err)
-	}
-
-	paths, err := filepath.Glob(filepath.Join(workDir, "*.go"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	paths = removeOtherArches(paths)
-
-	for _, path := range paths {
-		testBasename := filepath.Base(path)
-		testTmpname := filepath.Join(tmpWorkDir, testBasename)
-		src, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(testTmpname, src, 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	testdata := analysistest.TestData()
+// TestFixLeavesWritingToDriver pins that -fix is no longer an alias of
+// -apply: the driver applies the SuggestedFixes itself, so the analyzer must
+// not touch the files (the driver would then abort on the size change), even
+// when -apply is also set. The fixes must still be attached.
+func TestFixLeavesWritingToDriver(t *testing.T) {
+	skipUnless64Bit(t)
+	tmpPkg, paths := copyTestPackage(t, "layoutpin")
 
 	analyzer := NewTestAnalyzer()
-	// singlechecker/multichecker would register -fix; without a real host, register it ourselves.
 	var fix bool
-	analyzer.Flags.BoolVar(&fix, "fix", false, "alias for -apply (test harness only)")
+	analyzer.Flags.BoolVar(&fix, "fix", false, "host-registered -fix (test harness only)")
 	_ = analyzer.Flags.Set("fix", "true")
-
-	analysistest.Run(t, testdata, analyzer, filepath.Join(filepath.Base(tmpDir), "a"))
+	_ = analyzer.Flags.Set("apply", "true")
+	results := analysistest.Run(t, analysistest.TestData(), analyzer, tmpPkg)
 
 	for _, path := range paths {
-		testBasename := filepath.Base(path)
-		testTmpname := filepath.Join(tmpWorkDir, testBasename)
-
-		testResult, err := os.ReadFile(testTmpname)
+		want, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatal(err)
 		}
-
-		goldenFilename := filepath.Join("src", "a", strings.Join([]string{testBasename, ".golden"}, ""))
-		golden.Assert(t, string(testResult), goldenFilename)
+		got, err := os.ReadFile(filepath.Join(analysistest.TestData(), "src", tmpPkg, filepath.Base(path)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Errorf("%s was written by the analyzer under -fix; that is the driver's job", filepath.Base(path))
+		}
+	}
+	if countFixes(results) == 0 {
+		t.Error("no SuggestedFixes under -fix; the driver would have nothing to apply")
 	}
 }
 
-// analyzeWithFix loads pattern from the GOPATH-style testdata tree and runs the
-// analyzer with -fix via checker.Analyze. Unlike analysistest.Run it doesn't
+// countFixes counts the SuggestedFixes across all results.
+func countFixes(results []*analysistest.Result) int {
+	n := 0
+	for _, r := range results {
+		for _, d := range r.Diagnostics {
+			n += len(d.SuggestedFixes)
+		}
+	}
+	return n
+}
+
+// TestSuggestedFixesLayoutPins pins that pinned structs (positional literal,
+// unsafe.Offsetof) are reported without a fix, while the unpinned controls get
+// one whose raw edits reproduce the -apply goldens byte for byte.
+func TestSuggestedFixesLayoutPins(t *testing.T) {
+	skipUnless64Bit(t)
+	results := analysistest.RunWithSuggestedFixes(t, analysistest.TestData(), NewTestAnalyzer(), "layoutpin")
+	for _, r := range results {
+		for _, d := range r.Diagnostics {
+			pinned := strings.Contains(d.Message, "reorder skipped")
+			if pinned && len(d.SuggestedFixes) != 0 {
+				t.Errorf("pinned diagnostic carries a fix: %s", d.Message)
+			}
+			if !pinned && len(d.SuggestedFixes) != 1 {
+				t.Errorf("unpinned diagnostic has %d fixes, want 1: %s", len(d.SuggestedFixes), d.Message)
+			}
+			for _, f := range d.SuggestedFixes {
+				if f.Message != "Rearrange fields" {
+					t.Errorf("fix message = %q, want upstream fieldalignment's %q", f.Message, "Rearrange fields")
+				}
+			}
+		}
+	}
+	assertRawFixesMatchGolden(t, results, "layoutpin")
+}
+
+// analyzeWithApply loads pattern from the GOPATH-style testdata tree and runs
+// the analyzer with -apply via checker.Analyze. Unlike analysistest.Run it doesn't
 // enforce `// want` comments — needed when the base pass and its [pkg.test]
 // variant must diverge on whether a shared file reports a diagnostic, which the
-// per-root want model can't express. The -fix rewrites still happen as a side
+// per-root want model can't express. The -apply rewrites still happen as a side
 // effect, as under analysistest.Run.
-func analyzeWithFix(t *testing.T, pattern string) *checker.Graph {
+func analyzeWithApply(t *testing.T, pattern string) *checker.Graph {
 	t.Helper()
 	dir := analysistest.TestData()
 	mode := packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles |
@@ -245,9 +314,7 @@ func analyzeWithFix(t *testing.T, pattern string) *checker.Graph {
 		t.Fatalf("load %s: %v", pattern, err)
 	}
 	analyzer := NewTestAnalyzer()
-	var fix bool
-	analyzer.Flags.BoolVar(&fix, "fix", false, "alias for -apply (test harness only)")
-	if err := analyzer.Flags.Set("fix", "true"); err != nil {
+	if err := analyzer.Flags.Set("apply", "true"); err != nil {
 		t.Fatal(err)
 	}
 	g, err := checker.Analyze([]*analysis.Analyzer{analyzer}, pkgs, nil)
@@ -297,7 +364,7 @@ func TestApplyDefersPositionalLiteralInTestFile(t *testing.T) {
 
 	// act.Package.ID is slash-based even on Windows; match it.
 	pattern := filepath.ToSlash(filepath.Join(filepath.Base(tmpDir), "litguard"))
-	g := analyzeWithFix(t, pattern)
+	g := analyzeWithApply(t, pattern)
 
 	got, err := os.ReadFile(filepath.Join(tmpWorkDir, "lit.go"))
 	if err != nil {
@@ -307,7 +374,7 @@ func TestApplyDefersPositionalLiteralInTestFile(t *testing.T) {
 		t.Errorf("lit.go was rewritten despite a positional literal in the test file:\n--- got:\n%s\n--- want (unchanged):\n%s", got, orig["lit.go"])
 	}
 
-	// Only -apply is deferred: base reports plain, variant adds the caveat. Both
+	// Only the rewrite is deferred: base reports plain, variant adds the caveat. Both
 	// appear (the accepted duplicate) — see deferToTestVariant.
 	var base, variant *checker.Action
 	for _, act := range g.Roots {
@@ -331,6 +398,16 @@ func TestApplyDefersPositionalLiteralInTestFile(t *testing.T) {
 		if strings.Contains(d.Message, "reorder skipped") {
 			t.Errorf("base pass emitted the caveat, which it can't know: %q", d.Message)
 		}
+		// The fix is deferred like -apply: under -fix the driver would apply a
+		// base-pass fix the variant knows breaks the test build.
+		if len(d.SuggestedFixes) != 0 {
+			t.Errorf("base pass attached a fix despite deferring to the test variant: %q", d.Message)
+		}
+	}
+	for _, d := range variant.Diagnostics {
+		if len(d.SuggestedFixes) != 0 {
+			t.Errorf("test variant attached a fix to a pinned struct: %q", d.Message)
+		}
 	}
 	caveat := false
 	for _, d := range variant.Diagnostics {
@@ -347,7 +424,7 @@ func TestApplyDefersPositionalLiteralInTestFile(t *testing.T) {
 // deferral: a healthy non-test file must still be reported when an in-package
 // test file fails to type-check. The driver skips the ill-typed [pkg.test]
 // variant, so if the base pass deferred *reporting* too the struct would go
-// silent. Only -apply is deferred, so the base pass still reports it.
+// silent. Only the rewrite is deferred, so the base pass still reports it.
 func TestReportsHealthyCodeWhenTestFileIllTyped(t *testing.T) {
 	srcDir := filepath.Join("testdata", "src")
 	tmpDir, err := os.MkdirTemp(srcDir, "illtyped-test")
@@ -373,7 +450,7 @@ func TestReportsHealthyCodeWhenTestFileIllTyped(t *testing.T) {
 	}
 
 	pattern := filepath.ToSlash(filepath.Join(filepath.Base(tmpDir), "illtyped"))
-	g := analyzeWithFix(t, pattern)
+	g := analyzeWithApply(t, pattern)
 
 	var base *checker.Action
 	for _, act := range g.Roots {
@@ -430,11 +507,12 @@ func TestApplyRewritesWhenTestFileBuildExcluded(t *testing.T) {
 
 	testdata := analysistest.TestData()
 	analyzer := NewTestAnalyzer()
-	var fix bool
-	analyzer.Flags.BoolVar(&fix, "fix", false, "alias for -apply (test harness only)")
-	_ = analyzer.Flags.Set("fix", "true")
+	_ = analyzer.Flags.Set("apply", "true")
 
-	analysistest.Run(t, testdata, analyzer, filepath.Join(filepath.Base(tmpDir), "litexcluded"))
+	results := analysistest.Run(t, testdata, analyzer, filepath.Join(filepath.Base(tmpDir), "litexcluded"))
+	if countFixes(results) == 0 {
+		t.Error("no SuggestedFix: a build-excluded test literal must not withhold it")
+	}
 
 	got, err := os.ReadFile(filepath.Join(tmpWorkDir, "lit.go"))
 	if err != nil {
@@ -685,14 +763,14 @@ func skipUnless64Bit(t *testing.T) {
 func copyTestPackage(t *testing.T, name string) (string, []string) {
 	t.Helper()
 	srcDir := filepath.Join("testdata", "src")
-	tmpDir, err := os.MkdirTemp(srcDir, name+"-test")
+	tmpDir, err := os.MkdirTemp(srcDir, filepath.Base(name)+"-test")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.RemoveAll(tmpDir) })
 
 	tmpPkg := filepath.Join(filepath.Base(tmpDir), name)
-	if err := os.Mkdir(filepath.Join(srcDir, tmpPkg), 0o750); err != nil {
+	if err := os.MkdirAll(filepath.Join(srcDir, tmpPkg), 0o750); err != nil {
 		t.Fatal(err)
 	}
 	paths, err := filepath.Glob(filepath.Join(srcDir, name, "*.go"))
@@ -797,8 +875,13 @@ func TestApplyDiff(t *testing.T) {
 // TestFixDiffGlobalFlags is the regression for `betteralign -fix -diff`: the
 // driver registers both flags on the process-global set, and -fix used to
 // rewrite files the user asked only to preview.
+//
+// With SuggestedFixes populated, the driver owns both: it prints the diff from
+// the fixes and never writes. The analyzer must therefore stay silent and
+// leave the files alone even with -apply also set (runDiffMode checks disk).
 func TestFixDiffGlobalFlags(t *testing.T) {
-	got, paths, tmpDir := runDiffMode(t, func(*analysis.Analyzer) {
+	got, _, _ := runDiffMode(t, func(a *analysis.Analyzer) {
+		_ = a.Flags.Set("apply", "true")
 		*betteralign.FixGlobalFlag = true
 		*betteralign.DiffGlobalFlag = true
 		t.Cleanup(func() {
@@ -806,8 +889,8 @@ func TestFixDiffGlobalFlags(t *testing.T) {
 			*betteralign.DiffGlobalFlag = false
 		})
 	})
-	if want := wantLayoutPinDiff(t, paths, tmpDir); got != want {
-		t.Errorf("diff output mismatch\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	if got != "" {
+		t.Errorf("analyzer printed a diff under -fix -diff; the driver prints it from the fixes:\n%s", got)
 	}
 }
 
@@ -841,4 +924,43 @@ func TestApplyDiffJSON(t *testing.T) {
 	if want := wantLayoutPinDiff(t, paths, tmpDir); jsonOut != want {
 		t.Errorf("diff output mismatch\n--- got ---\n%s\n--- want ---\n%s", jsonOut, want)
 	}
+}
+
+// TestFixWithGeneratedFiles is the regression for -fix -generated_files: the
+// driver refuses fixes in "Code generated ... DO NOT EDIT" files, so the pair
+// silently rewrote nothing there (in v0.15.4, where -fix aliased -apply, it
+// did). The analyzer must write the generated file itself and attach no fixes,
+// or the driver's own writes would race it.
+func TestFixWithGeneratedFiles(t *testing.T) {
+	tmpPkg, paths := copyTestPackage(t, filepath.Join("generated", "b"))
+
+	analyzer := NewTestAnalyzer()
+	var fix bool
+	analyzer.Flags.BoolVar(&fix, "fix", false, "host-registered -fix (test harness only)")
+	_ = analyzer.Flags.Set("fix", "true")
+	_ = analyzer.Flags.Set("generated_files", "true")
+	results := analysistest.Run(t, analysistest.TestData(), analyzer, tmpPkg)
+
+	if n := countFixes(results); n != 0 {
+		t.Errorf("%d SuggestedFixes attached; the analyzer writes itself here, so the driver must get none", n)
+	}
+	got, err := os.ReadFile(filepath.Join(analysistest.TestData(), "src", tmpPkg, filepath.Base(paths[0])))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Optimal order puts the int32 first.
+	if y, x := strings.Index(string(got), "y int32"), strings.Index(string(got), "x byte"); y < 0 || x < 0 || y > x {
+		t.Errorf("generated file was not rewritten under -fix -generated_files:\n%s", got)
+	}
+}
+
+// TestCrossPackageConversionFollowsPartner pins the fix for a regression the
+// conversion pin introduced: pinning the local side of a conversion to a
+// struct that another package's pass reorders broke the build (rewriting the
+// standard library failed at net/http's HTTP2Config -> http2.Config, which
+// v0.15.4 handled by reordering both). A same-run partner predicts the local
+// side reorders too; local-to-local conversions stay pinned.
+func TestCrossPackageConversionFollowsPartner(t *testing.T) {
+	skipUnless64Bit(t)
+	analysistest.Run(t, analysistest.TestData(), NewTestAnalyzer(), "xconv/user")
 }

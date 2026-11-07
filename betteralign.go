@@ -13,9 +13,11 @@
 
 // Fork of fieldalignment (https://pkg.go.dev/golang.org/x/tools/go/analysis/passes/fieldalignment)
 // using a DST (Decorated Syntax Tree) so comments and spacing survive a
-// rewrite. The alignment math is largely unchanged from fieldalignment/maligned;
-// apply mode reprints the whole file because DST can't serialise a single node,
-// and -fix acts as an alias for -apply since SuggestedFixes are unused.
+// rewrite. The alignment math is largely unchanged from fieldalignment/maligned.
+// The reorder reprints the whole file (go/ast can't print one node with its
+// comments), then cuts each struct's gofmt'd body out of that reprint as a
+// SuggestedFix TextEdit, so -fix goes through the standard driver; -apply
+// writes the whole-file reprint itself.
 //
 // Related AST issue:
 //   - https://github.com/golang/go/issues/20744
@@ -30,7 +32,6 @@
 package betteralign
 
 import (
-	"bytes"
 	"cmp"
 	"errors"
 	"flag"
@@ -44,6 +45,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
@@ -136,13 +138,28 @@ pinned by a literal in an in-package test.
 A struct with a ` + "`structs.HostLayout`" + ` field declares that its layout must
 follow the platform's C ABI, so it is neither reported nor rewritten. A struct
 with explicit padding (a blank ` + "`_`" + ` field of non-zero size, such as a
-cache-line pad) is skipped the same way, since its layout is deliberate. A
-struct whose field offset is taken with ` + "`unsafe.Offsetof`" + ` anywhere in the
-package is reported but never rewritten: reordering would shift offsets the
-code depends on.
+cache-line pad) is skipped the same way, since its layout is deliberate.
 
-Under ` + "`-apply`" + ` (or ` + "`-fix`" + `), ` + "`-diff`" + ` prints a unified diff of each rewrite
-to stdout (stderr with ` + "`-json`" + `) instead of updating the files.
+A struct the package depends on in field order is reported but never
+rewritten: one whose field offset is taken with ` + "`unsafe.Offsetof`" + `, one
+converted to or from another struct type, one identical to an unnamed struct
+type it may be assigned to (including an alias ` + "`type A = struct{...}`" + `), one
+converted to or from ` + "`unsafe.Pointer`" + ` (type punning), and one passed to
+` + "`encoding/binary`" + ` or ` + "`encoding/asn1`" + ` (whose wire format is field order).
+Reordering would break the build, corrupt memory or silently change the
+encoding. The last three also cover structs held by value inside them. A
+struct that declares itself ASN.1 — an ` + "`asn1:\"...\"`" + ` tag or a field of an
+` + "`encoding/asn1`" + ` type — is skipped outright, since its encoder usually lives
+in another package. A conversion to a struct of another package in the same
+module follows that package: both are reordered, identically.
+
+Each rewritable diagnostic carries a suggested fix, so ` + "`-fix`" + ` (and
+` + "`-fix -diff`" + ` to preview) rewrites through the standard analysis driver.
+` + "`-apply`" + ` rewrites the files itself with atomic writes; under it, ` + "`-diff`" + `
+prints a unified diff of each rewrite to stdout (stderr with ` + "`-json`" + `)
+instead of updating the files. ` + "`-fix`" + ` takes precedence over ` + "`-apply`" + `.
+The driver never applies fixes to files marked as generated, so with
+` + "`-generated_files`" + `, ` + "`-fix`" + ` instead rewrites through the ` + "`-apply`" + ` path.
 
 Windows-line-ending (CRLF) files are reported but never rewritten under
 ` + "`-apply`" + `; normalise them to LF to enable the reorder.
@@ -168,6 +185,7 @@ var (
 	ErrWriteFile      = errors.New("unable to write to file")
 	ErrEmptyBuffer    = errors.New("refusing to write empty buffer")
 	ErrPreFilterFiles = errors.New("failed to pre-filter files")
+	ErrRewritePanic   = errors.New("internal error while rewriting, please report it")
 )
 
 // analyzerConfig holds per-analyzer flag state; one per InitAnalyzer call.
@@ -237,34 +255,46 @@ func init() {
 	InitAnalyzer(Analyzer)
 }
 
-// run is the per-package analyzer entry point. Reporting is decoupled from
-// rewriting: diagnostics come from AST + type info alone, so report-only mode
-// never reads source bytes or builds DST. DST decoration is lazy and gated by
-// -apply (and its legacy alias -fix); a struct dstmin can't decorate is still
-// reported, just not rewritten. SuggestedFixes stay nil because DST can't
-// serialise a single node without losing comments — the rewrite emits whole
-// files (see package doc).
+// run is the per-package analyzer entry point. Optimality comes from AST +
+// type info alone, so clean files never read source bytes or build DST. A
+// misaligned, rewritable struct is reordered in a lazily decorated DST; after
+// the walk, one dstmin.Reprint per dirty file yields both the -apply bytes and
+// each struct's SuggestedFix, and every diagnostic is then reported in walk
+// order. A struct dstmin can't decorate is still reported, just without a fix.
 //
 // Returns a non-nil error (wrapping ErrPreFilterFiles) only when exclude-path
 // normalisation fails; per-file decorate/format/write failures are logged and
 // skipped. Safe across concurrent passes; flag slices are cloned because hosts
 // like golangci-lint may share flag state.
 func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
-	apply := cfg.apply
-	if flagRequested(pass, "fix") {
-		apply = true
-	}
-	// -diff previews a rewrite; never write files under it. Under -json the
-	// diff goes to stderr so stdout stays parseable JSON.
+	// -fix belongs to the driver, which applies the SuggestedFixes itself (and
+	// handles its own -diff). Writing here too would change the file under the
+	// driver, which then aborts on the size mismatch, so -fix wins over -apply.
+	//
+	// Except with -generated_files: the driver refuses every fix in a file
+	// marked "Code generated ... DO NOT EDIT" — exactly the files that flag asks
+	// for — so -fix would silently rewrite nothing there. Then -fix keeps its
+	// v0.15.4 meaning, an alias of -apply: the analyzer writes (and handles
+	// -diff) and attaches no fixes, leaving the driver nothing to collide with.
+	fix := flagRequested(pass, "fix")
+	selfWrite := fix && cfg.generatedFiles
+	apply := (cfg.apply && !fix) || selfWrite
+	// -diff previews an -apply rewrite; never write files under it. Under -json
+	// the diff goes to stderr so stdout stays parseable JSON.
 	showDiff := apply && flagRequested(pass, "diff")
 	diffTo := diffOut
 	if flagRequested(pass, "json") {
 		diffTo = diffJSONOut
 	}
-	// Defer only -apply, never reporting, to the test variant; see
-	// deferToTestVariant.
-	if apply && deferToTestVariant(pass) {
-		apply = false
+	// Defer the rewrite — both -apply and SuggestedFixes — but never reporting,
+	// to the test variant; see deferToTestVariant. Lazy, so clean packages skip
+	// the test-file scan.
+	var deferredSet, deferred bool
+	rewriteDeferred := func() bool {
+		if !deferredSet {
+			deferred, deferredSet = deferToTestVariant(pass), true
+		}
+		return deferred
 	}
 	testFiles := cfg.testFiles
 	generatedFiles := cfg.generatedFiles
@@ -276,17 +306,34 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 
 	inspect := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 
+	// Fall back to 64-bit defaults if the unsafe.Pointer lookup ever fails.
+	var wordSize, maxAlign int64 = 8, 8
+	if unsafePointerTyp != nil {
+		wordSize = pass.TypesSizes.Sizeof(unsafePointerTyp)
+		maxAlign = pass.TypesSizes.Alignof(unsafePointerTyp)
+	}
+	sizes := newGCSizes(wordSize, maxAlign)
+
 	// Built lazily so clean packages skip the composite-literal/call walk.
 	var layoutPins map[*types.Struct]layoutPin
 	ensureLayoutPins := func() map[*types.Struct]layoutPin {
 		if layoutPins == nil {
-			layoutPins = collectLayoutPins(inspect, pass)
+			layoutPins = collectLayoutPins(inspect, pass, sizes)
 		}
 		return layoutPins
 	}
 
 	// Lazy: nil until the first misaligned struct.
 	var dec *dst.Decorator
+
+	// Diagnostics are reported after the walk, once each file's reprint has
+	// produced the SuggestedFixes; st is the struct whose reorder is pending, or
+	// nil when the diagnostic carries no fix.
+	type pendingDiag struct {
+		st   *ast.StructType
+		diag analysis.Diagnostic
+	}
+	var diags []pendingDiag
 
 	dirtyFiles := make(map[string]*dst.File)
 	decoratedFiles := make(map[string]*dst.File)
@@ -310,14 +357,6 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 			return nil, fmt.Errorf("%w: %w", ErrPreFilterFiles, err)
 		}
 	}
-
-	// Fall back to 64-bit defaults if the unsafe.Pointer lookup ever fails.
-	var wordSize, maxAlign int64 = 8, 8
-	if unsafePointerTyp != nil {
-		wordSize = pass.TypesSizes.Sizeof(unsafePointerTyp)
-		maxAlign = pass.TypesSizes.Alignof(unsafePointerTyp)
-	}
-	sizes := newGCSizes(wordSize, maxAlign)
 
 	// Per-file state set on *ast.File visit; reused by child node visits.
 	var (
@@ -403,24 +442,8 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 			return
 		}
 
-		// Compute optimality without DST and without allocating a permutation;
-		// clean files pay no decoration cost and the hot path stays zero-alloc.
-		optimal, optsz, optptrs := layoutMetrics(typ, sizes)
-		if optimal {
-			return
-		}
-
-		// Skip structs whose layout depends on a type parameter: sized from the
-		// constraint underlying, their figures are per-instantiation guesses.
-		// On the misaligned path only, so non-generic structs pay nothing.
-		if layoutDependsOnTypeParam(typ) {
-			return
-		}
-
-		// structs.HostLayout (a C-ABI contract) and explicit blank padding make
-		// the layout deliberate: nothing to report, since the user can't act on
-		// it and the "could be" figure would need breaking that contract.
-		if hasHostLayout(typ) || hasBlankPadding(typ, sizes) {
+		candidate, optsz, optptrs := rewriteCandidate(typ, sizes)
+		if !candidate {
 			return
 		}
 
@@ -435,8 +458,6 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 			} else {
 				message = fmt.Sprintf("%d bytes saved: struct with %d pointer bytes could be %d", ptrs-optptrs, ptrs, optptrs)
 			}
-		} else {
-			return
 		}
 
 		// AST-based so ignore works even for shapes dstmin can't decorate.
@@ -445,25 +466,16 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 		}
 
 		// A pinned layout is safe to report, unsafe to mutate.
-		if pin, pinned := ensureLayoutPins()[typ]; pinned {
-			pass.Report(analysis.Diagnostic{
-				Pos:            s.Pos(),
-				End:            s.Pos() + structKeywordLen,
-				Message:        message + "; reorder skipped: " + fmt.Sprintf(pin.format, pass.Fset.Position(pin.pos)),
-				SuggestedFixes: nil,
-			})
-			return
+		pin, pinned := ensureLayoutPins()[typ]
+		if pinned {
+			message += "; reorder skipped: " + fmt.Sprintf(pin.format, pass.Fset.Position(pin.pos))
 		}
-
-		pass.Report(analysis.Diagnostic{
-			Pos:            s.Pos(),
-			End:            s.Pos() + structKeywordLen,
-			Message:        message,
-			SuggestedFixes: nil,
-		})
-
-		// Rewrite path: only -apply runs it, and only it needs DST.
-		if !apply {
+		diags = append(diags, pendingDiag{diag: analysis.Diagnostic{
+			Pos:     s.Pos(),
+			End:     s.Pos() + structKeywordLen,
+			Message: message,
+		}})
+		if pinned || rewriteDeferred() {
 			return
 		}
 
@@ -483,9 +495,13 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 		}
 		dFile, ok := decoratedFiles[currentFn]
 		if !ok {
-			df, err := dec.DecorateFile(currentASTFile)
+			df, err := decorateFile(dec, currentASTFile)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "failed to decorate %s: %v\n", currentFn, err)
+				// Report-only runs still get the diagnostic; only a requested
+				// rewrite (or an internal bug) warrants noise about the missing fix.
+				if apply || errors.Is(err, ErrRewritePanic) {
+					fmt.Fprintf(os.Stderr, "failed to decorate %s: %v\n", currentFn, err)
+				}
 				decorationFailed[currentFn] = struct{}{}
 				return
 			}
@@ -499,8 +515,9 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 			return
 		}
 
-		// Flatten multi-name fields (A, B int) into one slot per name.
-		// TODO: preserve multi-named fields instead of flattening.
+		// Map type-info indexes (one per name) onto DST fields (one per
+		// declaration): a multi-name field (A, B int) takes its first name's
+		// slot and dummyField pads the rest, so the declaration moves as a unit.
 		flatPtr := fieldSlicePool.Get().(*[]*dst.Field)
 		flat := (*flatPtr)[:0]
 		defer func() {
@@ -533,45 +550,129 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 		}
 		dNode.Fields.List = reordered
 		dirtyFiles[currentFn] = dFile
+		diags[len(diags)-1].st = s
 	})
 
-	if apply {
-		// Sort so partial-failure ordering is reproducible across runs.
-		fns := make([]string, 0, len(dirtyFiles))
-		for fn := range dirtyFiles {
-			fns = append(fns, fn)
-		}
-		slices.Sort(fns)
-		// Reuse buffer across writes to amortize the backing byte slice.
-		var buf bytes.Buffer
-		for _, fn := range fns {
-			buf.Reset()
-			df := dirtyFiles[fn]
-			// Fprint already validates its output parses; no second parse needed.
-			if err := dst.Fprint(&buf, df); err != nil {
+	// One reprint per dirty file feeds both the SuggestedFixes and -apply.
+	// Sorted so partial-failure ordering is reproducible across runs.
+	fns := make([]string, 0, len(dirtyFiles))
+	for fn := range dirtyFiles {
+		fns = append(fns, fn)
+	}
+	slices.Sort(fns)
+	edits := make(map[*ast.StructType]dst.BodyEdit)
+	for _, fn := range fns {
+		df := dirtyFiles[fn]
+		// Reprint already validates its output parses; no second parse needed.
+		out, bodyEdits, err := reprint(df)
+		if err != nil {
+			if apply || errors.Is(err, ErrRewritePanic) {
 				fmt.Fprintf(os.Stderr, "failed to print %s: %v\n", fn, err)
-				continue
 			}
-			if showDiff {
-				writeDiff(diffTo, fn, df.Source(), buf.Bytes())
-				continue
-			}
-			if err := applyToFile(fn, buf.Bytes()); err != nil {
-				fmt.Fprintf(os.Stderr, "error applying fixes to %v: %v\n", fn, err)
-			}
+			continue
 		}
+		for _, e := range bodyEdits {
+			edits[e.Struct] = e
+		}
+		if !apply {
+			continue
+		}
+		if showDiff {
+			writeDiff(diffTo, fn, df.Source(), out)
+			continue
+		}
+		if err := applyToFile(fn, out); err != nil {
+			fmt.Fprintf(os.Stderr, "error applying fixes to %v: %v\n", fn, err)
+		}
+	}
+
+	for _, d := range diags {
+		if e, ok := edits[d.st]; ok && d.st != nil && !selfWrite && validEdit(pass.Fset, e) {
+			d.diag.SuggestedFixes = []analysis.SuggestedFix{{
+				Message:   fixMessage,
+				TextEdits: []analysis.TextEdit{{Pos: e.Pos, End: e.End, NewText: e.New}},
+			}}
+		}
+		pass.Report(d.diag)
 	}
 
 	return nil, nil
 }
 
-// flagRequested reports whether a driver-owned boolean flag (-fix, the alias
-// of -apply, or -diff) is set. Both flag sets matter: x/tools drivers register
-// them on the process-global set (via analysisflags), while hosts and the test
-// harness wire them onto Analyzer.Flags. Checking only Analyzer.Flags makes
-// -fix a silent no-op in the shipped binary, since the driver then applies the
-// (always nil) SuggestedFixes instead of reporting diagnostics — and makes
-// -fix -diff overwrite the files it was asked only to preview.
+// decorateFile and reprint wrap the dstmin entry points so a dstmin bug costs
+// one file's fix, never the run. dstmin runs in every mode now (SuggestedFixes
+// need it, not just -apply), so a panic there would otherwise turn a plain
+// report into a crash. The panic surfaces as ErrRewritePanic, which run always
+// logs (it is a bug to report); the file loses its fix, the diagnostic stays.
+// Variables so tests can inject a panic.
+var (
+	decorateFile = func(dec *dst.Decorator, f *ast.File) (df *dst.File, err error) {
+		defer recoverRewrite(&err)
+		return dec.DecorateFile(f)
+	}
+	reprint = func(df *dst.File) (out []byte, edits []dst.BodyEdit, err error) {
+		defer recoverRewrite(&err)
+		return dst.Reprint(df)
+	}
+)
+
+// recoverRewrite converts a panic in a deferred-from function into
+// ErrRewritePanic on *err.
+func recoverRewrite(err *error) {
+	if r := recover(); r != nil {
+		*err = fmt.Errorf("%w: %v", ErrRewritePanic, r)
+	}
+}
+
+// validEdit reports whether e satisfies the driver's fix validation: both
+// ends in one file, in order. The x/tools checker panics on an invalid fix
+// inside pass.Report, killing the whole run, so a malformed edit must cost
+// only its own fix. Brace positions always pass today; this is the backstop.
+func validEdit(fset *token.FileSet, e dst.BodyEdit) bool {
+	tf := fset.File(e.Pos)
+	return tf != nil && e.Pos.IsValid() && e.End.IsValid() && e.Pos <= e.End && fset.File(e.End) == tf
+}
+
+// rewriteCandidate reports whether str's layout alone makes it a reorder
+// candidate — misaligned with a real size or ptrdata saving, and none of the
+// layouts betteralign leaves alone — plus the optimal size and ptrdata. It is
+// the single source of truth for both run's decision and collectLayoutPins'
+// prediction of what another package's pass does with its struct, so the two
+// can't drift. Directives, pins and file filters are applied on top by run.
+func rewriteCandidate(str *types.Struct, sizes *gcSizes) (ok bool, optSize, optPtrdata int64) {
+	// Compute optimality without DST and without allocating a permutation;
+	// clean files pay no decoration cost and the hot path stays zero-alloc.
+	optimal, optSize, optPtrdata := layoutMetrics(str, sizes)
+	if optimal {
+		return false, 0, 0
+	}
+	// Skip structs whose layout depends on a type parameter: sized from the
+	// constraint underlying, their figures are per-instantiation guesses. On
+	// the misaligned path only, so non-generic structs pay nothing.
+	if layoutDependsOnTypeParam(str) {
+		return false, 0, 0
+	}
+	// structs.HostLayout (a C-ABI contract) and explicit blank padding make the
+	// layout deliberate: nothing to report, since the user can't act on it and
+	// the "could be" figure would need breaking that contract.
+	if hasHostLayout(str) || hasBlankPadding(str, sizes) || isASN1Struct(str) {
+		return false, 0, 0
+	}
+	if sizes.Sizeof(str) == optSize && sizes.ptrdata(str) == optPtrdata {
+		return false, 0, 0
+	}
+	return true, optSize, optPtrdata
+}
+
+// fixMessage titles the reorder SuggestedFix; it matches upstream
+// fieldalignment's so hosts that key on it treat betteralign as a drop-in.
+const fixMessage = "Rearrange fields"
+
+// flagRequested reports whether a driver-owned boolean flag (-fix, -diff,
+// -json) is set. Both flag sets matter: x/tools drivers register them on the
+// process-global set (via analysisflags), while hosts and the test harness wire
+// them onto Analyzer.Flags. Checking only Analyzer.Flags would miss -fix in the
+// shipped binary, letting -apply write files the driver is about to fix.
 func flagRequested(pass *analysis.Pass, name string) bool {
 	if a := pass.Analyzer.Flags.Lookup(name); a != nil && a.Value.String() == "true" {
 		return true
@@ -648,7 +749,27 @@ type layoutPin struct {
 const (
 	pinPositional = "positional composite literal at %s would break, convert to keyed form first"
 	pinOffsetof   = "unsafe.Offsetof at %s depends on field order"
+	pinConversion = "conversion at %s needs identical field order"
+	pinIdentical  = "identical unnamed struct type at %s needs the same field order"
+	pinUnsafe     = "unsafe.Pointer conversion at %s depends on field layout"
+	pinBinary     = "encoding/binary call at %s depends on field order"
+	pinASN1       = "encoding/asn1 call at %s depends on field order"
 )
+
+// orderCodecs are the functions that encode or decode struct fields in
+// declaration order, by package path; the value is the pin message.
+// encoding/asn1 also encodes slices of structs (SEQUENCE OF), so its pins
+// follow slice fields too.
+var orderCodecs = map[string]map[string]string{
+	"encoding/binary": {
+		"Read": pinBinary, "Write": pinBinary, "Size": pinBinary,
+		"Append": pinBinary, "Encode": pinBinary, "Decode": pinBinary,
+	},
+	"encoding/asn1": {
+		"Marshal": pinASN1, "MarshalWithParams": pinASN1,
+		"Unmarshal": pinASN1, "UnmarshalWithParams": pinASN1,
+	},
+}
 
 // unsafeOffsetof is the unsafe.Offsetof builtin; go/types records every use of
 // it (qualified or dot-imported) against this one object.
@@ -656,7 +777,7 @@ var unsafeOffsetof = types.Unsafe.Scope().Lookup("Offsetof")
 
 // collectLayoutPins maps each *types.Struct whose field order the package
 // relies on to the first such use, which the diagnostic surfaces as a jump
-// target. Two uses pin a struct:
+// target. These uses pin a struct:
 //
 //   - a positional composite literal (`T{1, 2, 3}`, not keyed): reordering
 //     would re-map its elements to other fields.
@@ -664,12 +785,27 @@ var unsafeOffsetof = types.Unsafe.Scope().Lookup("Offsetof")
 //     embedded struct on the path. Offsetof itself recomputes, but the code
 //     around it (constant offset asserts, 64-bit atomic alignment checks,
 //     offsets shared with assembly or C) usually assumes today's layout.
+//   - a conversion between two distinct struct types (U(t), (*U)(&t)): Go
+//     requires identical underlying types, field order included, so
+//     reordering one side alone (the other ignored, excluded or pinned) breaks
+//     the build. Both sides are pinned.
+//   - an unnamed struct type identical to another struct type in the package
+//     (a parameter, variable or alias `type A = struct{...}`): assignability
+//     between them rests on identical field order. Both are pinned.
+//   - an unsafe.Pointer conversion to or from *S: type punning reads S's
+//     memory layout directly, so a reorder corrupts it silently.
+//   - an encoding/binary Read/Write/Size/Append/Encode/Decode argument: the
+//     wire format is field declaration order, so a reorder silently changes
+//     it.
+//
+// The last two also pin every struct held by value inside S (fields, arrays),
+// since those bytes are part of the same layout.
 //
 // Per-file skip flags deliberately do not apply: an excluded file still
 // compiles against the layout, so its use would break just the same. Elts[0]
 // classifies the whole literal (Go forbids mixing keyed and positional).
 // Returns a fresh map; one per pass.
-func collectLayoutPins(inspect *inspector.Inspector, pass *analysis.Pass) map[*types.Struct]layoutPin {
+func collectLayoutPins(inspect *inspector.Inspector, pass *analysis.Pass, sizes *gcSizes) map[*types.Struct]layoutPin {
 	pins := make(map[*types.Struct]layoutPin)
 	pin := func(st *types.Struct, p layoutPin) {
 		if _, seen := pins[st]; !seen {
@@ -677,9 +813,129 @@ func collectLayoutPins(inspect *inspector.Inspector, pass *analysis.Pass) map[*t
 		}
 	}
 
-	inspect.Preorder([]ast.Node{(*ast.CompositeLit)(nil), (*ast.CallExpr)(nil)}, func(node ast.Node) {
+	// pinLayout pins st and every struct it holds by value: punning and binary
+	// encoding see all of those bytes. With followSlices (ASN.1), structs reached
+	// through slice fields are pinned as well.
+	var pinLayout func(t types.Type, p layoutPin, followSlices bool, seen map[*types.Struct]bool)
+	pinLayout = func(t types.Type, p layoutPin, followSlices bool, seen map[*types.Struct]bool) {
+		for {
+			switch u := types.Unalias(t).Underlying().(type) {
+			case *types.Array:
+				t = u.Elem()
+				continue
+			case *types.Slice:
+				if followSlices {
+					t = u.Elem()
+					continue
+				}
+			case *types.Struct:
+				st := canonicalStructType(t)
+				if st == nil || seen[st] {
+					return
+				}
+				seen[st] = true
+				pin(st, p)
+				for f := range st.Fields() {
+					pinLayout(f.Type(), p, followSlices, seen)
+				}
+			}
+			return
+		}
+	}
+
+	// Unnamed struct type literals, checked for identity after the walk.
+	var unnamed, all []*types.Struct
+	allPos := make(map[*types.Struct]token.Pos)
+	defined := make(map[*ast.StructType]bool)
+
+	inspect.Preorder([]ast.Node{(*ast.CompositeLit)(nil), (*ast.CallExpr)(nil), (*ast.TypeSpec)(nil), (*ast.StructType)(nil)}, func(node ast.Node) {
+		switch n := node.(type) {
+		case *ast.TypeSpec:
+			// A defined type's struct is named; an alias's stays unnamed.
+			if st, ok := n.Type.(*ast.StructType); ok && !n.Assign.IsValid() {
+				defined[st] = true
+			}
+			return
+		case *ast.StructType:
+			st, ok := pass.TypesInfo.TypeOf(n).(*types.Struct)
+			if !ok || st.NumFields() == 0 {
+				return
+			}
+			all = append(all, st)
+			allPos[st] = n.Pos()
+			if !defined[n] {
+				unnamed = append(unnamed, st)
+			}
+			return
+		}
+
 		if call, ok := node.(*ast.CallExpr); ok {
-			if len(call.Args) != 1 || typeutil.Callee(pass.TypesInfo, call) != unsafeOffsetof {
+			// Order codecs first and regardless of arity: binary.Size takes
+			// one argument, most others two or three.
+			fn, _ := typeutil.Callee(pass.TypesInfo, call).(*types.Func)
+			var codec string
+			if fn != nil && fn.Pkg() != nil {
+				codec = orderCodecs[fn.Pkg().Path()][fn.Name()]
+			}
+			if codec != "" {
+				for _, arg := range call.Args {
+					t := pass.TypesInfo.TypeOf(arg)
+					if t == nil {
+						continue
+					}
+					// Values arrive by pointer, slice or array; walk to the element.
+					for {
+						switch u := types.Unalias(t).Underlying().(type) {
+						case *types.Pointer:
+							t = u.Elem()
+							continue
+						case *types.Slice:
+							t = u.Elem()
+							continue
+						}
+						break
+					}
+					pinLayout(t, layoutPin{format: codec, pos: call.Pos()}, codec == pinASN1, map[*types.Struct]bool{})
+				}
+				return
+			}
+			if len(call.Args) != 1 {
+				return
+			}
+			if tv, ok := pass.TypesInfo.Types[call.Fun]; ok && tv.IsType() {
+				to, from := tv.Type, pass.TypesInfo.TypeOf(call.Args[0])
+				if from == nil {
+					return
+				}
+				switch {
+				case isUnsafePointer(from):
+					if p, ok := types.Unalias(to).Underlying().(*types.Pointer); ok {
+						pinLayout(p.Elem(), layoutPin{format: pinUnsafe, pos: call.Pos()}, false, map[*types.Struct]bool{})
+					}
+				case isUnsafePointer(to):
+					if p, ok := types.Unalias(from).Underlying().(*types.Pointer); ok {
+						pinLayout(p.Elem(), layoutPin{format: pinUnsafe, pos: call.Pos()}, false, map[*types.Struct]bool{})
+					}
+				default:
+					a, b := canonicalStructType(to), canonicalStructType(from)
+					if a == nil || b == nil || a == b {
+						return
+					}
+					// A partner from another package is rewritten (or not) by that
+					// package's own pass, which can't see this conversion. If it
+					// will be reordered, the local side must follow — identical
+					// fields sort to the identical order — so pinning it would be
+					// what breaks the build (net/http's HTTP2Config converts to
+					// net/http/internal/http2.Config). Otherwise pin as usual.
+					if foreignRewritten(pass, to, a, sizes) || foreignRewritten(pass, from, b, sizes) {
+						return
+					}
+					pin(a, layoutPin{format: pinConversion, pos: call.Pos()})
+					pin(b, layoutPin{format: pinConversion, pos: call.Pos()})
+				}
+				return
+			}
+			if typeutil.Callee(pass.TypesInfo, call) != unsafeOffsetof {
 				return
 			}
 			sel, ok := ast.Unparen(call.Args[0]).(*ast.SelectorExpr)
@@ -720,7 +976,85 @@ func collectLayoutPins(inspect *inspector.Inspector, pass *analysis.Pass) map[*t
 		pin(st, layoutPin{format: pinPositional, pos: lit.Pos()})
 	})
 
+	// Identity: each unnamed struct type pins every distinct identical struct
+	// type, and is pinned by it. Identical structs share their field names in
+	// order, so bucketing by them confines types.Identical to real candidates;
+	// a field-count bucket made generated code with thousands of unnamed
+	// structs quadratic (6000 three-field structs: +0.5s; 60000: ~minutes).
+	byNames := make(map[string][]*types.Struct)
+	for _, st := range all {
+		k := fieldNamesKey(st)
+		byNames[k] = append(byNames[k], st)
+	}
+	for _, u := range unnamed {
+		for _, other := range byNames[fieldNamesKey(u)] {
+			if other != u && types.Identical(u, other) {
+				pin(other, layoutPin{format: pinIdentical, pos: allPos[u]})
+				pin(u, layoutPin{format: pinIdentical, pos: allPos[other]})
+			}
+		}
+	}
+
 	return pins
+}
+
+// foreignRewritten predicts whether st, the struct behind t, is declared in
+// another package that the same run will reorder: same module as the pass (or
+// both standard library) and a rewriteCandidate. That package's own
+// directives and pins are invisible from here, as is whether it is actually
+// among the analyzed packages, so the prediction can miss in either
+// direction; each miss is the v0.15.4 behaviour (which reordered both sides
+// regardless), never worse.
+func foreignRewritten(pass *analysis.Pass, t types.Type, st *types.Struct, sizes *gcSizes) bool {
+	t = types.Unalias(t)
+	if p, ok := t.(*types.Pointer); ok {
+		t = types.Unalias(p.Elem())
+	}
+	named, ok := t.(*types.Named)
+	if !ok {
+		return false
+	}
+	pkg := named.Obj().Pkg()
+	if pkg == nil || pkg == pass.Pkg || !sameRun(pass, pkg) {
+		return false
+	}
+	ok, _, _ = rewriteCandidate(st, sizes)
+	return ok
+}
+
+// sameRun guesses whether pkg is analyzed in the same run as pass: the same
+// module, or — without module information — the same side of the standard
+// library boundary (std builds and GOPATH-mode trees such as analysistest's).
+func sameRun(pass *analysis.Pass, pkg *types.Package) bool {
+	if pass.Module == nil || pass.Module.Path == "" {
+		return isStdPath(pass.Pkg.Path()) == isStdPath(pkg.Path())
+	}
+	m := pass.Module.Path
+	return pkg.Path() == m || strings.HasPrefix(pkg.Path(), m+"/")
+}
+
+// isStdPath reports whether path looks like a standard-library import path:
+// no dot in its first element.
+func isStdPath(path string) bool {
+	first, _, _ := strings.Cut(path, "/")
+	return !strings.Contains(first, ".")
+}
+
+// fieldNamesKey joins st's field names in order, a necessary condition for
+// types.Identical between structs, used to bucket identity candidates.
+func fieldNamesKey(st *types.Struct) string {
+	var b strings.Builder
+	for f := range st.Fields() {
+		b.WriteString(f.Name())
+		b.WriteByte(0)
+	}
+	return b.String()
+}
+
+// isUnsafePointer reports whether t is unsafe.Pointer (through aliases).
+func isUnsafePointer(t types.Type) bool {
+	b, ok := types.Unalias(t).(*types.Basic)
+	return ok && b.Kind() == types.UnsafePointer
 }
 
 // hasBlankPadding reports whether str has a blank field of non-zero size. A
@@ -731,6 +1065,28 @@ func collectLayoutPins(inspect *inspector.Inspector, pass *analysis.Pass) map[*t
 func hasBlankPadding(str *types.Struct, sizes *gcSizes) bool {
 	for f := range str.Fields() {
 		if f.Name() == "_" && sizes.Sizeof(f.Type()) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// isASN1Struct reports whether str declares itself an ASN.1 SEQUENCE: a field
+// tagged `asn1:"..."` or of an encoding/asn1 type (RawValue, RawContent,
+// ObjectIdentifier, BitString, ...). Field order is then the wire format, and
+// the encoder often lives in another package (crypto/x509 encodes
+// crypto/x509/pkix types) where its call site can't pin this struct — so the
+// struct is left alone in its own package, like structs.HostLayout.
+func isASN1Struct(str *types.Struct) bool {
+	for i := range str.NumFields() {
+		if _, ok := reflect.StructTag(str.Tag(i)).Lookup("asn1"); ok {
+			return true
+		}
+		t := types.Unalias(str.Field(i).Type())
+		if p, ok := t.(*types.Pointer); ok {
+			t = types.Unalias(p.Elem())
+		}
+		if named, ok := t.(*types.Named); ok && named.Obj().Pkg() != nil && named.Obj().Pkg().Path() == "encoding/asn1" {
 			return true
 		}
 	}
@@ -806,19 +1162,29 @@ type testFileEntry struct {
 }
 
 // testVariantCache memoises the per-FileSet *_test.go scan (keyed by
-// *token.FileSet, value map[dir][]testFileEntry): deferToTestVariant runs on
-// every pass over the shared FileSet, so the walk must not repeat per package.
-// Entries live for the process lifetime, which suits the CLI and golangci-lint.
-var testVariantCache sync.Map // map[*token.FileSet]map[string][]testFileEntry
+// *token.FileSet, value func() map[dir][]testFileEntry from sync.OnceValue):
+// deferToTestVariant runs on every pass over the shared FileSet, so the walk
+// must not repeat per package. Entries live for the process lifetime, which
+// suits the CLI and golangci-lint.
+var testVariantCache sync.Map // map[*token.FileSet]func() map[string][]testFileEntry
 
 // testFilesByDir groups fset's *_test.go files by directory, building the map
-// once. The FileSet is fully populated before analysis, so the scan is a safe
-// concurrent read; a racing double-build stores one deterministic result
-// (LoadOrStore, as in readSourceOnce). Unparsable files are dropped.
+// exactly once per FileSet. The once matters: passes start concurrently, and a
+// plain check-then-store let every one of them miss together and re-parse every
+// test file (85% of a report-only stdlib run). The FileSet is fully populated
+// before analysis, so the scan is a safe read. Unparsable files are dropped.
 func testFilesByDir(fset *token.FileSet) map[string][]testFileEntry {
-	if v, ok := testVariantCache.Load(fset); ok {
-		return v.(map[string][]testFileEntry)
-	}
+	build, _ := testVariantCache.LoadOrStore(fset, sync.OnceValue(func() map[string][]testFileEntry {
+		return scanTestFilesFn(fset)
+	}))
+	return build.(func() map[string][]testFileEntry)()
+}
+
+// scanTestFilesFn indirects scanTestFiles so tests can count builds.
+var scanTestFilesFn = scanTestFiles
+
+// scanTestFiles is testFilesByDir's uncached body.
+func scanTestFiles(fset *token.FileSet) map[string][]testFileEntry {
 	byDir := make(map[string][]testFileEntry)
 	fset.Iterate(func(tf *token.File) bool {
 		name := tf.Name()
@@ -833,8 +1199,7 @@ func testFilesByDir(fset *token.FileSet) map[string][]testFileEntry {
 		byDir[dir] = append(byDir[dir], testFileEntry{name: name, pkgName: pf.Name.Name})
 		return true
 	})
-	actual, _ := testVariantCache.LoadOrStore(fset, byDir)
-	return actual.(map[string][]testFileEntry)
+	return byDir
 }
 
 // canonicalStructType collapses every syntactic form of a struct reference onto
@@ -994,8 +1359,8 @@ func measureLayout(elems []fieldElem) (optSize, optPtrdata int64) {
 
 // layoutMetrics is the report-mode hot path: it reports whether str is already
 // optimally laid out and, if not, the optimal size and ptrdata — without
-// allocating a permutation (that's only needed by -apply; see optimalOrder).
-// Report-only runs dominate, so keeping the alloc off this path makes the
+// allocating a permutation (that's only needed to rewrite; see optimalOrder).
+// Already-optimal structs dominate, so keeping the alloc off this path makes the
 // already-optimal case zero-allocation (see BenchmarkDecisionPath_Optimal_FastPath).
 // Optimal returns (true, 0, 0) and skips the layout walk. One *gcSizes per
 // goroutine — caches are not concurrency-safe.
@@ -1024,8 +1389,8 @@ func layoutMetrics(str *types.Struct, sizes *gcSizes) (optimal bool, optSize, op
 }
 
 // optimalOrder returns the compacting field permutation plus the resulting size
-// and ptrdata. It is the -apply rewrite path; report-only runs use layoutMetrics
-// and skip this allocation. indexes is always a full permutation of
+// and ptrdata. It is the rewrite path, run only for a misaligned rewritable
+// struct; the optimality check uses layoutMetrics and skips this allocation. indexes is always a full permutation of
 // [0, NumFields) — including identity when already optimal — because the unit
 // and fuzz tests assert its contents (notably stable-sort order on equal keys).
 // One *gcSizes per goroutine.

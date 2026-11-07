@@ -173,6 +173,7 @@ func reorderInvariant(t *testing.T, src string) {
 		}
 		t.Fatalf("Fprint (reorder): %v", err)
 	}
+	bodyEditsInvariant(t, df, src, buf.Bytes())
 	outFset := token.NewFileSet()
 	outFile, err := parser.ParseFile(outFset, "out.go", buf.Bytes(), parser.ParseComments|parser.SkipObjectResolution)
 	if err != nil {
@@ -462,6 +463,7 @@ func reorderAllInvariant(t *testing.T, src string) {
 		}
 		t.Fatalf("Fprint (reorder-all): %v", err)
 	}
+	bodyEditsInvariant(t, df, src, buf.Bytes())
 	outFset := token.NewFileSet()
 	outFile, err := parser.ParseFile(outFset, "out.go", buf.Bytes(), parser.ParseComments|parser.SkipObjectResolution)
 	if err != nil {
@@ -547,4 +549,43 @@ func FuzzCommentRun(f *testing.F) {
 			return true
 		})
 	})
+}
+
+// bodyEditsInvariant checks Reprint's BodyEdits against its whole-file output
+// out (already produced by Fprint for the same mutation): each edit sits
+// strictly inside its struct's braces, edits don't overlap, the edited source
+// parses, and — when src is gofmt-clean, so formatting changes nothing outside
+// the reordered bodies — applying the edits to src reproduces out byte for
+// byte. That last property is what lets a host apply the SuggestedFixes
+// without its own format pass.
+func bodyEditsInvariant(t *testing.T, df *File, src string, out []byte) {
+	t.Helper()
+	got, edits, err := Reprint(df)
+	if err != nil {
+		t.Fatalf("Reprint after successful Fprint: %v", err)
+	}
+	if !bytes.Equal(got, out) {
+		t.Fatal("Reprint output differs from Fprint for the same mutation")
+	}
+	if len(edits) == 0 {
+		t.Fatal("dirty file produced no BodyEdits")
+	}
+	slices.SortFunc(edits, func(a, b BodyEdit) int { return int(b.Pos) - int(a.Pos) })
+	applied := []byte(src)
+	for i, e := range edits {
+		if e.Pos != e.Struct.Fields.Opening+1 || e.End != e.Struct.Fields.Closing {
+			t.Fatalf("edit [%d,%d) is not its struct's brace interior", e.Pos, e.End)
+		}
+		if i > 0 && e.End > edits[i-1].Pos {
+			t.Fatalf("overlapping BodyEdits at %d and %d", e.Pos, edits[i-1].Pos)
+		}
+		start, end := df.tf.Offset(e.Pos), df.tf.Offset(e.End)
+		applied = slices.Concat(applied[:start], e.New, applied[end:])
+	}
+	if _, err := parser.ParseFile(token.NewFileSet(), "", applied, parser.SkipObjectResolution); err != nil {
+		t.Fatalf("source with BodyEdits applied does not parse: %v\n%s", err, applied)
+	}
+	if clean, err := format.Source([]byte(src)); err == nil && bytes.Equal(clean, []byte(src)) && !bytes.Equal(applied, out) {
+		t.Errorf("BodyEdits applied to gofmt-clean source differ from Reprint output\n=== APPLIED ===\n%s\n=== WANT ===\n%s", applied, out)
+	}
 }

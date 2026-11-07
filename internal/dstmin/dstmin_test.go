@@ -1118,3 +1118,117 @@ func panicsNot(fn func()) (ok bool) {
 	fn()
 	return true
 }
+
+// TestReprintBodyEdits pins Reprint's per-struct edits on the shapes the
+// analyzer feeds it: a grouped `type ( ... )` decl (one extra indent level),
+// several reordered structs in one file, an untouched struct between them and
+// an anonymous nested struct ahead of a dirty one, which shifts the
+// ast.Inspect index Reprint matches structs by. Applying the edits to the
+// gofmt-clean source must reproduce the whole-file output exactly.
+func TestReprintBodyEdits(t *testing.T) {
+	src := `package p
+
+type (
+	A struct {
+		a    bool // a
+		b    int64
+		long int32
+	}
+	Keep struct {
+		x int
+	}
+)
+
+type Nested struct {
+	in struct {
+		p bool
+		q int64
+	}
+	z bool
+}
+
+type B struct {
+	// doc c
+	c bool
+	d int64
+}
+`
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "p.go", src, parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec := NewDecorator(fset)
+	df := dec.DecorateFileSrc(file, []byte(src))
+
+	reverse := map[string]bool{"A": true, "B": true}
+	ast.Inspect(file, func(n ast.Node) bool {
+		ts, ok := n.(*ast.TypeSpec)
+		if !ok || !reverse[ts.Name.Name] {
+			return true
+		}
+		slices.Reverse(dec.Dst.Nodes[ts.Type].(*StructType).Fields.List)
+		return true
+	})
+
+	out, edits, err := Reprint(df)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(edits) != 2 {
+		t.Fatalf("got %d edits, want 2 (A and B only)", len(edits))
+	}
+	want := `package p
+
+type (
+	A struct {
+		long int32
+		b    int64
+		a    bool // a
+	}
+	Keep struct {
+		x int
+	}
+)
+
+type Nested struct {
+	in struct {
+		p bool
+		q int64
+	}
+	z bool
+}
+
+type B struct {
+	d int64
+	// doc c
+	c bool
+}
+`
+	if string(out) != want {
+		t.Fatalf("Reprint output:\n%s\nwant:\n%s", out, want)
+	}
+	applied := []byte(src)
+	for i := len(edits) - 1; i >= 0; i-- { // source order; apply back to front
+		e := edits[i]
+		applied = slices.Concat(applied[:df.tf.Offset(e.Pos)], e.New, applied[df.tf.Offset(e.End):])
+	}
+	if string(applied) != want {
+		t.Errorf("edits applied to source:\n%s\nwant:\n%s", applied, want)
+	}
+}
+
+// TestReprintClean pins the identity path: nothing dirty means the source back
+// verbatim and no edits.
+func TestReprintClean(t *testing.T) {
+	src := "package p\n\ntype S struct {\n\ta int\n\tb int\n}\n"
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "p.go", src, parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, edits, err := Reprint(NewDecorator(fset).DecorateFileSrc(file, []byte(src)))
+	if err != nil || string(out) != src || edits != nil {
+		t.Errorf("Reprint(clean) = %q, %v, %v; want source, nil, nil", out, edits, err)
+	}
+}

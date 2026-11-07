@@ -19,10 +19,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	dst "github.com/dkorunic/betteralign/internal/dstmin"
 	"golang.org/x/tools/go/analysis"
+	"golang.org/x/tools/go/analysis/analysistest"
 	"golang.org/x/tools/go/ast/inspector"
 )
 
@@ -2091,7 +2095,7 @@ var _ = T{4, 5, 6} // second literal — line 10
 	insp := inspector.New([]*ast.File{f})
 	pass := &analysis.Pass{Fset: fset, Pkg: pkg, TypesInfo: info, Files: []*ast.File{f}}
 
-	pins := collectLayoutPins(insp, pass)
+	pins := collectLayoutPins(insp, pass, newGCSizes(8, 8))
 	tStruct := pkg.Scope().Lookup("T").Type().(*types.Named).Underlying().(*types.Struct)
 
 	pin, ok := pins[tStruct]
@@ -2256,4 +2260,145 @@ func TestWriteDiff(t *testing.T) {
 	}
 
 	writeDiff(failWriter{}, "f.go", []byte("a\n"), []byte("b\n")) // must not panic
+}
+
+// TestTestFilesByDirBuildsOnce is the regression for concurrent passes each
+// re-scanning every test file: a check-then-store cache let all of them miss
+// together, making report-only stdlib runs 4x slower once fixes needed the
+// deferral check. Concurrent callers on one FileSet must share a single scan.
+func TestTestFilesByDirBuildsOnce(t *testing.T) {
+	dir := t.TempDir()
+	name := filepath.Join(dir, "x_test.go")
+	if err := os.WriteFile(name, []byte("package x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fset := token.NewFileSet()
+	fset.AddFile(name, -1, len("package x\n"))
+
+	var scans atomic.Int32
+	saved := scanTestFilesFn
+	scanTestFilesFn = func(fs *token.FileSet) map[string][]testFileEntry {
+		scans.Add(1)
+		time.Sleep(10 * time.Millisecond) // widen the race window
+		return saved(fs)
+	}
+	defer func() { scanTestFilesFn = saved }()
+
+	var wg sync.WaitGroup
+	for range 32 {
+		wg.Go(func() {
+			if got := testFilesByDir(fset)[dir]; len(got) != 1 || got[0].pkgName != "x" {
+				t.Errorf("testFilesByDir = %v, want one entry for package x", got)
+			}
+		})
+	}
+	wg.Wait()
+	if n := scans.Load(); n != 1 {
+		t.Errorf("scanned %d times for one FileSet, want 1", n)
+	}
+}
+
+// TestValidEdit pins the backstop against the checker's panic on invalid fixes:
+// an edit is attached only if both ends are valid, ordered and in one file.
+func TestValidEdit(t *testing.T) {
+	fset := token.NewFileSet()
+	a := fset.AddFile("a.go", -1, 100)
+	b := fset.AddFile("b.go", -1, 100)
+	for _, tc := range []struct {
+		name     string
+		pos, end token.Pos
+		want     bool
+	}{
+		{"in one file", a.Pos(10), a.Pos(20), true},
+		{"empty", a.Pos(10), a.Pos(10), true},
+		{"reversed", a.Pos(20), a.Pos(10), false},
+		{"spans files", a.Pos(10), b.Pos(10), false},
+		{"no pos", token.NoPos, a.Pos(10), false},
+		{"no end", a.Pos(10), token.NoPos, false},
+	} {
+		if got := validEdit(fset, dst.BodyEdit{Pos: tc.pos, End: tc.end}); got != tc.want {
+			t.Errorf("%s: validEdit = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestRewritePanicKeepsDiagnostics pins panic containment: dstmin runs in every
+// mode to build SuggestedFixes, so a bug there must cost only the fix — the
+// run must not crash and every diagnostic must still be reported, unfixed.
+func TestRewritePanicKeepsDiagnostics(t *testing.T) {
+	for name, inject := range map[string]func(){
+		"decorate": func() {
+			saved := decorateFile
+			decorateFile = func(dec *dst.Decorator, f *ast.File) (df *dst.File, err error) {
+				defer recoverRewrite(&err)
+				panic("injected decorate panic")
+			}
+			t.Cleanup(func() { decorateFile = saved })
+		},
+		"reprint": func() {
+			saved := reprint
+			reprint = func(df *dst.File) (out []byte, edits []dst.BodyEdit, err error) {
+				defer recoverRewrite(&err)
+				panic("injected reprint panic")
+			}
+			t.Cleanup(func() { reprint = saved })
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			inject()
+			analyzer := &analysis.Analyzer{Name: Analyzer.Name, Doc: Analyzer.Doc, Requires: Analyzer.Requires}
+			InitAnalyzer(analyzer)
+			// The "a" fixture's // want annotations must all still match.
+			results := analysistest.Run(t, analysistest.TestData(), analyzer, "a")
+			for _, r := range results {
+				for _, d := range r.Diagnostics {
+					if len(d.SuggestedFixes) != 0 {
+						t.Errorf("fix attached despite the rewrite panicking: %s", d.Message)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestRecoverRewrite pins the panic-to-error conversion.
+func TestRecoverRewrite(t *testing.T) {
+	err := func() (err error) {
+		defer recoverRewrite(&err)
+		panic("boom")
+	}()
+	if !errors.Is(err, ErrRewritePanic) || !strings.Contains(err.Error(), "boom") {
+		t.Errorf("recoverRewrite = %v, want ErrRewritePanic wrapping the panic value", err)
+	}
+	if err := func() (err error) { defer recoverRewrite(&err); return nil }(); err != nil {
+		t.Errorf("recoverRewrite without a panic = %v, want nil", err)
+	}
+}
+
+// TestSameRun pins the module-boundary guess behind cross-package conversion
+// prediction: a partner in the same module (or, without module information,
+// on the same side of the standard-library boundary) is assumed rewritten by
+// the same run; anything else is not.
+func TestSameRun(t *testing.T) {
+	for _, tc := range []struct {
+		name, module, self, other string
+		want                      bool
+	}{
+		{"same module", "example.com/m", "example.com/m/a", "example.com/m/b", true},
+		{"module root", "example.com/m", "example.com/m/a", "example.com/m", true},
+		{"other module", "example.com/m", "example.com/m/a", "example.com/other/b", false},
+		{"module path prefix only", "example.com/m", "example.com/m/a", "example.com/mx/b", false},
+		{"std from module", "example.com/m", "example.com/m/a", "net/http/internal/http2", false},
+		{"std to std", "", "net/http", "net/http/internal/http2", true},
+		{"std to third party", "", "net/http", "example.com/x", false},
+		{"GOPATH to GOPATH", "", "xconv/user", "xconv/dep", true},
+	} {
+		pass := &analysis.Pass{Pkg: types.NewPackage(tc.self, "self")}
+		if tc.module != "" {
+			pass.Module = &analysis.Module{Path: tc.module}
+		}
+		if got := sameRun(pass, types.NewPackage(tc.other, "other")); got != tc.want {
+			t.Errorf("%s: sameRun = %v, want %v", tc.name, got, tc.want)
+		}
+	}
 }
