@@ -28,3 +28,37 @@ type L2 struct { // want `reorder skipped: conversion at`
 }
 
 var _ = L2(L1{})
+
+// Assignable to unnamed struct types declared in dep, so pinned: reordering
+// these would break the calls and assignments below.
+type P struct { // want `reorder skipped: identical unnamed struct type at .*dep.go`
+	D bool
+	E int64
+	F bool
+}
+
+type V struct { // want `reorder skipped: identical unnamed struct type at .*dep.go`
+	G bool
+	H int64
+	I bool
+}
+
+type R struct { // want `reorder skipped: identical unnamed struct type at .*dep.go`
+	J bool
+	K int64
+	L bool
+}
+
+type H struct { // want `reorder skipped: identical unnamed struct type at .*dep.go`
+	M bool
+	N int64
+	O bool
+}
+
+func assign(p P, v V, h H) R {
+	dep.Param(p)
+	dep.Var = v
+	var x dep.Holder
+	x.Field = h
+	return dep.Result()
+}

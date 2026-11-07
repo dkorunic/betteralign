@@ -1029,12 +1029,8 @@ type (
 	}
 )
 `
-	// Both variants parse the pristine file before any rewrite, as go/packages does.
+	// Both variants share one parse of the pristine file, as go/packages does.
 	fset, f1, path := parseSource(t, src)
-	f2, err := parser.ParseFile(fset, path, nil, parser.ParseComments|parser.SkipObjectResolution)
-	if err != nil {
-		t.Fatalf("second parse: %v", err)
-	}
 
 	// Pass 1: reorder and write to disk, as -apply does.
 	out1 := reverseFirstStructInto(t, NewDecorator(fset), f1)
@@ -1043,7 +1039,17 @@ type (
 	}
 
 	// Pass 2: same reorder of the same parsed struct — must match pass 1.
-	out2 := reverseFirstStructInto(t, NewDecorator(fset), f2)
+	out2 := reverseFirstStructInto(t, NewDecorator(fset), f1)
+
+	// A separate parse of the rewritten file must not splice pass 1's AST
+	// offsets into pass 2's bytes either: it rereads, and the mismatch refuses.
+	f2, err := parser.ParseFile(fset, path, []byte(src), parser.ParseComments|parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("second parse: %v", err)
+	}
+	if _, err := NewDecorator(fset).DecorateFile(f2); !errors.Is(err, ErrSourceRead) {
+		t.Errorf("decorating a parse of the pre-rewrite text against the rewritten file: err = %v, want ErrSourceRead", err)
+	}
 
 	if out1 != out2 {
 		t.Errorf("second pass reprint diverged after disk rewrite (issue #36)\n=== PASS 1 ===\n%s\n=== PASS 2 ===\n%s", out1, out2)

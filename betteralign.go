@@ -978,6 +978,61 @@ func collectLayoutPins(inspect *inspector.Inspector, pass *analysis.Pass, sizes 
 		pin(st, layoutPin{format: pinPositional, pos: lit.Pos()})
 	})
 
+	// Unnamed struct types also arrive from imports, as the type of another
+	// package's parameter, result, variable or field (func F(x struct{...})).
+	// A local struct assigned to one must keep its order, so they join the
+	// identity check, at the importing object's position. Uses is a map, so the
+	// objects are sorted for a stable first pin.
+	var foreign []types.Object
+	for _, obj := range pass.TypesInfo.Uses {
+		if obj.Pkg() != nil && obj.Pkg() != pass.Pkg {
+			foreign = append(foreign, obj)
+		}
+	}
+	slices.SortFunc(foreign, func(a, b types.Object) int { return cmp.Compare(a.Pos(), b.Pos()) })
+	walked := make(map[types.Type]bool)
+	var addUnnamed func(t types.Type, pos token.Pos)
+	addUnnamed = func(t types.Type, pos token.Pos) {
+		t = types.Unalias(t)
+		if walked[t] {
+			return
+		}
+		walked[t] = true
+		switch t := t.(type) {
+		case *types.Struct:
+			if _, local := allPos[t]; !local && t.NumFields() > 0 {
+				unnamed = append(unnamed, t)
+				allPos[t] = pos
+			}
+			for f := range t.Fields() {
+				addUnnamed(f.Type(), pos)
+			}
+		case *types.Pointer:
+			addUnnamed(t.Elem(), pos)
+		case *types.Slice:
+			addUnnamed(t.Elem(), pos)
+		case *types.Array:
+			addUnnamed(t.Elem(), pos)
+		case *types.Chan:
+			addUnnamed(t.Elem(), pos)
+		case *types.Map:
+			addUnnamed(t.Key(), pos)
+			addUnnamed(t.Elem(), pos)
+		case *types.Signature:
+			for v := range t.Params().Variables() {
+				addUnnamed(v.Type(), pos)
+			}
+			for v := range t.Results().Variables() {
+				addUnnamed(v.Type(), pos)
+			}
+		}
+		// A *types.Named is its own type, never identical to a struct literal;
+		// its fields are reached through their own Uses entries.
+	}
+	for _, obj := range foreign {
+		addUnnamed(obj.Type(), obj.Pos())
+	}
+
 	// Identity: each unnamed struct type pins every distinct identical struct
 	// type, and is pinned by it. Identical structs share their field names in
 	// order, so bucketing by them confines types.Identical to real candidates;
@@ -1204,15 +1259,6 @@ func scanTestFiles(fset *token.FileSet) map[string][]testFileEntry {
 	return byDir
 }
 
-// canonicalStructType collapses every syntactic form of a struct reference onto
-// the single *types.Struct the visitor sees at the *ast.StructType, so both key
-// against identical pointers. Returns nil for non-structs.
-//
-// Collapses named structs, chained type defs, generic instantiations, and
-// pointer-elided literals; aliases are stripped via types.Unalias. The
-// *types.Pointer arm is load-bearing: in `[]*T{{...}}` the type-checker records
-// the inner literal as *T, and without the unwrap the analyzer would reorder T
-// and break the build.
 // revisits reports whether t is a defined type the walk already passed,
 // recording it otherwise. A defined type can be its own element (type S []S,
 // type P *P), so a loop unwrapping pointers or slices needs it to terminate;
@@ -1234,6 +1280,15 @@ func revisits(t types.Type, visited *map[*types.Named]bool) bool {
 	return false
 }
 
+// canonicalStructType collapses every syntactic form of a struct reference onto
+// the single *types.Struct the visitor sees at the *ast.StructType, so both key
+// against identical pointers. Returns nil for non-structs.
+//
+// Collapses named structs, chained type defs, generic instantiations, and
+// pointer-elided literals; aliases are stripped via types.Unalias. The
+// *types.Pointer arm is load-bearing: in `[]*T{{...}}` the type-checker records
+// the inner literal as *T, and without the unwrap the analyzer would reorder T
+// and break the build.
 func canonicalStructType(t types.Type) *types.Struct {
 	t = types.Unalias(t)
 	if p, ok := t.(*types.Pointer); ok {

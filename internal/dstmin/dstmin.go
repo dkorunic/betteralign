@@ -113,7 +113,7 @@ func (dec *Decorator) DecorateFile(f *ast.File) (*File, error) {
 		// nothing to read or splice against.
 		return nil, fmt.Errorf("%w: position not in FileSet", ErrSourceRead)
 	}
-	src, err := readSourceOnce(tf.Name())
+	src, err := readSourceOnce(tf)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s: %w", ErrSourceRead, tf.Name(), err)
 	}
@@ -161,28 +161,55 @@ func sourceMatchesAST(f *ast.File, tf *token.File, src []byte) bool {
 	return ok
 }
 
-// sourceCache memoises each file's first-read bytes by path, process-wide.
-var sourceCache sync.Map // map[string][]byte
+// sourceCache holds, per path, the bytes first read for one parse of it.
+var sourceCache sync.Map // map[string]*cachedSource
+
+// cachedSource is a file's bytes as read for the parse that produced tf.
+type cachedSource struct {
+	tf  *token.File
+	src []byte
+}
 
 // readSourceOnce pins the bytes the splice runs against to the file as first
-// seen, so they still match the AST offsets after -apply rewrites it (issue #36).
+// read for this parse (tf), so they still match the AST offsets after -apply
+// rewrites it (issue #36).
 //
 // Under `betteralign -apply ./...` a non-test file loads in several package
-// variants (base + [p.test]), so independent passes decorate and rewrite the
-// same path. A fresh os.ReadFile would hand a later pass an earlier pass's
-// rewrite, and its stale offsets would duplicate/drop fields. Safe because a
-// pass only rewrites a file it first decorated through here, so every read —
-// including concurrent misses — precedes the first write.
-func readSourceOnce(name string) ([]byte, error) {
-	if v, ok := sourceCache.Load(name); ok {
-		return v.([]byte), nil
+// variants (base + [p.test]), which go/packages type-checks from one shared
+// parse, so independent passes decorate and rewrite the same path. A fresh
+// os.ReadFile would hand a later pass an earlier pass's rewrite, and its stale
+// offsets would duplicate/drop fields. Safe because a pass only rewrites a file
+// it first decorated through here, so every read for a parse — including
+// concurrent misses — precedes the first write.
+//
+// Keyed by parse, not just path: a long-running host re-parses after every
+// edit, and bytes cached for an older parse would revert a same-length edit
+// that sourceMatchesAST can't see. A new parse replaces the entry, so memory
+// stays one entry per path.
+func readSourceOnce(tf *token.File) ([]byte, error) {
+	name := tf.Name()
+	if v, ok := sourceCache.Load(name); ok && v.(*cachedSource).tf == tf {
+		return v.(*cachedSource).src, nil
 	}
 	b, err := os.ReadFile(name)
 	if err != nil {
 		return nil, err
 	}
-	actual, _ := sourceCache.LoadOrStore(name, b)
-	return actual.([]byte), nil
+	mine := &cachedSource{tf: tf, src: b}
+	for {
+		v, loaded := sourceCache.LoadOrStore(name, mine)
+		if !loaded {
+			return b, nil
+		}
+		c := v.(*cachedSource)
+		if c.tf == tf {
+			// A concurrent miss for this parse stored first; agree with it.
+			return c.src, nil
+		}
+		if sourceCache.CompareAndSwap(name, c, mine) {
+			return b, nil
+		}
+	}
 }
 
 // DecorateFileSrc is the in-memory entry point for tests and fuzz harnesses

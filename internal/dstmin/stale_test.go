@@ -11,6 +11,7 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -75,5 +76,36 @@ func TestSourceMatchesASTLatchesMismatch(t *testing.T) {
 	stale[len("package p\n\nvar a = 1\n\nvar ")] = 'z'
 	if sourceMatchesAST(f, tf, stale) {
 		t.Error("an early mismatch followed by matching identifiers was accepted")
+	}
+}
+
+// TestDecorateFileRereadsForNewParse is the regression for the process-wide
+// source cache outliving its parse. A long-running host (an editor
+// integration, a daemon embedding the analyzer) re-parses a file after each
+// edit; with the cache keyed by path alone it spliced the first-ever bytes,
+// and a same-length edit (a tag, a comment, an array length) passes
+// sourceMatchesAST, so the reorder silently reverted the user's edit.
+func TestDecorateFileRereadsForNewParse(t *testing.T) {
+	const orig = "package p\n\ntype S struct {\n\ta bool // old\n\tb int64\n}\n"
+	_, _, path := parseSource(t, orig)
+	edited := strings.Replace(orig, "old", "new", 1)
+	fset := token.NewFileSet()
+	first, err := parser.ParseFile(fset, path, nil, parser.ParseComments|parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewDecorator(fset).DecorateFile(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(edited), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	second, err := parser.ParseFile(fset, path, nil, parser.ParseComments|parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := reverseFirstStructInto(t, NewDecorator(fset), second)
+	if !strings.Contains(out, "// new") || strings.Contains(out, "// old") {
+		t.Errorf("reprint of the new parse used stale bytes:\n%s", out)
 	}
 }
