@@ -95,6 +95,36 @@ func TestSuggestions(t *testing.T) {
 	assertRawFixesMatchGolden(t, results, "a")
 }
 
+// TestFixesWanted pins the report-only shortcut: when nothing consumes
+// SuggestedFixes (the CLI driver printing plain text), the rewrite is skipped
+// and no fix is attached, yet the diagnostics are exactly the same; when
+// fixes are wanted they are attached as before.
+func TestFixesWanted(t *testing.T) {
+	skipUnless64Bit(t)
+	saved := *betteralign.FixesWanted
+	t.Cleanup(func() { *betteralign.FixesWanted = saved })
+	type diag struct {
+		pos string
+		msg string
+	}
+	var got [2][]diag
+	for i, want := range []bool{false, true} {
+		*betteralign.FixesWanted = func(*analysis.Pass) bool { return want }
+		results := analysistest.Run(t, analysistest.TestData(), NewTestAnalyzer(), "a")
+		if n := countFixes(results); (n > 0) != want {
+			t.Errorf("fixesWanted %v: %d SuggestedFixes", want, n)
+		}
+		for _, r := range results {
+			for _, d := range r.Diagnostics {
+				got[i] = append(got[i], diag{r.Pass.Fset.Position(d.Pos).String(), d.Message})
+			}
+		}
+	}
+	if !slices.Equal(got[0], got[1]) || len(got[0]) == 0 {
+		t.Errorf("diagnostics differ without fixes:\n%v\nwith:\n%v", got[0], got[1])
+	}
+}
+
 // assertRawFixesMatchGolden applies each file's SuggestedFixes as plain byte
 // edits — no gofmt pass, unlike RunWithSuggestedFixes — and requires the
 // golden byte for byte. Hosts such as golangci-lint may apply edits without
@@ -461,6 +491,61 @@ func TestApplyDefersPositionalLiteralInTestFile(t *testing.T) {
 	}
 	if !caveat {
 		t.Errorf("test variant did not report the caveat diagnostic; got %v", variant.Diagnostics)
+	}
+}
+
+// TestCarriageReturnFileReportOnly pins the file-wide CRLF rule: a carriage
+// return anywhere in a file makes it report-only. dstmin refused \r only
+// inside a struct body, so an LF struct in a file with CRLF elsewhere was
+// rewritten and go/format.Source normalised every other line to LF. The
+// diagnostic stays; no fix, no write, and nothing on stderr (expected, not an
+// error), even under -apply. Pure CRLF behaves the same.
+func TestCarriageReturnFileReportOnly(t *testing.T) {
+	const body = "type T struct { // want `8 bytes saved: struct of size 24 could be 16`\n\ta bool\n\tb int64\n\tc bool\n}\n"
+	for name, src := range map[string]string{
+		"mixed": "package crlf\r\n\n" + body,
+		"crlf":  strings.ReplaceAll("package crlf\n\n"+body, "\n", "\r\n"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			tmpDir, err := os.MkdirTemp(filepath.Join("testdata", "src"), "crlf-test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.RemoveAll(tmpDir)
+			pkgDir := filepath.Join(tmpDir, "crlf")
+			if err := os.Mkdir(pkgDir, 0o750); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(pkgDir, "p.go")
+			if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			pkg := filepath.Join(filepath.Base(tmpDir), "crlf")
+
+			if n := countFixes(analysistest.Run(t, analysistest.TestData(), NewTestAnalyzer(), pkg)); n != 0 {
+				t.Errorf("%d SuggestedFixes for a file with carriage returns, want none", n)
+			}
+
+			r, w, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			saved := os.Stderr
+			os.Stderr = w
+			analyzer := NewTestAnalyzer()
+			_ = analyzer.Flags.Set("apply", "true")
+			analysistest.Run(t, analysistest.TestData(), analyzer, pkg)
+			os.Stderr = saved
+			_ = w.Close()
+			var stderr bytes.Buffer
+			_, _ = stderr.ReadFrom(r)
+			if stderr.Len() != 0 {
+				t.Errorf("-apply printed on stderr: %s", stderr.String())
+			}
+			if got, err := os.ReadFile(path); err != nil || string(got) != src {
+				t.Errorf("file rewritten (err %v):\n%q", err, got)
+			}
+		})
 	}
 }
 
@@ -951,6 +1036,14 @@ func runDiffModeJSON(t *testing.T, configure func(*analysis.Analyzer)) (string, 
 // Files the rewrite leaves alone (dotimport.go) contribute nothing.
 func wantLayoutPinDiff(t *testing.T, paths []string, tmpDir string) string {
 	t.Helper()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rel, err := filepath.Rel(wd, tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var want bytes.Buffer
 	for _, path := range paths { // filepath.Glob returns sorted paths
 		orig, err := os.ReadFile(path)
@@ -961,7 +1054,8 @@ func wantLayoutPinDiff(t *testing.T, paths []string, tmpDir string) string {
 		if err != nil {
 			t.Fatal(err)
 		}
-		fn := filepath.Join(tmpDir, filepath.Base(path))
+		// The fixture is under the working directory: printed relative to it.
+		fn := filepath.Join(rel, filepath.Base(path))
 		want.Write(diff.Diff(fn+".orig", orig, fn, rewritten))
 	}
 	if want.Len() == 0 {
@@ -982,6 +1076,12 @@ func TestApplyDiff(t *testing.T) {
 	})
 	if want := wantLayoutPinDiff(t, paths, tmpDir); got != want {
 		t.Errorf("diff output mismatch\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+	// patch -p0 refuses absolute names ("potentially dangerous file name").
+	for line := range strings.Lines(got) {
+		if strings.HasPrefix(line, "--- /") || strings.HasPrefix(line, "+++ /") || strings.HasPrefix(line, "diff /") {
+			t.Errorf("absolute path in diff header: %q", line)
+		}
 	}
 }
 

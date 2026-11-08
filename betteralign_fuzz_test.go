@@ -540,7 +540,7 @@ func FuzzDeclSourceDirectives(f *testing.F) {
 		held := lineDirective(fset, file)
 		for _, d := range file.Decls {
 			if fn, ok := d.(*ast.FuncDecl); ok {
-				if target := linkTarget(file, fn); target != "" && fn.Recv != nil {
+				if target := linkTarget(linkTargets(file), fn); target != "" && fn.Recv != nil {
 					t.Errorf("linkTarget(method %s) = %q, want none", fn.Name.Name, target)
 				}
 			}
@@ -551,7 +551,7 @@ func FuzzDeclSourceDirectives(f *testing.F) {
 			if ts, ok := n.(*ast.TypeSpec); ok {
 				if st, ok := ts.Type.(*ast.StructType); ok && st.Fields != nil && len(st.Fields.List) > 0 {
 					first := st.Fields.List[0]
-					var name string
+					name := embeddedName(first.Type)
 					if len(first.Names) > 0 {
 						name = first.Names[0].Name
 					}
@@ -566,7 +566,7 @@ func FuzzDeclSourceDirectives(f *testing.F) {
 			if !ok {
 				return
 			}
-			if !slices.Contains(firsts[l], d.field) || d.field != "" && d.field != field {
+			if !slices.Contains(firsts[l], d.field) || d.field != field {
 				t.Errorf("at(%d, %q) = first field %q, declared there: %q", l, field, d.field, firsts[l])
 			}
 			if held && d.reorderable {

@@ -11,4 +11,5 @@ var (
 	DiffJSONOut    = &diffJSONOut
 	FixGlobalFlag  = fixGlobalFlag
 	DiffGlobalFlag = diffGlobalFlag
+	FixesWanted    = &fixesWanted
 )

@@ -14,8 +14,9 @@ import (
 // withVersionVars installs the trio for the test and restores it on cleanup.
 func withVersionVars(t *testing.T, version, commit, date string) {
 	t.Helper()
-	origV, origC, origD := Version, Commit, Date
+	origV, origC, origD, origL := Version, Commit, Date, dateLabel
 	t.Cleanup(func() {
+		dateLabel = origL
 		Version = origV
 		Commit = origC
 		Date = origD
@@ -160,6 +161,10 @@ func TestFillFromBuildInfo_VCSSettings(t *testing.T) {
 		}
 		if Date != "2026-05-28T12:00:00Z" {
 			t.Errorf("Date = %q, want %q", Date, "2026-05-28T12:00:00Z")
+		}
+		// vcs.time is the commit's time, not the build's.
+		if got := getVersionString(); !strings.Contains(got, "commit date 2026-05-28") || strings.Contains(got, "built on") {
+			t.Errorf("getVersionString() = %q, want \"commit date 2026-05-28\"", got)
 		}
 	})
 

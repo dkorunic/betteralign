@@ -34,6 +34,10 @@ import (
 var (
 	ErrSourceRead = errors.New("dstmin: unable to read source")
 	ErrFormat     = errors.New("dstmin: formatted output rejected by gofmt")
+	// ErrCarriageReturn refuses a file with a carriage return anywhere:
+	// go/format.Source would normalise every CRLF in it, not just the
+	// spliced bodies. Expected, not a failure.
+	ErrCarriageReturn = errors.New("dstmin: file contains carriage returns")
 )
 
 // Decorator owns decorated trees; Dst.Nodes maps AST struct types to DST wrappers.
@@ -104,7 +108,8 @@ type Field struct {
 // DecorateFile is the production entry point: it reads f's source from disk
 // (path via dec.Fset, so f must belong to it) and hands off to DecorateFileSrc.
 // Splicing needs the verbatim bytes — the AST alone drops positional whitespace
-// and unattached comments. Returns ErrSourceRead on failure. The returned *File
+// and unattached comments. Returns ErrSourceRead on failure, and
+// ErrCarriageReturn for a file with a carriage return anywhere. The returned *File
 // aliases the source bytes; don't mutate them.
 func (dec *Decorator) DecorateFile(f *ast.File) (*File, error) {
 	tf := dec.Fset.File(f.Pos())
@@ -116,6 +121,9 @@ func (dec *Decorator) DecorateFile(f *ast.File) (*File, error) {
 	src, err := readSourceOnce(tf)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s: %w", ErrSourceRead, tf.Name(), err)
+	}
+	if bytes.IndexByte(src, '\r') >= 0 {
+		return nil, fmt.Errorf("%w: %s", ErrCarriageReturn, tf.Name())
 	}
 	if !sourceMatchesAST(f, tf, src) {
 		return nil, fmt.Errorf("%w: %s: changed on disk since it was parsed", ErrSourceRead, tf.Name())
@@ -160,9 +168,9 @@ func sourceMatchesAST(f *ast.File, tf *token.File, src []byte) bool {
 	})
 	// Comments too: lead docs are re-emitted from the AST's text, not the
 	// bytes, so a same-length edit to one would be reverted (or, turning a
-	// comment into code, deleted). Comment text drops carriage returns, so a
-	// file with any is left to the per-struct \r guard.
-	if ok && bytes.IndexByte(src, '\r') < 0 {
+	// comment into code, deleted). Comment text drops carriage returns, but
+	// DecorateFile refuses a file holding any before this check.
+	if ok {
 		for _, cg := range f.Comments {
 			for _, c := range cg.List {
 				if !at(c.Slash, c.Text) {

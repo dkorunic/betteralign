@@ -2350,42 +2350,6 @@ func TestWriteDiff(t *testing.T) {
 	writeDiff(failWriter{}, "f.go", []byte("a\n"), []byte("b\n")) // must not panic
 }
 
-// TestTestFilesByDirBuildsOnce is the regression for concurrent passes each
-// re-scanning every test file: a check-then-store cache let all of them miss
-// together, making report-only stdlib runs 4x slower once fixes needed the
-// deferral check. Concurrent callers on one FileSet must share a single scan.
-func TestTestFilesByDirBuildsOnce(t *testing.T) {
-	dir := t.TempDir()
-	name := filepath.Join(dir, "x_test.go")
-	if err := os.WriteFile(name, []byte("package x\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	fset := token.NewFileSet()
-	fset.AddFile(name, -1, len("package x\n"))
-
-	var scans atomic.Int32
-	saved := scanTestFilesFn
-	scanTestFilesFn = func(fs *token.FileSet) map[string][]testFileEntry {
-		scans.Add(1)
-		time.Sleep(10 * time.Millisecond) // widen the race window
-		return saved(fs)
-	}
-	defer func() { scanTestFilesFn = saved }()
-
-	var wg sync.WaitGroup
-	for range 32 {
-		wg.Go(func() {
-			if got := testFilesByDir(fset)[dir]; len(got) != 1 || got[0].pkgName != "x" {
-				t.Errorf("testFilesByDir = %v, want one entry for package x", got)
-			}
-		})
-	}
-	wg.Wait()
-	if n := scans.Load(); n != 1 {
-		t.Errorf("scanned %d times for one FileSet, want 1", n)
-	}
-}
-
 // TestValidEdit pins the backstop against the checker's panic on invalid fixes:
 // an edit is attached only if both ends are valid, ordered and in one file.
 func TestValidEdit(t *testing.T) {
@@ -2652,6 +2616,7 @@ func TestDeclSourceReorderableAt(t *testing.T) {
 		{"not a type spec", "func f(x struct {\n\ta bool\n}) {}", "a", 2, false, false},
 		{"other first field", "type T struct {\n\ta bool\n}", "b", 2, false, false},
 		{"line past end", "type T struct {\n\ta bool\n}", "a", 9, false, false},
+		{"carriage return elsewhere", "type T struct {\n\ta bool\n}\r\n", "a", 2, true, false},
 		{"unparsable", "type T struct {", "a", 2, false, false},
 	} {
 		ds := newDeclSource("t.go", []byte("package p\n"+tc.src))
@@ -2991,17 +2956,298 @@ func TestResolveLiteralPathCycleAcrossFiles(t *testing.T) {
 	}
 }
 
-// TestComparePosByFileName pins that pin positions are ordered by file name,
+// TestSortByPosByFileName pins that pin positions are ordered by file name,
 // not by FileSet base: bases follow go/packages' concurrent parse order, so
 // the position quoted in a diagnostic changed between runs.
-func TestComparePosByFileName(t *testing.T) {
+func TestSortByPosByFileName(t *testing.T) {
 	fset := token.NewFileSet()
 	b := fset.AddFile("b.go", -1, 10) // parsed first: lower base
 	a := fset.AddFile("a.go", -1, 10)
-	if got := comparePos(fset, a.Pos(5), b.Pos(1)); got >= 0 {
-		t.Errorf("comparePos(a.go:5, b.go:1) = %d, want < 0", got)
+	got := []token.Pos{b.Pos(1), a.Pos(5), a.Pos(1)}
+	sortByPos(fset, got, func(p token.Pos) token.Pos { return p })
+	if want := []token.Pos{a.Pos(1), a.Pos(5), b.Pos(1)}; !slices.Equal(got, want) {
+		t.Errorf("sortByPos = %v, want %v", got, want)
 	}
-	if got := comparePos(fset, a.Pos(1), a.Pos(5)); got >= 0 {
-		t.Errorf("comparePos(a.go:1, a.go:5) = %d, want < 0", got)
+}
+
+// writeTestFiles writes name→content into dir.
+func writeTestFiles(t *testing.T, dir string, files map[string]string) {
+	t.Helper()
+	for name, src := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// basePass parses the named files of dir into fset and returns a pass over
+// them, as a driver that has parsed only those files so far would hand it.
+func basePass(t *testing.T, fset *token.FileSet, dir string, names ...string) *analysis.Pass {
+	t.Helper()
+	pass := &analysis.Pass{Fset: fset, Analyzer: &analysis.Analyzer{}, Pkg: types.NewPackage("example.com/p", "p")}
+	for _, name := range names {
+		f, err := parser.ParseFile(fset, filepath.Join(dir, name), nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pass.Files = append(pass.Files, f)
+	}
+	return pass
+}
+
+// TestDeferToTestVariantLazyParse is the regression for golangci-lint --fix:
+// it parses packages lazily into one shared FileSet, so the base pass of p
+// can run before p [p.test]'s test files are parsed. A FileSet scan then
+// misses them, the base pass rewrites, and a struct pinned only by a
+// positional literal in p_test.go is reordered. The decision comes from the
+// directory on disk instead, so it holds whatever the FileSet has seen.
+func TestDeferToTestVariantLazyParse(t *testing.T) {
+	dir := t.TempDir()
+	writeTestFiles(t, dir, map[string]string{
+		"p.go":      "package p\n\ntype T struct {\n\ta bool\n\tb int64\n\tc bool\n}\n",
+		"p_test.go": "package p\n\nvar _ = T{true, 1, false}\n",
+	})
+	fset := token.NewFileSet()
+	base := basePass(t, fset, dir, "p.go")
+	if !deferToTestVariant(base) {
+		t.Error("base pass did not defer although p_test.go (package p) is on disk but not yet in the FileSet")
+	}
+	// The variant is parsed later into the same FileSet; it sees the test
+	// and owns the rewrite.
+	variant := basePass(t, fset, dir, "p.go", "p_test.go")
+	if deferToTestVariant(variant) {
+		t.Error("test variant deferred; it holds every in-package test file and must keep the rewrite")
+	}
+	if !deferToTestVariant(base) {
+		t.Error("base pass stopped deferring once the variant was parsed")
+	}
+}
+
+// TestDeferToTestVariantSkips pins what does not defer: an external p_test
+// package (loads separately, never rewrites p), a test file no build compiles
+// (//go:build ignore) or this load excluded (pass.IgnoredFiles: another GOOS,
+// an unset tag), files the go command ignores (_x, .x), and any test file
+// under the driver's -test=false, which loads no variant to defer to.
+func TestDeferToTestVariantSkips(t *testing.T) {
+	for _, tc := range []struct {
+		files   map[string]string
+		name    string
+		ignored []string
+		noTest  bool
+		want    bool
+	}{
+		{name: "in-package test", files: map[string]string{"p_test.go": "package p\n"}, want: true},
+		{name: "external test", files: map[string]string{"p_ext_test.go": "package p_test\n"}},
+		{name: "build ignore", files: map[string]string{"q_test.go": "//go:build ignore\n\npackage p\n"}},
+		{name: "load excluded", files: map[string]string{"w_windows_test.go": "package p\n"}, ignored: []string{"w_windows_test.go"}},
+		{name: "-test=false", files: map[string]string{"p_test.go": "package p\n"}, noTest: true},
+		{name: "go command ignores", files: map[string]string{"_x_test.go": "package p\n", ".y_test.go": "package p\n"}},
+		{name: "unparsable", files: map[string]string{"z_test.go": "packge p\n"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeTestFiles(t, dir, map[string]string{"p.go": "package p\n"})
+			writeTestFiles(t, dir, tc.files)
+			pass := basePass(t, token.NewFileSet(), dir, "p.go")
+			for _, name := range tc.ignored {
+				pass.IgnoredFiles = append(pass.IgnoredFiles, filepath.Join(dir, name))
+			}
+			if tc.noTest {
+				pass.Analyzer.Flags.Bool("test", true, "")
+				_ = pass.Analyzer.Flags.Set("test", "false")
+			}
+			if got := deferToTestVariant(pass); got != tc.want {
+				t.Errorf("deferToTestVariant = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTestFilesInDirScansOnce is the regression for concurrent passes each
+// re-scanning every test file (a check-then-store cache let all of them miss
+// together, making report-only stdlib runs 4x slower): concurrent callers on
+// one directory share a single scan. An edited directory (a new file changes
+// its modification time) is rescanned, replacing the entry.
+func TestTestFilesInDirScansOnce(t *testing.T) {
+	dir := t.TempDir()
+	writeTestFiles(t, dir, map[string]string{"x_test.go": "package x\n"})
+
+	var scans atomic.Int32
+	saved := scanTestDirFn
+	scanTestDirFn = func(d string) []testFileEntry {
+		scans.Add(1)
+		time.Sleep(10 * time.Millisecond) // widen the race window
+		return saved(d)
+	}
+	defer func() { scanTestDirFn = saved }()
+
+	var wg sync.WaitGroup
+	for range 32 {
+		wg.Go(func() {
+			if got := testFilesInDir(dir); len(got) != 1 || got[0].pkgName != "x" {
+				t.Errorf("testFilesInDir = %v, want one entry for package x", got)
+			}
+		})
+	}
+	wg.Wait()
+	if n := scans.Load(); n != 1 {
+		t.Errorf("scanned %d times for one directory, want 1", n)
+	}
+
+	fi, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestFiles(t, dir, map[string]string{"y_test.go": "package x\n"})
+	// Coarse-mtime filesystems: force a distinct stamp.
+	if err := os.Chtimes(dir, time.Now(), fi.ModTime().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if got := testFilesInDir(dir); len(got) != 2 {
+		t.Errorf("after an edit testFilesInDir = %v, want both files", got)
+	}
+	if n := scans.Load(); n != 2 {
+		t.Errorf("scanned %d times, want one rescan after the edit", n)
+	}
+}
+
+// TestLoadStampedOneEntryPerPath pins the per-path cache bound: a long-lived
+// host editing a file replaces its entry rather than adding one per edit.
+func TestLoadStampedOneEntryPerPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "f.go")
+	if err := os.WriteFile(path, []byte("package p\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if readDeclSource(path) == nil {
+		t.Fatal("readDeclSource = nil")
+	}
+	if err := os.WriteFile(path, []byte("package p\n\ntype T struct {\n\ta bool\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if ds := readDeclSource(path); ds == nil || len(ds.decls) != 1 {
+		t.Fatalf("edited file not reread: %+v", ds)
+	}
+	n := 0
+	declSourceCache.Range(func(k, _ any) bool {
+		if k == path {
+			n++
+		}
+		return true
+	})
+	if n != 1 {
+		t.Errorf("declSourceCache holds %d entries for one path, want 1", n)
+	}
+
+	var m sync.Map
+	builds := 0
+	for _, stamp := range []int64{1, 2, 2} {
+		if got := loadStamped(&m, "p", 10, stamp, func() int64 { builds++; return stamp }); got != stamp {
+			t.Errorf("loadStamped(stamp %d) = %d", stamp, got)
+		}
+	}
+	entries := 0
+	m.Range(func(_, _ any) bool { entries++; return true })
+	if entries != 1 || builds != 2 {
+		t.Errorf("entries %d, builds %d; want 1 entry, 2 builds", entries, builds)
+	}
+}
+
+// TestIsASN1TypeErrors pins that encoding/asn1's error types do not mark a
+// struct as ASN.1: one holding a StructuralError is no wire-format struct.
+func TestIsASN1TypeErrors(t *testing.T) {
+	pkg := types.NewPackage("encoding/asn1", "asn1")
+	for name, want := range map[string]bool{"StructuralError": false, "SyntaxError": false, "RawValue": true, "ObjectIdentifier": true} {
+		n := types.NewNamed(types.NewTypeName(token.NoPos, pkg, name, nil), types.NewStruct(nil, nil), nil)
+		if got := isASN1Type(n); got != want {
+			t.Errorf("isASN1Type(asn1.%s) = %v, want %v", name, got, want)
+		}
+		if got := isASN1Type(types.NewPointer(n)); got != want {
+			t.Errorf("isASN1Type(*asn1.%s) = %v, want %v", name, got, want)
+		}
+	}
+}
+
+// TestDeclSourceEmbeddedFirstField pins that an embedded first field is
+// matched by its type name, as types.Var.Name() gives it: a stale candidate
+// embedding another type on that line is rejected.
+func TestDeclSourceEmbeddedFirstField(t *testing.T) {
+	ds := newDeclSource("t.go", []byte("package p\n\ntype T struct {\n\t*pkg.U\n\tb int64\n}\n\ntype G struct {\n\tV[int]\n}\n"))
+	for _, tc := range []struct {
+		field string
+		line  int
+		want  bool
+	}{
+		{"U", 4, true},
+		{"W", 4, false},
+		{"pkg", 4, false},
+		{"V", 9, true},
+		{"int", 9, false},
+	} {
+		if _, ok := ds.at(tc.line, tc.field); ok != tc.want {
+			t.Errorf("at(%d, %q) = %v, want %v", tc.line, tc.field, ok, tc.want)
+		}
+	}
+}
+
+// TestWriteDiffRelativePaths pins -apply -diff's file names: relative to the
+// working directory when under it, so `patch -p0` and `git apply -p0` take
+// the diff; absolute otherwise.
+func TestWriteDiffRelativePaths(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf strings.Builder
+	writeDiff(&buf, filepath.Join(wd, "x", "f.go"), []byte("a\nb\n"), []byte("b\na\n"))
+	rel := filepath.Join("x", "f.go")
+	if got, want := buf.String(), "diff "+rel+".orig "+rel+"\n--- "+rel+".orig\n+++ "+rel+"\n"; !strings.HasPrefix(got, want) {
+		t.Errorf("header = %q, want prefix %q", got, want)
+	}
+	buf.Reset()
+	out := filepath.Join(filepath.Dir(wd), "elsewhere", "f.go")
+	writeDiff(&buf, out, []byte("a\nb\n"), []byte("b\na\n"))
+	if got := buf.String(); !strings.HasPrefix(got, "diff "+out+".orig "+out+"\n") {
+		t.Errorf("header for a file outside wd = %q, want it absolute", got)
+	}
+}
+
+// TestParseModeGatesComments pins that the comment-free parse loses nothing:
+// a file holding a directive is still parsed with comments (ignore, linkname
+// found), and one without any is parsed without them, its declarations intact.
+func TestParseModeGatesComments(t *testing.T) {
+	if parseMode([]byte("package p\n// a comment\ntype T struct {\n\ta bool\n}\n"))&parser.ParseComments != 0 {
+		t.Error("comments parsed in a file with no directive")
+	}
+	plain := newDeclSource("t.go", []byte("package p\n\n// T is documented.\ntype T struct {\n\ta bool\n}\n"))
+	if d, ok := plain.at(5, "a"); !ok || !d.reorderable {
+		t.Errorf("comment-free parse lost the declaration: %+v, %v", d, ok)
+	}
+	ignored := newDeclSource("t.go", []byte("package p\n\ntype T struct { // betteralign:ignore\n\ta bool\n}\n"))
+	if d, ok := ignored.at(4, "a"); !ok || d.reorderable {
+		t.Errorf("ignore directive missed: %+v, %v", d, ok)
+	}
+	held := newDeclSource("t.go", []byte("package p\n/*line x.go:1*/\ntype T struct {\n\ta bool\n}\n"))
+	if d, ok := held.at(4, "a"); !ok || d.reorderable {
+		t.Errorf("line directive missed: %+v, %v", d, ok)
+	}
+	s := scanOtherBuildSrc("t.go", []byte("package p\n\ntype T struct{ a bool }\n\n//go:linkname f example.com/p.g\nfunc f(*T)\n"))
+	if stubs := s.asm["T"]; len(stubs) != 1 || stubs[0].link != "example.com/p.g" {
+		t.Errorf("linkname missed: %+v", s.asm)
+	}
+}
+
+// TestCLIDriverFlags pins the detection behind fixesWanted: the x/tools CLI
+// drivers register -fix, -json and -c on the global set; a test binary (which
+// may register a stand-in -fix) or a programmatic host does not.
+func TestCLIDriverFlags(t *testing.T) {
+	fs := flag.NewFlagSet("x", flag.ContinueOnError)
+	fs.Bool("fix", false, "")
+	if cliDriverFlags(fs) {
+		t.Error("-fix alone counted as the CLI driver")
+	}
+	fs.Bool("json", false, "")
+	fs.Int("c", -1, "")
+	if !cliDriverFlags(fs) {
+		t.Error("the driver's flag set not recognised")
 	}
 }

@@ -21,6 +21,10 @@ var (
 	Date    = defaultUnknownInfo
 )
 
+// dateLabel introduces Date in the banner: ldflags set the build date, while
+// the build-info fallback (vcs.time) is the commit's date.
+var dateLabel = "built on"
+
 // fillFromBuildInfo populates Version/Commit/Date from runtime build info when
 // ldflags weren't used (e.g. `go install module@version`).
 func fillFromBuildInfo() {
@@ -50,6 +54,7 @@ func fillFromBuildInfoData(info *debug.BuildInfo) {
 		case "vcs.time":
 			if Date == defaultUnknownInfo && s.Value != "" {
 				Date = s.Value
+				dateLabel = "commit date"
 			}
 		}
 	}
@@ -58,6 +63,8 @@ func fillFromBuildInfoData(info *debug.BuildInfo) {
 // getVersionString returns a banner of the form:
 //
 //	betteralign version X.Y.Z (commit short-SHA) built on YYYY-MM-DD
+//
+// with "commit date" for "built on" when the date is vcs.time from build info.
 //
 // It first calls fillFromBuildInfo. The commit and date segments are omitted
 // when unknown; the commit is shortened to 7 chars and the date to its
@@ -77,9 +84,9 @@ func getVersionString() string {
 
 	if Date != defaultUnknownInfo {
 		if len(Date) >= 10 {
-			version += fmt.Sprintf(" built on %s", Date[:10])
+			version += fmt.Sprintf(" %s %s", dateLabel, Date[:10])
 		} else {
-			version += fmt.Sprintf(" built on %s", Date)
+			version += fmt.Sprintf(" %s %s", dateLabel, Date)
 		}
 	}
 
