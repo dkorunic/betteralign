@@ -2209,10 +2209,13 @@ func asn1Struct(str *types.Struct, visited *map[*types.Named]bool) bool {
 	return false
 }
 
-// isASN1Type reports whether t is an encoding/asn1 named type or a pointer
-// to one: as a field, an array or a slice element, it marks ASN.1. The
-// package's error types are not wire values: a struct holding one is not.
+// isASN1Type reports whether t is one of encoding/asn1's exported
+// wire-format data types, or a pointer to one: as a field, an array or a
+// slice element, it marks ASN.1. The package's error types are not wire
+// values, and its unexported types (encoder, inside encoding/asn1 itself)
+// are not data a user struct encodes.
 func isASN1Type(t types.Type) bool {
+	t = types.Unalias(t)
 	if p, ok := t.(*types.Pointer); ok {
 		t = types.Unalias(p.Elem())
 	}
@@ -2220,8 +2223,11 @@ func isASN1Type(t types.Type) bool {
 	if !ok || named.Obj().Pkg() == nil || named.Obj().Pkg().Path() != "encoding/asn1" {
 		return false
 	}
-	name := named.Obj().Name()
-	return name != "StructuralError" && name != "SyntaxError"
+	switch named.Obj().Name() {
+	case "RawValue", "RawContent", "ObjectIdentifier", "BitString", "Enumerated", "Flag":
+		return true
+	}
+	return false
 }
 
 // hasSSHTag reports whether a field of str is tagged for x/crypto/ssh's

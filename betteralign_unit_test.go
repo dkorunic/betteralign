@@ -3206,17 +3206,23 @@ func TestLoadStampedOneEntryPerPath(t *testing.T) {
 	}
 }
 
-// TestIsASN1TypeErrors pins that encoding/asn1's error types do not mark a
-// struct as ASN.1: one holding a StructuralError is no wire-format struct.
-func TestIsASN1TypeErrors(t *testing.T) {
+// TestIsASN1Type pins that only encoding/asn1's exported wire-format data
+// types mark a struct as ASN.1: not its error types (a struct holding a
+// StructuralError is no wire-format struct) and not its unexported types
+// (inside encoding/asn1, taggedEncoder's encoder field is no marker).
+func TestIsASN1Type(t *testing.T) {
 	pkg := types.NewPackage("encoding/asn1", "asn1")
-	for name, want := range map[string]bool{"StructuralError": false, "SyntaxError": false, "RawValue": true, "ObjectIdentifier": true} {
+	for name, want := range map[string]bool{
+		"RawValue": true, "RawContent": true, "ObjectIdentifier": true,
+		"BitString": true, "Enumerated": true, "Flag": true,
+		"StructuralError": false, "SyntaxError": false, "encoder": false,
+	} {
 		n := types.NewNamed(types.NewTypeName(token.NoPos, pkg, name, nil), types.NewStruct(nil, nil), nil)
-		if got := isASN1Type(n); got != want {
-			t.Errorf("isASN1Type(asn1.%s) = %v, want %v", name, got, want)
-		}
-		if got := isASN1Type(types.NewPointer(n)); got != want {
-			t.Errorf("isASN1Type(*asn1.%s) = %v, want %v", name, got, want)
+		alias := types.NewAlias(types.NewTypeName(token.NoPos, nil, "A", nil), n)
+		for _, typ := range []types.Type{n, alias, types.NewPointer(n), types.NewPointer(alias)} {
+			if got := isASN1Type(typ); got != want {
+				t.Errorf("isASN1Type(%s) = %v, want %v", typ, got, want)
+			}
 		}
 	}
 }
