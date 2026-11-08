@@ -156,3 +156,33 @@ type AsmOnly struct { // want `struct of size 24 could be 16$`
 	AO2 int64
 	AO3 bool
 }
+
+// Taken by a body-less declaration only in asmstub_never.go: its assembly
+// reads the fields by offset.
+type AsmState struct { // want `reorder skipped: assembly implementation at .*asmstub_never.go`
+	AS1 bool
+	AS2 int64
+	AS3 bool
+}
+
+// The receiver of a body-less method there, holding AsmState by value.
+type AsmHolder struct { // want `reorder skipped: assembly implementation at .*asmstub_never.go`
+	AH1 bool
+	AH2 AsmState
+	AH3 bool
+}
+
+// Passed only to a function with a body in the excluded file: still reordered.
+type AsmPlain struct { // want `struct of size 24 could be 16$`
+	AP1 bool
+	AP2 int64
+	AP3 bool
+}
+
+// Taken only by a //go:linkname-bound declaration in the excluded file: Go
+// code, not assembly, so still reordered.
+type AsmLinkedOther struct { // want `struct of size 24 could be 16$`
+	AL1 bool
+	AL2 int64
+	AL3 bool
+}

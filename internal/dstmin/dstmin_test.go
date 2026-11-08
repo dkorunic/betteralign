@@ -769,6 +769,41 @@ func TestFprint(t *testing.T) {
 			want: "package p\n\ntype S struct { // want \"struct of size 12 could be 8\"\n\ty int32\n\tx byte\n\tz byte\n}\n",
 		},
 		{
+			// gofmt drops a blank line after { only before a field, not
+			// before a comment: the moved field's lead blank must not
+			// follow it to the top.
+			name: "no blank line after brace when a documented field moves first",
+			code: "package p\n\ntype S struct {\n\ta bool\n\n\t// p doc\n\tp *int\n\tb bool\n}\n",
+			mutate: func(df *File) {
+				st := df.structs[0]
+				st.Fields.List = []*Field{st.Fields.List[1], st.Fields.List[0], st.Fields.List[2]}
+			},
+			want: "package p\n\ntype S struct {\n\t// p doc\n\tp *int\n\ta bool\n\n\tb bool\n}\n",
+		},
+		{
+			// The field that was first keeps its trail blank where it lands;
+			// the next field's lead blank duplicates it, and the pair stays
+			// one blank line.
+			name: "former first field's blank is not doubled",
+			code: "package p\n\ntype S struct {\n\ta bool\n\n\t// b doc\n\tb bool\n\tp *int\n}\n",
+			mutate: func(df *File) {
+				st := df.structs[0]
+				st.Fields.List = []*Field{st.Fields.List[2], st.Fields.List[0], st.Fields.List[1]}
+			},
+			want: "package p\n\ntype S struct {\n\tp *int\n\ta bool\n\n\t// b doc\n\tb bool\n}\n",
+		},
+		{
+			// A comment floating above the first field travels in its lead
+			// span; only blank lines at the top of the body are dropped.
+			name: "floating comment above moved first field survives",
+			code: "package p\n\ntype S struct {\n\n\t// floating\n\n\ta bool\n\tp *int\n}\n",
+			mutate: func(df *File) {
+				st := df.structs[0]
+				st.Fields.List = []*Field{st.Fields.List[1], st.Fields.List[0]}
+			},
+			want: "package p\n\ntype S struct {\n\tp *int\n\n\t// floating\n\n\ta bool\n}\n",
+		},
+		{
 			name: "struct tags survive reorder",
 			code: "package p\n\ntype S struct {\n\tX byte  `json:\"x\"`\n\tY int32 `json:\"y\"`\n}\n",
 			mutate: func(df *File) {

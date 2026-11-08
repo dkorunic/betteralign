@@ -1,0 +1,59 @@
+package layoutpin
+
+// A body-less declaration is implemented in assembly, which reads its
+// arguments' fields at offsets fixed by today's layout: every struct its
+// parameters and results reach (through pointers, slices and arrays) is
+// pinned, with the structs it holds by value. Methods count by receiver.
+type AsmCtx struct { // want `reorder skipped: assembly implementation at .*asm.go:20:`
+	a  bool
+	in AsmInner
+	b  bool
+}
+
+// Held by value inside AsmCtx: part of the bytes the assembly reads.
+type AsmInner struct { // want `reorder skipped: assembly implementation at .*asm.go:20:`
+	ix bool
+	iy int64
+	iz bool
+}
+
+func asmGet(c *AsmCtx) int
+
+type AsmRecv struct { // want `reorder skipped: assembly implementation at .*asm.go:28:`
+	qa bool
+	qb int64
+	qc bool
+}
+
+func (r *AsmRecv) asmLoad() int
+
+// Passed only to a function with a body: still reordered.
+type AsmControl struct { // want `struct of size 24 could be 16$`
+	cb int64
+	ca bool
+	cc bool
+}
+
+func asmControl(c *AsmControl) int { return int(c.cb) }
+
+// Bound by //go:linkname to a Go implementation elsewhere: compiled Go
+// against the real layout, no offset contract. Still reordered, whether the
+// directive is the declaration's doc comment or detached from it.
+type AsmLinked struct { // want `struct of size 24 could be 16$`
+	kb int64
+	ka bool
+	kc bool
+}
+
+//go:linkname asmLinked runtime.asmLinked
+func asmLinked(l *AsmLinked) int
+
+type AsmDetached struct { // want `struct of size 24 could be 16$`
+	db int64
+	da bool
+	dc bool
+}
+
+//go:linkname asmDetached
+
+func asmDetached(d *AsmDetached) int

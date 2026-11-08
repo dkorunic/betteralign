@@ -90,3 +90,18 @@ type innerAliasOuter struct {
 	f  four
 	in innerAlias
 }
+
+// An inner struct the same run really reorders (time.Time's shape) must not
+// stop its outer: measured as declared, the order below looks worse (40
+// pointer bytes), so a check against the declared layout refused outer in
+// the first run and accepted it in the second, once Time had moved.
+type Time struct { // want `struct with 24 pointer bytes could be 8`
+	loc  *int
+	wall uint64
+	ext  int64
+}
+
+type Outer struct { // want `struct with 32 pointer bytes could be 24`
+	S string
+	T Time
+}

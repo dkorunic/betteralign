@@ -32,6 +32,7 @@
 package betteralign
 
 import (
+	"bytes"
 	"cmp"
 	"errors"
 	"flag"
@@ -150,11 +151,13 @@ whose field is passed to a 64-bit ` + "`sync/atomic`" + ` function (which needs 
 type, one identical to an unnamed struct
 type it may be assigned to (including an alias ` + "`type A = struct{...}`" + `), one
 converted to or from ` + "`unsafe.Pointer`" + ` (type punning), and one passed to
-` + "`encoding/binary`" + `, ` + "`encoding/asn1`" + ` or ` + "`x/crypto/ssh`" + ` (whose wire format is field order).
-Reordering would break the build, corrupt memory or silently change the
-encoding. The last three also cover structs held by value inside them. A
-struct that declares itself ASN.1 — an ` + "`asn1:\"...\"`" + ` tag or a field of an
-` + "`encoding/asn1`" + ` type — is skipped outright, since its encoder usually lives
+` + "`encoding/binary`" + `, ` + "`encoding/asn1`" + ` or ` + "`x/crypto/ssh`" + ` (whose wire format is field order),
+and one taken or returned by a body-less function declaration, whose
+assembly reads fields at fixed offsets. Reordering would break the build,
+corrupt memory or silently change the encoding. The last four also cover
+structs held by value inside them. A struct that declares itself ASN.1 — an
+` + "`asn1:\"...\"`" + ` tag or a field of an ` + "`encoding/asn1`" + ` type, on it or on a
+struct it holds by value — is skipped outright, since its encoder usually lives
 in another package; so is one tagged for ` + "`x/crypto/ssh`" + ` (` + "`ssh`" + `, ` + "`sshtype`" + `). A conversion to a struct of another package in the same
 module follows that package: both are reordered, identically.
 
@@ -193,6 +196,8 @@ var (
 	ErrEmptyBuffer    = errors.New("refusing to write empty buffer")
 	ErrPreFilterFiles = errors.New("failed to pre-filter files")
 	ErrRewritePanic   = errors.New("internal error while rewriting, please report it")
+	ErrApplyUnderVet  = errors.New("-apply is not supported under go vet (each package runs in its own process, " +
+		"so rewrites race with other packages' layout predictions); use `go vet -fix` / `go fix -fixtool`, or run betteralign directly")
 )
 
 // analyzerConfig holds per-analyzer flag state; one per InitAnalyzer call.
@@ -269,8 +274,9 @@ func init() {
 // each struct's SuggestedFix, and every diagnostic is then reported in walk
 // order. A struct dstmin can't decorate is still reported, just without a fix.
 //
-// Returns a non-nil error (wrapping ErrPreFilterFiles) only when exclude-path
-// normalisation fails; per-file decorate/format/write failures are logged and
+// Returns a non-nil error only when exclude-path normalisation fails
+// (wrapping ErrPreFilterFiles) or when asked to write under go vet
+// (ErrApplyUnderVet); per-file decorate/format/write failures are logged and
 // skipped. Safe across concurrent passes; flag slices are cloned because hosts
 // like golangci-lint may share flag state.
 func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
@@ -289,6 +295,13 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 	// -diff previews an -apply rewrite; never write files under it. Under -json
 	// the diff goes to stderr so stdout stays parseable JSON.
 	showDiff := apply && flagRequested(pass, "diff")
+	// Under go vet each package is its own process: a dependency's process
+	// rewrites its file before an importer's predicts from it, the moved
+	// struct no longer matches, the importer pins its side and the build
+	// breaks. -diff writes nothing, so it stays allowed.
+	if apply && !showDiff && unitcheckerDriver() {
+		return nil, ErrApplyUnderVet
+	}
 	diffTo := diffOut
 	if flagRequested(pass, "json") {
 		diffTo = diffJSONOut
@@ -345,7 +358,6 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 	var diags []pendingDiag
 
 	dirtyFiles := make(map[string]*dst.File)
-	dirtyTF := make(map[string]*token.File)
 	decoratedFiles := make(map[string]*dst.File)
 	decorationFailed := make(map[string]struct{})
 	// Populated from *ast.GenDecl visits, consulted from *ast.StructType visits.
@@ -606,7 +618,6 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 		}
 		dNode.Fields.List = reordered
 		dirtyFiles[currentFn] = dFile
-		dirtyTF[currentFn] = pass.Fset.File(currentASTFile.Pos())
 		diags[len(diags)-1].st = s
 	})
 
@@ -639,7 +650,7 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 			continue
 		}
 		// Before the write: another pass may be predicting from this file.
-		storePristine(fn, dirtyTF[fn], df.Source())
+		storePristine(fn, df.Source())
 		if err := applyToFile(fn, out); err != nil {
 			fmt.Fprintf(os.Stderr, "error applying fixes to %v: %v\n", fn, err)
 		}
@@ -839,6 +850,7 @@ const (
 	pinASN1       = "encoding/asn1 call at %s depends on field order"
 	pinSSH        = "x/crypto/ssh call at %s depends on field order"
 	pinAtomic     = "64-bit atomic access at %s needs its 8-byte alignment on 32-bit platforms"
+	pinAssembly   = "assembly implementation at %s (body-less func declaration) reads fields by offset"
 )
 
 // isAtomic64Func reports whether fn is one of sync/atomic's 64-bit functions
@@ -901,8 +913,13 @@ var unsafeOffsetof = types.Unsafe.Scope().Lookup("Offsetof")
 //   - an argument of an orderCodecs function (encoding/binary, encoding/asn1,
 //     x/crypto/ssh): the wire format is field declaration order, so a reorder
 //     silently changes it.
+//   - a parameter, result or receiver of a body-less func declaration: its
+//     assembly implementation reads fields at fixed offsets, and nothing
+//     (build, vet, asmdecl) notices when they move. One a //go:linkname
+//     directive names is Go code elsewhere and pins nothing. Declarations in files this build excludes
+//     (the usual arch-gated stub) are found syntactically, by type name.
 //
-// The last two also pin every struct held by value inside S (fields, arrays),
+// The last three also pin every struct held by value inside S (fields, arrays),
 // since those bytes are part of the same layout.
 //
 // Per-file skip flags deliberately do not apply: an excluded file still
@@ -979,13 +996,60 @@ func collectLayoutPins(inspect *inspector.Inspector, pass *analysis.Pass, sizes 
 		}
 	}
 
+	// elemOf walks t to the element a value arrives as: through pointers
+	// and slices (codec arguments, assembly operands); pinLayout takes arrays.
+	elemOf := func(t types.Type) types.Type {
+		var visited map[*types.Named]bool
+		for !revisits(t, &visited) {
+			switch u := types.Unalias(t).Underlying().(type) {
+			case *types.Pointer:
+				t = u.Elem()
+				continue
+			case *types.Slice:
+				t = u.Elem()
+				continue
+			}
+			break
+		}
+		return t
+	}
+
 	// Unnamed struct type literals, checked for identity after the walk.
 	var unnamed, all []*types.Struct
 	allPos := make(map[*types.Struct]token.Pos)
 	defined := make(map[*ast.StructType]bool)
 
-	inspect.Preorder([]ast.Node{(*ast.CompositeLit)(nil), (*ast.CallExpr)(nil), (*ast.TypeSpec)(nil), (*ast.StructType)(nil)}, func(node ast.Node) {
+	inspect.Preorder([]ast.Node{(*ast.CompositeLit)(nil), (*ast.CallExpr)(nil), (*ast.TypeSpec)(nil), (*ast.StructType)(nil), (*ast.FuncDecl)(nil)}, func(node ast.Node) {
 		switch n := node.(type) {
+		case *ast.FuncDecl:
+			// Body-less: implemented in assembly, which reads its operands'
+			// fields by offset — unless //go:linkname binds it to Go code.
+			if n.Body != nil {
+				return
+			}
+			for _, f := range pass.Files {
+				if f.FileStart <= n.Pos() && n.Pos() < f.FileEnd && linknamed(f, n) {
+					return
+				}
+			}
+			fn, _ := pass.TypesInfo.Defs[n.Name].(*types.Func)
+			if fn == nil {
+				return
+			}
+			sig := fn.Signature()
+			p := layoutPin{format: pinAssembly, pos: n.Pos()}
+			vars := []*types.Var{sig.Recv()}
+			for _, tup := range []*types.Tuple{sig.Params(), sig.Results()} {
+				for v := range tup.Variables() {
+					vars = append(vars, v)
+				}
+			}
+			for _, v := range vars {
+				if v != nil {
+					pinLayout(elemOf(v.Type()), p, false, map[*types.Struct]bool{})
+				}
+			}
+			return
 		case *ast.TypeSpec:
 			// A defined type's struct is named; an alias's stays unnamed.
 			if st, ok := n.Type.(*ast.StructType); ok && !n.Assign.IsValid() {
@@ -1020,19 +1084,7 @@ func collectLayoutPins(inspect *inspector.Inspector, pass *analysis.Pass, sizes 
 						continue
 					}
 					// Values arrive by pointer, slice or array; walk to the element.
-					var visited map[*types.Named]bool
-					for !revisits(t, &visited) {
-						switch u := types.Unalias(t).Underlying().(type) {
-						case *types.Pointer:
-							t = u.Elem()
-							continue
-						case *types.Slice:
-							t = u.Elem()
-							continue
-						}
-						break
-					}
-					pinLayout(t, layoutPin{format: codec, pos: call.Pos()}, codec == pinASN1, map[*types.Struct]bool{})
+					pinLayout(elemOf(t), layoutPin{format: codec, pos: call.Pos()}, codec == pinASN1, map[*types.Struct]bool{})
 				}
 				return
 			}
@@ -1252,10 +1304,19 @@ func collectLayoutPins(inspect *inspector.Inspector, pass *analysis.Pass, sizes 
 	// breaks that build or, with compatible field types, silently re-maps its
 	// values. Found syntactically, by type name; after the typed pins, which
 	// win.
-	other, otherDecls := otherBuildPositional(pass)
-	for _, path := range slices.Sorted(maps.Keys(other)) {
-		for _, st := range resolveLiteralPath(pass.Pkg, path, otherDecls) {
-			pin(st, layoutPin{format: pinPositional, at: other[path]})
+	other := otherBuildPositional(pass)
+	for _, path := range slices.Sorted(maps.Keys(other.lits)) {
+		for _, st := range resolveLiteralPath(pass.Pkg, path, other.decls) {
+			pin(st, layoutPin{format: pinPositional, at: other.lits[path]})
+		}
+	}
+	// Likewise the operands of a body-less declaration there: assembly stubs
+	// are usually arch-gated (f_arm64.go beside f_arm64.s), so the in-build
+	// check above misses the main case.
+	for _, name := range slices.Sorted(maps.Keys(other.asm)) {
+		seen := make(map[*types.Struct]bool)
+		for _, st := range resolveLiteralPath(pass.Pkg, name, other.decls) {
+			pinLayout(st, layoutPin{format: pinAssembly, at: other.asm[name]}, false, seen)
 		}
 	}
 
@@ -1357,18 +1418,17 @@ func foreignRewritten(pass *analysis.Pass, st *types.Struct, sizes *gcSizes, dec
 
 // declDecorates reports whether dstmin would accept the struct literal decl
 // for a reorder; a shape it refuses stays as declared, whatever its layout.
-// An unreadable or unparsable file gives no such evidence, so it counts as
-// accepted.
+// A source that doesn't hold the declaration (declAt) gives no such
+// evidence, so it counts as accepted.
 func declDecorates(pass *analysis.Pass, decl *types.Struct) bool {
 	if decl.NumFields() == 0 {
 		return false
 	}
-	pos := pass.Fset.PositionFor(decl.Field(0).Pos(), false)
-	ds := readDeclSource(pos.Filename, pass.Fset.File(decl.Field(0).Pos()))
-	if ds.decorated == nil {
+	_, ds, ok := declAt(pass, decl)
+	if !ok {
 		return true
 	}
-	accepted, known := ds.decorated()[pos.Line]
+	accepted, known := ds.decorated()[pass.Fset.PositionFor(decl.Field(0).Pos(), false).Line]
 	return !known || accepted
 }
 
@@ -1402,8 +1462,7 @@ func declOptedIn(pass *analysis.Pass, decl *types.Struct) bool {
 	if decl.NumFields() == 0 {
 		return false
 	}
-	pos := pass.Fset.PositionFor(decl.Field(0).Pos(), false)
-	d, ok := readDeclSource(pos.Filename, pass.Fset.File(decl.Field(0).Pos())).at(pos.Line, decl.Field(0).Name())
+	d, _, ok := declAt(pass, decl)
 	return ok && d.optedIn
 }
 
@@ -1519,23 +1578,32 @@ func moduleRoot(file string) string {
 var otherBuildCache sync.Map // map[declSourceKey]func() otherBuildScan
 
 // otherBuildScan is one excluded file's package name, its first positional
-// composite literal ("file:line:col") per literal type path, and its
+// composite literal ("file:line:col") per literal type path, its first
+// body-less func declaration per operand type name (asm), and its
 // non-generic type declarations (name to type expression).
 type otherBuildScan struct {
 	lits  map[string]string
+	asm   map[string]string
 	decls map[string]ast.Expr
 	pkg   string
+}
+
+// otherBuild is otherBuildScan merged over a package's excluded files.
+type otherBuild struct {
+	lits  map[string]string
+	asm   map[string]string
+	decls map[string][]ast.Expr
 }
 
 // otherBuildPositional maps each literal type path (see scanOtherBuild) to the
 // first positional composite literal of it in pass's .go files of its own
 // package that the build excluded (pass.IgnoredFiles: another GOOS/GOARCH, an
-// unset tag, a tag the run set that a file negates). It also returns the type
-// declarations of those files, every one per name: the builds that declare a
-// name differently each need theirs.
-func otherBuildPositional(pass *analysis.Pass) (map[string]string, map[string][]ast.Expr) {
-	found := make(map[string]string)
-	decls := make(map[string][]ast.Expr)
+// unset tag, a tag the run set that a file negates), and each operand type
+// name to the first body-less func declaration taking or returning it there.
+// It also returns the type declarations of those files, every one per name:
+// the builds that declare a name differently each need theirs.
+func otherBuildPositional(pass *analysis.Pass) otherBuild {
+	out := otherBuild{lits: make(map[string]string), asm: make(map[string]string), decls: make(map[string][]ast.Expr)}
 	for _, path := range slices.Sorted(slices.Values(pass.IgnoredFiles)) {
 		if !strings.HasSuffix(path, ".go") {
 			continue
@@ -1552,30 +1620,38 @@ func otherBuildPositional(pass *analysis.Pass) (map[string]string, map[string][]
 		if s.pkg != pass.Pkg.Name() {
 			continue
 		}
-		for typ, at := range s.lits {
-			if _, seen := found[typ]; !seen {
-				found[typ] = at
-			}
-		}
+		keepFirst(out.lits, s.lits)
+		keepFirst(out.asm, s.asm)
 		for _, name := range slices.Sorted(maps.Keys(s.decls)) {
-			decls[name] = append(decls[name], s.decls[name])
+			out.decls[name] = append(out.decls[name], s.decls[name])
 		}
 	}
-	return found, decls
+	return out
+}
+
+// keepFirst copies src's entries into dst, keeping any dst already has.
+func keepFirst(dst, src map[string]string) {
+	for k, v := range src {
+		if _, seen := dst[k]; !seen {
+			dst[k] = v
+		}
+	}
 }
 
 // scanOtherBuild records path's positional composite literals by the type
 // they build. Only the syntax is available, so a type is a path: a local type
 // name, then for each elided level ([]T{{...}}, M{"k": {...}} with M a named
 // map) "/e" for an element or "/k" for a map key, resolved against the
-// package's types by resolveLiteralPath.
+// package's types by resolveLiteralPath. It also records, by local type name,
+// the receiver, parameters and results of each body-less func declaration
+// (implemented in assembly), stripped of *, [] and [N].
 func scanOtherBuild(path string) otherBuildScan {
 	src, err := os.ReadFile(path)
 	if err != nil || neverBuilt(src) {
 		return otherBuildScan{}
 	}
 	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, path, src, parser.SkipObjectResolution)
+	f, err := parser.ParseFile(fset, path, src, parser.SkipObjectResolution|parser.ParseComments)
 	if err != nil {
 		return otherBuildScan{}
 	}
@@ -1630,16 +1706,71 @@ func scanOtherBuild(path string) otherBuildScan {
 		return true
 	})
 	decls := make(map[string]ast.Expr)
+	asm := make(map[string]string)
 	for _, d := range f.Decls {
-		if g, ok := d.(*ast.GenDecl); ok && g.Tok == token.TYPE {
-			for _, spec := range g.Specs {
+		switch d := d.(type) {
+		case *ast.GenDecl:
+			if d.Tok != token.TYPE {
+				continue
+			}
+			for _, spec := range d.Specs {
 				if ts := spec.(*ast.TypeSpec); ts.TypeParams == nil {
 					decls[ts.Name.Name] = ts.Type
 				}
 			}
+		case *ast.FuncDecl:
+			if d.Body != nil || linknamed(f, d) {
+				continue
+			}
+			for _, fl := range []*ast.FieldList{d.Recv, d.Type.Params, d.Type.Results} {
+				if fl == nil {
+					continue
+				}
+				for _, field := range fl.List {
+					name := asmOperandName(field.Type)
+					if _, seen := asm[name]; name != "" && !seen {
+						asm[name] = fset.Position(d.Pos()).String()
+					}
+				}
+			}
 		}
 	}
-	return otherBuildScan{pkg: f.Name.Name, lits: found, decls: decls}
+	return otherBuildScan{pkg: f.Name.Name, lits: found, asm: asm, decls: decls}
+}
+
+// linknamed reports whether fn, a body-less declaration in f, is bound by a
+// `//go:linkname fn [target]` directive to an implementation elsewhere:
+// compiled Go against the real layout, not assembly reading fixed offsets.
+// The doc comment first; gofmt sometimes detaches a directive, so then every
+// comment of f.
+func linknamed(f *ast.File, fn *ast.FuncDecl) bool {
+	names := func(g *ast.CommentGroup) bool {
+		for _, c := range g.List {
+			rest, ok := strings.CutPrefix(c.Text, "//go:linkname ")
+			if args := strings.Fields(rest); ok && len(args) > 0 && args[0] == fn.Name.Name {
+				return true
+			}
+		}
+		return false
+	}
+	return fn.Doc != nil && names(fn.Doc) || slices.ContainsFunc(f.Comments, names)
+}
+
+// asmOperandName returns the local type name an assembly operand of type t
+// reaches through pointers, slices, arrays and a variadic ..., or "".
+func asmOperandName(t ast.Expr) string {
+	for {
+		switch tt := ast.Unparen(t).(type) {
+		case *ast.StarExpr:
+			t = tt.X
+		case *ast.ArrayType:
+			t = tt.Elt
+		case *ast.Ellipsis:
+			t = tt.Elt
+		default:
+			return literalTypeName(t)
+		}
+	}
 }
 
 // resolveLiteralPath resolves a scanOtherBuild type path to the structs its
@@ -1870,19 +2001,52 @@ func hasBlankPadding(str *types.Struct, sizes *gcSizes) bool {
 // crypto/x509/pkix types) where its call site can't pin this struct — so the
 // struct is left alone in its own package, like structs.HostLayout.
 func isASN1Struct(str *types.Struct) bool {
+	var visited map[*types.Named]bool
+	return asn1Struct(str, &visited)
+}
+
+// asn1Struct is isASN1Struct's walk: str's own fields (an encoding/asn1
+// type counts directly or as an array or slice element), then the structs it
+// holds by value — fields, arrays and slice elements (SEQUENCE OF), not
+// pointers — since a holder of an ASN.1 struct is encoded with it and usually
+// reaches the codec through an interface{} (x/crypto/pkcs12's encryptedData),
+// where no call site pins it. visited, shared by the whole walk, stops on
+// recursive types; the first hit ends it.
+func asn1Struct(str *types.Struct, visited *map[*types.Named]bool) bool {
 	for i := range str.NumFields() {
 		if _, ok := reflect.StructTag(str.Tag(i)).Lookup("asn1"); ok {
 			return true
 		}
-		t := types.Unalias(str.Field(i).Type())
-		if p, ok := t.(*types.Pointer); ok {
-			t = types.Unalias(p.Elem())
-		}
-		if named, ok := t.(*types.Named); ok && named.Obj().Pkg() != nil && named.Obj().Pkg().Path() == "encoding/asn1" {
-			return true
+		for t := types.Unalias(str.Field(i).Type()); !revisits(t, visited); {
+			if isASN1Type(t) {
+				return true
+			}
+			switch u := t.Underlying().(type) {
+			case *types.Array:
+				t = types.Unalias(u.Elem())
+				continue
+			case *types.Slice:
+				t = types.Unalias(u.Elem())
+				continue
+			case *types.Struct:
+				if asn1Struct(u, visited) {
+					return true
+				}
+			}
+			break
 		}
 	}
 	return false
+}
+
+// isASN1Type reports whether t is an encoding/asn1 named type or a pointer
+// to one: as a field, an array or a slice element, it marks ASN.1.
+func isASN1Type(t types.Type) bool {
+	if p, ok := t.(*types.Pointer); ok {
+		t = types.Unalias(p.Elem())
+	}
+	named, ok := t.(*types.Named)
+	return ok && named.Obj().Pkg() != nil && named.Obj().Pkg().Path() == "encoding/asn1"
 }
 
 // hasSSHTag reports whether a field of str is tagged for x/crypto/ssh's
@@ -2740,23 +2904,78 @@ func declRewritable(pass *analysis.Pass, decl *types.Struct, skipFile func(strin
 	if !filepath.IsAbs(fn) || !strings.HasSuffix(fn, ".go") || pos.Line < 1 || skipFile(fn) {
 		return false
 	}
-	tf := pass.Fset.File(first.Pos())
-	src := readDeclSource(fn, tf)
-	// A token.File that is not a parse of these bytes comes from export data
-	// (gcimporter's fake file: a fixed size, one-byte lines): the package is
-	// not analyzed, so its pass never rewrites anything. Or the file changed
-	// since it was parsed, where its lines say nothing about the declaration.
-	// ponytail: size only; a real file of exactly gcimporter's fake size
-	// (64 KiB) passes, and is then judged by its text as before.
-	if tf == nil || int64(tf.Size()) != src.size {
-		return false
-	}
+	d, src, ok := declAt(pass, decl)
 	// A cgo file is never rewritten, -generated_files or not (see run).
-	if src.cgo || !generatedFiles && src.generated {
+	if !ok || src.cgo || !generatedFiles && src.generated {
 		return false
 	}
-	d, ok := src.at(pos.Line, first.Name())
-	return ok && d.reorderable
+	return d.reorderable
+}
+
+// declAt finds the struct literal decl in the source its type information
+// describes, so declRewritable, declDecorates and declOptedIn judge the same
+// text. Candidates, in order: the file on disk, then its pristine bytes
+// (pristineSource). One is accepted when it declares a struct whose first
+// field has decl's first field's name on that field's unadjusted line, and —
+// except under a vettool — has the size of the token.File holding decl.
+//
+// Disk first: after an edit in the same process the disk is current (the
+// pristine entry is stale) and matches; after another pass's concurrent
+// rewrite the moved struct no longer matches the disk, so the pristine bytes,
+// stored before the write, are used; a struct the rewrite left in place
+// matches both and both say the same. Pristine is loaded after the disk is
+// read, so a read that raced the rewrite still finds it.
+//
+// The size rejects export data under the drivers that parse every analyzed
+// package from source (singlechecker, golangci-lint): gcimporter's fake
+// token.File (64 KiB, one-byte lines) means the package is not analyzed, so
+// its pass never rewrites anything. Under go vet (unitcheckerDriver) every
+// import is export data and the partner is analyzed by its own process
+// whenever it is in the vet pattern, so the text alone decides; vetting a
+// subset of a module leaves partners outside the pattern unrewritten while
+// the local side follows them, as in v0.15.4.
+// ponytail: size only; a real file of exactly gcimporter's fake size (64 KiB)
+// passes, and is then judged by its text.
+func declAt(pass *analysis.Pass, decl *types.Struct) (declInfo, *declSource, bool) {
+	if decl.NumFields() == 0 {
+		return declInfo{}, nil, false
+	}
+	first := decl.Field(0)
+	tf := pass.Fset.File(first.Pos())
+	if tf == nil {
+		return declInfo{}, nil, false
+	}
+	pos := pass.Fset.PositionFor(first.Pos(), false)
+	accept := func(ds *declSource) (declInfo, bool) {
+		if ds == nil || !unitcheckerDriver() && int64(tf.Size()) != ds.size {
+			return declInfo{}, false
+		}
+		return ds.at(pos.Line, first.Name())
+	}
+	if ds := readDeclSource(pos.Filename); ds != nil {
+		if d, ok := accept(ds); ok {
+			return d, ds, true
+		}
+	}
+	if ds := pristineDeclSource(pos.Filename); ds != nil {
+		if d, ok := accept(ds); ok {
+			return d, ds, true
+		}
+	}
+	return declInfo{}, nil, false
+}
+
+// unitcheckerDriver reports whether this process is a vettool (go vet
+// -vettool, which runs one process per package). Computed once; a variable
+// so tests can override it.
+var unitcheckerDriver = sync.OnceValue(func() bool {
+	return flag.Parsed() && vettoolArgs(flag.Args())
+})
+
+// vettoolArgs mirrors the x/tools singlechecker/multichecker hand-off to
+// unitchecker: go vet runs `vettool <analyzer flags> <path>.cfg`.
+func vettoolArgs(args []string) bool {
+	return len(args) == 1 && strings.HasSuffix(args[0], ".cfg")
 }
 
 // declSource is a declaring file as declRewritable reads it.
@@ -2767,7 +2986,7 @@ type declSource struct {
 	// a type spec (the first, where one line starts several) to what run
 	// would do with it.
 	decls map[int]declInfo
-	// size is the length of the bytes parsed (0 when unreadable).
+	// size is the length of the bytes parsed.
 	size      int64
 	generated bool
 	cgo       bool
@@ -2798,67 +3017,56 @@ type declSourceKey struct {
 // pristineSource holds, per path, a file's bytes from before -apply rewrote
 // it. Type information — this pass's and the export data's — describes those
 // bytes, while passes run concurrently: a pass predicting a partner declared
-// in a file its own pass already rewrote would otherwise read the reordered
-// struct (another first field, shifted lines) and mispredict. An entry holds
-// only for the parse it was written from (the *token.File every package of
-// one load shares): a later run in the same process (an embedding host, the
-// test suite) parses afresh, edited or not, and reads the disk.
+// in a file another pass already rewrote would otherwise read the reordered
+// struct (another first field, shifted lines) and mispredict. Keyed by path,
+// not parse: golangci-lint parses each package variant itself, so the
+// importer's token.File is not the writer's. declAt decides when an entry
+// applies.
 var pristineSource sync.Map // map[string]*pristineEntry
 
-// pristineEntry is a file's pre-rewrite bytes, parsed on first use, and the
-// parse of them the rewrite came from.
+// pristineEntry is a file's pre-rewrite bytes, parsed on first use.
 type pristineEntry struct {
-	tf *token.File
-	ds func() *declSource
+	ds  func() *declSource
+	src []byte
 }
 
-// storePristine records src, the bytes tf was parsed from, as fn's
-// pre-rewrite text before -apply writes fn. An entry for the same parse is
-// kept: p and p [p.test] share it and may both rewrite the file, and only the
-// first holds the bytes type information describes.
-func storePristine(fn string, tf *token.File, src []byte) {
-	if v, ok := pristineSource.Load(fn); ok && v.(*pristineEntry).tf == tf {
+// storePristine records src as fn's pre-rewrite text before -apply writes
+// fn. The latest rewrite wins, except that an entry with the same bytes is
+// kept (p and p [p.test] may both rewrite from one parse).
+func storePristine(fn string, src []byte) {
+	if v, ok := pristineSource.Load(fn); ok && bytes.Equal(v.(*pristineEntry).src, src) {
 		return
 	}
 	pristineSource.Store(fn, &pristineEntry{
-		tf: tf,
-		ds: sync.OnceValue(func() *declSource { return newDeclSource(fn, src) }),
+		src: src,
+		ds:  sync.OnceValue(func() *declSource { return newDeclSource(fn, src) }),
 	})
 }
 
-// readDeclSource loads and parses fn — as it was before this process
-// rewrote it, if it did from tf, the parse the caller's type information
-// comes from; an unreadable file yields an empty declSource, which knows no
-// declaration.
-func readDeclSource(fn string, tf *token.File) *declSource {
-	pristine := func() *declSource {
-		if v, ok := pristineSource.Load(fn); ok && v.(*pristineEntry).tf == tf {
-			return v.(*pristineEntry).ds()
-		}
-		return nil
+// pristineDeclSource returns fn's pristine bytes parsed, or nil.
+func pristineDeclSource(fn string) *declSource {
+	if v, ok := pristineSource.Load(fn); ok {
+		return v.(*pristineEntry).ds()
 	}
-	if ds := pristine(); ds != nil {
-		return ds
-	}
+	return nil
+}
+
+// readDeclSource loads and parses fn as it is on disk; an unreadable file
+// yields nil.
+func readDeclSource(fn string) *declSource {
 	fi, err := os.Stat(fn)
 	if err != nil {
-		return &declSource{}
+		return nil
 	}
 	key := declSourceKey{fn, fi.Size(), fi.ModTime().UnixNano()}
 	if v, ok := declSourceCache.Load(key); ok {
 		return v.(*declSource)
 	}
 	src, err := os.ReadFile(fn)
-	// The pristine bytes are stored before the rewrite lands, so a read that
-	// raced it finds them now.
-	if ds := pristine(); ds != nil {
-		return ds
+	if err != nil {
+		return nil
 	}
-	ds := &declSource{}
-	if err == nil {
-		ds = newDeclSource(fn, src)
-	}
-	v, _ := declSourceCache.LoadOrStore(key, ds)
+	v, _ := declSourceCache.LoadOrStore(key, newDeclSource(fn, src))
 	return v.(*declSource)
 }
 
@@ -2957,32 +3165,31 @@ func lineDirective(fset *token.FileSet, f *ast.File) bool {
 // loud, not silent. So does a malformed glob, which isExcluded would treat as
 // excluding every file: a run reporting nothing would pass a CI gate.
 func normalizeExcludePaths(wd string, paths []string) ([]string, error) {
-	for _, p := range paths {
+	out := paths
+	if slices.ContainsFunc(paths, func(p string) bool { return filepath.IsAbs(p) || filepath.Clean(p) != p }) {
+		out = make([]string, len(paths))
+		for i, p := range paths {
+			if !filepath.IsAbs(p) {
+				out[i] = filepath.Clean(p)
+				continue
+			}
+			rel, err := filepath.Rel(wd, p)
+			if err != nil {
+				return nil, fmt.Errorf("exclude path %q is not resolvable relative to working directory %q (cross-volume on Windows, or requires runtime cwd): %w", p, wd, err)
+			}
+			// A "../"-prefixed rel never matches real paths under filepath.Match; fail loud not silent.
+			if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				return nil, fmt.Errorf("exclude path %q escapes working directory %q (resolved to %q); supply a path inside the working tree or use a relative pattern", p, wd, rel)
+			}
+			out[i] = rel
+		}
+	}
+	// Validate what isExcluded matches: cleaning can break a valid pattern
+	// (foo\/ becomes foo\, a trailing escape).
+	for i, p := range out {
 		if _, err := filepath.Match(p, ""); err != nil {
-			return nil, fmt.Errorf("exclude pattern %q: %w", p, err)
+			return nil, fmt.Errorf("exclude pattern %q: %w", paths[i], err)
 		}
-	}
-	needsNorm := slices.ContainsFunc(paths, func(p string) bool {
-		return filepath.IsAbs(p) || filepath.Clean(p) != p
-	})
-	if !needsNorm {
-		return paths, nil
-	}
-	out := make([]string, len(paths))
-	for i, p := range paths {
-		if !filepath.IsAbs(p) {
-			out[i] = filepath.Clean(p)
-			continue
-		}
-		rel, err := filepath.Rel(wd, p)
-		if err != nil {
-			return nil, fmt.Errorf("exclude path %q is not resolvable relative to working directory %q (cross-volume on Windows, or requires runtime cwd): %w", p, wd, err)
-		}
-		// A "../"-prefixed rel never matches real paths under filepath.Match; fail loud not silent.
-		if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return nil, fmt.Errorf("exclude path %q escapes working directory %q (resolved to %q); supply a path inside the working tree or use a relative pattern", p, wd, rel)
-		}
-		out[i] = rel
 	}
 	return out, nil
 }

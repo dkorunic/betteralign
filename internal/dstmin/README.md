@@ -10,8 +10,12 @@ alignment.
 Comments and blank lines are preserved via a **dual-attachment** model:
 each inter-field blank in source is decorated as a trail-blank on the
 preceding field AND a lead-blank on the following field. On reorder both
-emit; `go/format.Source` then naturally coalesces the duplicate and strips
-brace-adjacent blanks, matching `sirkon/dst`'s observable output.
+emit; `go/format.Source` then coalesces the duplicate. It strips a blank
+line after `{` only when a field follows directly, not a comment, so the
+splice drops the leading blank lines of a field moved to the top
+(`synthesizeBodyInto`): a documented field would otherwise keep the blank
+that separated it from its old predecessor. The field that was first keeps
+its span as written.
 
 The package is intentionally not exported; it exists only to remove the
 ~17k LOC `sirkon/dst` dependency from `betteralign` while keeping the

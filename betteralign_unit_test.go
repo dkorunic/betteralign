@@ -2032,7 +2032,13 @@ func TestNormalizeExcludePathsErrorMessage(t *testing.T) {
 // fast path (nothing to normalise) and the slow one alike.
 func TestNormalizeExcludePathsRejectsBadPattern(t *testing.T) {
 	wd := filepath.Join(string(filepath.Separator), "proj")
-	for _, paths := range [][]string{{"["}, {"ok", "a/[b"}, {filepath.Join(wd, "x"), "["}} {
+	bad := [][]string{{"["}, {"ok", "a/[b"}, {filepath.Join(wd, "x"), "["}}
+	if filepath.Separator == '/' {
+		// Valid as given, but cleaned to `foo\` — a trailing escape — which
+		// is the pattern isExcluded matches.
+		bad = append(bad, []string{"foo\\/"})
+	}
+	for _, paths := range bad {
 		if got, err := normalizeExcludePaths(wd, paths); !errors.Is(err, filepath.ErrBadPattern) {
 			t.Errorf("normalizeExcludePaths(%q) = %v, %v; want ErrBadPattern", paths, got, err)
 		}
@@ -2787,6 +2793,20 @@ func TestRewriteCandidateNeverWorse(t *testing.T) {
 	}
 }
 
+// declFromParse parses src as path into its own FileSet, as a driver would,
+// and returns a pass over that FileSet plus the struct whose first field,
+// named field, starts at column 2 of line.
+func declFromParse(path, src string, line int, field string) (*analysis.Pass, *types.Struct) {
+	fset := token.NewFileSet()
+	tf := fset.AddFile(path, -1, len(src))
+	tf.SetLinesForContent([]byte(src))
+	pkg := types.NewPackage("example.com/p", "p")
+	st := types.NewStruct([]*types.Var{
+		types.NewField(tf.LineStart(line)+1, pkg, field, types.Typ[types.Bool], false),
+	}, nil)
+	return &analysis.Pass{Pkg: pkg, Fset: fset, Module: &analysis.Module{Path: "example.com/p"}}, st
+}
+
 // TestReadDeclSourcePrefersPristine pins that a declaration is judged from
 // the bytes type information describes: once -apply has rewritten a file
 // (another pass, running concurrently), its pre-rewrite text is used, not the
@@ -2798,43 +2818,99 @@ func TestReadDeclSourcePrefersPristine(t *testing.T) {
 	if err := os.WriteFile(path, []byte(rewritten), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	tf := token.NewFileSet().AddFile(path, -1, len(orig))
-	if _, ok := readDeclSource(path, tf).at(4, "a"); ok {
+	pass, decl := declFromParse(path, orig, 4, "a")
+	if _, _, ok := declAt(pass, decl); ok {
 		t.Fatal("the rewritten file matched the original's first field")
 	}
-	storePristine(path, tf, []byte(orig))
+	storePristine(path, []byte(orig))
 	t.Cleanup(func() { pristineSource.Delete(path) })
-	if d, ok := readDeclSource(path, tf).at(4, "a"); !ok || !d.reorderable {
+	if d, _, ok := declAt(pass, decl); !ok || !d.reorderable {
 		t.Errorf("pristine bytes not used: %+v, %v", d, ok)
 	}
 }
 
-// TestReadDeclSourceIgnoresOtherParsePristine pins that the pre-rewrite bytes
-// are trusted only for the parse the rewrite came from: a second -apply in the
-// same process (an embedding host, the test suite) after the file changed
-// predicted from the first run's bytes and reordered one side of a
-// conversion only.
-func TestReadDeclSourceIgnoresOtherParsePristine(t *testing.T) {
+// TestDeclAtSeparateParses pins the golangci-lint shape: each package variant
+// parses the file itself, so the importer's token.File is not the one the
+// writer (p [p.test], under deferToTestVariant) parsed. Pristine bytes keyed
+// by the writer's token.File missed, and the importer judged the rewritten
+// file on disk.
+func TestDeclAtSeparateParses(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "p.go")
+	const orig = "package p\n\ntype T struct {\n\ta bool\n\tp *int\n\tb bool\n}\n"
+	const rewritten = "package p\n\ntype T struct {\n\tp *int\n\ta bool\n\tb bool\n}\n"
+	if err := os.WriteFile(path, []byte(orig), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	declFromParse(path, orig, 4, "a") // the writer's parse
+	pass, decl := declFromParse(path, orig, 4, "a")
+	storePristine(path, []byte(orig))
+	t.Cleanup(func() { pristineSource.Delete(path) })
+	if err := os.WriteFile(path, []byte(rewritten), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if d, _, ok := declAt(pass, decl); !ok || !d.reorderable {
+		t.Errorf("second parse lost the pristine judgement: %+v, %v", d, ok)
+	}
+}
+
+// TestDeclAtPrefersDisk pins that a current disk wins over a stale pristine
+// entry: a later run in the same process (an embedding host, the test suite)
+// after an edit predicted from the first run's bytes and reordered one side
+// of a conversion only. Where both match — a struct the rewrite left in
+// place — the disk's judgement is the one used.
+func TestDeclAtPrefersDisk(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "p.go")
 	const orig = "package p\n\ntype T struct {\n\ta bool\n\tp *int\n\tb bool\n}\n"
 	const edited = "package p\n\ntype T struct {\n\tb bool\n\tp *int\n\ta bool\n\tc bool\n}\n"
 	if err := os.WriteFile(path, []byte(edited), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	first := token.NewFileSet().AddFile(path, -1, len(orig))
-	storePristine(path, first, []byte(orig))
+	storePristine(path, []byte(orig))
 	t.Cleanup(func() { pristineSource.Delete(path) })
-	second := token.NewFileSet().AddFile(path, -1, len(edited))
-	if d, ok := readDeclSource(path, second).at(4, "b"); !ok || !d.reorderable {
+	pass, decl := declFromParse(path, edited, 4, "b")
+	if d, _, ok := declAt(pass, decl); !ok || !d.reorderable {
 		t.Errorf("a later parse did not read the disk: %+v, %v", d, ok)
 	}
-	if _, ok := readDeclSource(path, first).at(4, "a"); !ok {
+	pass, decl = declFromParse(path, orig, 4, "a")
+	if _, _, ok := declAt(pass, decl); !ok {
 		t.Error("the rewrite's own parse no longer reads the pristine bytes")
 	}
-	// The later run's own rewrite replaces the entry.
-	storePristine(path, second, []byte(edited))
-	if _, ok := readDeclSource(path, second).at(4, "b"); !ok {
-		t.Error("the later run's pristine bytes not used")
+
+	// Both match at the same size; only the ignore directive differs.
+	const ignored = "package p\n\ntype T struct { // betteralign:ignore\n\ta bool\n\tp *int\n}\n"
+	const plain = "package p\n\ntype T struct { // a plain comment...\n\ta bool\n\tp *int\n}\n"
+	if len(ignored) != len(plain) {
+		t.Fatalf("fixture lengths differ: %d, %d", len(ignored), len(plain))
+	}
+	if err := os.WriteFile(path, []byte(plain), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	storePristine(path, []byte(ignored))
+	pass, decl = declFromParse(path, plain, 4, "a")
+	if d, _, ok := declAt(pass, decl); !ok || !d.reorderable {
+		t.Errorf("disk and pristine both match: want the disk's (reorderable), got %+v, %v", d, ok)
+	}
+}
+
+// TestUnitcheckerDriverDetection pins the vettool detection, mirroring the
+// x/tools singlechecker hand-off to unitchecker: exactly one argument ending
+// in ".cfg".
+func TestUnitcheckerDriverDetection(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want bool
+	}{
+		{[]string{"/tmp/go-build1/b001/vet.cfg"}, true},
+		{[]string{"./..."}, false},
+		{[]string{"a.cfg", "b.cfg"}, false},
+		{nil, false},
+	} {
+		if got := vettoolArgs(tc.args); got != tc.want {
+			t.Errorf("vettoolArgs(%q) = %v, want %v", tc.args, got, tc.want)
+		}
+	}
+	if unitcheckerDriver() {
+		t.Error("the test binary detected as a vettool")
 	}
 }
 
@@ -2876,6 +2952,13 @@ func TestDeclRewritableExportData(t *testing.T) {
 	}
 	if declRewritable(pass, decl(64*1024, fake, 4), never, false) {
 		t.Error("declaration from export data (fake token.File): want not rewritable")
+	}
+	// Under go vet every import is export data, and the partner's own vet
+	// process rewrites it: judged by its text alone.
+	defer func(f func() bool) { unitcheckerDriver = f }(unitcheckerDriver)
+	unitcheckerDriver = func() bool { return true }
+	if !declRewritable(pass, decl(64*1024, fake, 4), never, false) {
+		t.Error("export-data declaration under a vettool: want rewritable")
 	}
 }
 

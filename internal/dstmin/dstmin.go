@@ -722,6 +722,17 @@ func (df *File) lineEndOffset(offset int) int {
 	return offset
 }
 
+// trimLeadingBlankLines drops b's leading whitespace-only lines.
+func trimLeadingBlankLines(b []byte) []byte {
+	for {
+		nl := bytes.IndexByte(b, '\n')
+		if nl < 0 || len(bytes.TrimLeft(b[:nl], " \t")) != 0 {
+			return b
+		}
+		b = b[nl+1:]
+	}
+}
+
 // consumeBlankLines advances past blank lines (whitespace only) from off,
 // stopping at the first non-blank line or limit. Rule 4 uses it to pull
 // trailing blanks into a field's span so a reorder doesn't orphan them. The
@@ -911,10 +922,19 @@ func spliceDirty(f *File, dirty []*StructType) []byte {
 // ends in \n. The dual-attachment (every field carries both its lead- and
 // trail-blanks) is what makes reorder safe: after a swap both halves of each gap
 // are emitted and gofmt coalesces the duplicates.
+//
+// A field moved to the top drops the blank lines leading its lead span:
+// gofmt removes a blank line after { only when a field follows, not a
+// comment, so a documented field would keep the blank that separated it from
+// its old predecessor. The field that was first keeps its span as written.
 func synthesizeBodyInto(buf *bytes.Buffer, f *File, st *StructType) {
-	for _, fld := range st.Fields.List {
+	for i, fld := range st.Fields.List {
 		if fld.leadBlanksEnd > fld.leadBlanksStart {
-			buf.Write(f.source[fld.leadBlanksStart:fld.leadBlanksEnd])
+			lead := f.source[fld.leadBlanksStart:fld.leadBlanksEnd]
+			if i == 0 && len(st.origList) > 0 && fld != st.origList[0] {
+				lead = trimLeadingBlankLines(lead)
+			}
+			buf.Write(lead)
 		}
 		for _, c := range fld.lead {
 			buf.WriteString(st.indent)

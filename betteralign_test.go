@@ -1369,12 +1369,30 @@ func TestExportDataPartnerPinsConversion(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds the binary")
 	}
+	bin, mod := xconvModule(t)
+	cmd := exec.Command(bin, "-apply", "./user")
+	cmd.Dir = mod
+	out, _ := cmd.CombinedOutput() // exits non-zero when it reports
+	if !regexp.MustCompile(`user\.go:9:\d+: .*reorder skipped: conversion at`).Match(out) {
+		t.Errorf("T not pinned by its conversion to dep.U:\n%s", out)
+	}
+	build := exec.Command("go", "build", "./...")
+	build.Dir = mod
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Errorf("rewritten module no longer builds: %v\n%s", err, out)
+	}
+}
+
+// xconvModule builds the betteralign binary and copies testdata/src/xconv
+// into a module, both under t.TempDir().
+func xconvModule(t *testing.T) (bin, mod string) {
+	t.Helper()
 	tmp := t.TempDir()
-	bin := filepath.Join(tmp, "betteralign")
+	bin = filepath.Join(tmp, "betteralign")
 	if out, err := exec.Command("go", "build", "-o", bin, "./cmd/betteralign").CombinedOutput(); err != nil {
 		t.Fatalf("go build: %v\n%s", err, out)
 	}
-	mod := filepath.Join(tmp, "xconv")
+	mod = filepath.Join(tmp, "xconv")
 	for _, pkg := range []string{"dep", "user"} {
 		if err := os.MkdirAll(filepath.Join(mod, pkg), 0o750); err != nil {
 			t.Fatal(err)
@@ -1388,15 +1406,63 @@ func TestExportDataPartnerPinsConversion(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(mod, "go.mod"), []byte("module xconv\n\ngo 1.24\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(bin, "-apply", "./user")
-	cmd.Dir = mod
-	out, _ := cmd.CombinedOutput() // exits non-zero when it reports
-	if !regexp.MustCompile(`user\.go:9:\d+: .*reorder skipped: conversion at`).Match(out) {
-		t.Errorf("T not pinned by its conversion to dep.U:\n%s", out)
+	return bin, mod
+}
+
+// TestVetToolSameModulePartnerFollows runs betteralign as go vet's vettool,
+// where each package is analyzed in its own process and every import comes
+// from export data (gcimporter's fake token.File). Treating that as "not
+// analyzed" pinned user.T while dep's own vet process reordered dep.U, and
+// the fixed module no longer built.
+func TestVetToolSameModulePartnerFollows(t *testing.T) {
+	skipUnless64Bit(t)
+	if testing.Short() {
+		t.Skip("builds the binary")
 	}
+	bin, mod := xconvModule(t)
+	env := slices.DeleteFunc(os.Environ(), func(kv string) bool { return strings.HasPrefix(kv, "GOFLAGS=") })
+	env = append(env, "GOWORK=off")
+
+	// -apply is refused: dep's process rewrote dep.go before user's process
+	// predicted from it, so user pinned its side and the build broke.
+	pristine := map[string]string{}
+	for _, pkg := range []string{"dep", "user"} {
+		for name, src := range readGoFiles(t, filepath.Join(mod, pkg)) {
+			pristine[filepath.Join(pkg, name)] = src
+		}
+	}
+	apply := exec.Command("go", "vet", "-vettool="+bin, "-apply", "./...")
+	apply.Dir, apply.Env = mod, env
+	var stderr bytes.Buffer
+	apply.Stderr = &stderr
+	if err := apply.Run(); err == nil {
+		t.Errorf("go vet -apply exited 0; want an error\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "-apply is not supported under go vet") {
+		t.Errorf("go vet -apply stderr lacks the refusal:\n%s", stderr.String())
+	}
+	for f, src := range pristine {
+		if got, err := os.ReadFile(filepath.Join(mod, f)); err != nil || string(got) != src {
+			t.Errorf("go vet -apply changed %s (err %v)", f, err)
+		}
+	}
+
+	vet := exec.Command("go", "vet", "-vettool="+bin, "-fix", "./...")
+	vet.Dir, vet.Env = mod, env
+	out, _ := vet.CombinedOutput() // exits non-zero when it reports
 	build := exec.Command("go", "build", "./...")
-	build.Dir = mod
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Errorf("rewritten module no longer builds: %v\n%s", err, out)
+	build.Dir, build.Env = mod, env
+	if bout, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("module no longer builds after go vet -fix: %v\n%s\nvet output:\n%s", err, bout, out)
+	}
+	reordered := regexp.MustCompile(`type (T|U) struct \{[^\n]*\n\tB int64\n\tA bool\n\tC bool\n`)
+	for _, f := range []string{"user/user.go", "dep/dep.go"} {
+		src, err := os.ReadFile(filepath.Join(mod, f))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reordered.Match(src) {
+			t.Errorf("%s: struct not reordered in step:\n%s\nvet output:\n%s", f, src, out)
+		}
 	}
 }

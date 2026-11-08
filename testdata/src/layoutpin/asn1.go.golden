@@ -49,3 +49,45 @@ type JSONTagged struct { // want `struct of size 24 could be 16$`
 	A bool  `json:"a"`
 	C bool  `json:"c"`
 }
+
+// An ASN.1 struct held by value, or as SEQUENCE OF, makes its holder part of
+// the encoding: the holder reaches asn1.Unmarshal through an interface{} in
+// another function or package (x/crypto/pkcs12), where no call pins it.
+type ASNHolder struct {
+	A  bool
+	In ASNRawField
+	B  bool
+}
+
+type ASNSeqHolder struct {
+	A  bool
+	In []ASNTagged
+	B  bool
+}
+
+// Behind a pointer the inner struct is its own allocation: still reordered.
+type ASNPtrHolder struct { // want `struct of size 24 could be 16$`
+	In *ASNTagged
+	A  bool
+	B  bool
+}
+
+// An encoding/asn1 type as an array or slice element counts like a direct
+// field of it, also behind a pointer. No diagnostic.
+type ASNRawSlice struct {
+	A  bool
+	In []asn1.RawValue
+	B  bool
+}
+
+type ASNOIDArray struct {
+	A bool
+	O [2]asn1.ObjectIdentifier
+	B bool
+}
+
+type ASNRawPtrSlice struct {
+	A  bool
+	In []*asn1.RawValue
+	B  bool
+}
