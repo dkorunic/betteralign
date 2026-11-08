@@ -13,7 +13,18 @@ func (h *AsmHolder) asmRun() int
 // A function with a body pins nothing.
 func asmPlain(p *AsmPlain) int64 { return p.AP2 }
 
-// Bound by //go:linkname to a Go implementation: no offset contract.
+// Pulled by //go:linkname from another package, which keeps its own copy of
+// the layout: pinned like assembly.
 //
 //go:linkname asmLinked runtime.asmLinked
 func asmLinked(l *AsmLinkedOther) int
+
+// Pulled from this same package: Go code against the real layout.
+//
+//go:linkname asmSelf otherbuild.asmSelf
+func asmSelf(s *AsmSelfOther) int
+
+//go:linkname asmShadow otherbuild.asmShadow
+func asmShadow() int
+
+func (h *AsmShadowOther) asmShadow() int

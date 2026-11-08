@@ -36,24 +36,40 @@ type AsmControl struct { // want `struct of size 24 could be 16$`
 
 func asmControl(c *AsmControl) int { return int(c.cb) }
 
-// Bound by //go:linkname to a Go implementation elsewhere: compiled Go
-// against the real layout, no offset contract. Still reordered, whether the
-// directive is the declaration's doc comment or detached from it.
-type AsmLinked struct { // want `struct of size 24 could be 16$`
-	kb int64
+// A //go:linkname pull from another package, or a one-argument push, binds
+// the declaration to code elsewhere that keeps its own copy of the layout
+// (runtime.initTask, the runtime's riscvHWProbePairs) or to assembly: pinned
+// all the same, whether the directive is the doc comment or detached.
+type AsmLinked struct { // want `reorder skipped: assembly implementation at .*asm.go:50:`
 	ka bool
+	kb int64
 	kc bool
 }
 
 //go:linkname asmLinked runtime.asmLinked
 func asmLinked(l *AsmLinked) int
 
-type AsmDetached struct { // want `struct of size 24 could be 16$`
-	db int64
+type AsmDetached struct { // want `reorder skipped: assembly implementation at .*asm.go:60:`
 	da bool
+	db int64
 	dc bool
 }
 
 //go:linkname asmDetached
 
 func asmDetached(d *AsmDetached) int
+
+// A linkname cannot name a method: a body-less method sharing a linknamed
+// function's name is still assembly. (A pull from this same package, Go code
+// against the real layout, is exempt: fixture linkself, since the copies
+// copyTestPackage makes of this package change its path.)
+type AsmShadow struct { // want `reorder skipped: assembly implementation at .*asm.go:75:`
+	ha bool
+	hb int64
+	hc bool
+}
+
+//go:linkname asmShadow layoutpin.asmShadow
+func asmShadow() int
+
+func (h *AsmShadow) asmShadow() int

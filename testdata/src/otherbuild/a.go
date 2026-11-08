@@ -179,10 +179,44 @@ type AsmPlain struct { // want `struct of size 24 could be 16$`
 	AP3 bool
 }
 
-// Taken only by a //go:linkname-bound declaration in the excluded file: Go
-// code, not assembly, so still reordered.
-type AsmLinkedOther struct { // want `struct of size 24 could be 16$`
+// Taken only by a declaration in the excluded file that //go:linkname pulls
+// from another package, which keeps its own copy of the layout: pinned.
+type AsmLinkedOther struct { // want `reorder skipped: assembly implementation at .*asmstub_never.go`
 	AL1 bool
 	AL2 int64
 	AL3 bool
+}
+
+// Taken only by a declaration pulled from this same package: Go code against
+// the real layout, so still reordered.
+type AsmSelfOther struct { // want `struct of size 24 could be 16$`
+	AF1 bool
+	AF2 int64
+	AF3 bool
+}
+
+// The receiver of a body-less method sharing a linknamed function's name: a
+// linkname cannot name a method, so pinned.
+type AsmShadowOther struct { // want `reorder skipped: assembly implementation at .*asmstub_never.go`
+	AW1 bool
+	AW2 int64
+	AW3 bool
+}
+
+// Elements of a named slice taken by an arm64 assembly stub.
+type HS []HElem
+
+type HElem struct { // want `reorder skipped: assembly implementation at .*asmstub_arm64.go`
+	HE1 bool
+	HE2 int64
+	HE3 bool
+}
+
+// Elements of a named array taken by pointer there.
+type Blk [4]ArrElem
+
+type ArrElem struct { // want `reorder skipped: assembly implementation at .*asmstub_arm64.go`
+	AE1 bool
+	AE2 int64
+	AE3 bool
 }

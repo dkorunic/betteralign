@@ -289,8 +289,17 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 	// for — so -fix would silently rewrite nothing there. Then -fix keeps its
 	// v0.15.4 meaning, an alias of -apply: the analyzer writes (and handles
 	// -diff) and attaches no fixes, leaving the driver nothing to collide with.
+	// Not under go vet, which refuses analyzer writes (ErrApplyUnderVet) and
+	// whose -fix never reads a pass's error: the run would exit 0 having done
+	// nothing. There -fix stays the driver's, and the flag's no-op is said.
 	fix := flagRequested(pass, "fix")
-	selfWrite := fix && cfg.generatedFiles
+	selfWrite := fix && cfg.generatedFiles && !unitcheckerDriver()
+	if fix && cfg.generatedFiles && unitcheckerDriver() {
+		vetGeneratedNote.Do(func() {
+			fmt.Fprintln(os.Stderr, "betteralign: -generated_files has no effect under go vet -fix "+
+				"(the driver refuses fixes in generated files); run betteralign -fix or -apply directly")
+		})
+	}
 	apply := (cfg.apply && !fix) || selfWrite
 	// -diff previews an -apply rewrite; never write files under it. Under -json
 	// the diff goes to stderr so stdout stays parseable JSON.
@@ -1023,12 +1032,13 @@ func collectLayoutPins(inspect *inspector.Inspector, pass *analysis.Pass, sizes 
 		switch n := node.(type) {
 		case *ast.FuncDecl:
 			// Body-less: implemented in assembly, which reads its operands'
-			// fields by offset — unless //go:linkname binds it to Go code.
+			// fields by offset — unless //go:linkname binds it to Go code of
+			// this package (linkTarget).
 			if n.Body != nil {
 				return
 			}
 			for _, f := range pass.Files {
-				if f.FileStart <= n.Pos() && n.Pos() < f.FileEnd && linknamed(f, n) {
+				if f.FileStart <= n.Pos() && n.Pos() < f.FileEnd && selfLinked(pass.Pkg, linkTarget(f, n)) {
 					return
 				}
 			}
@@ -1313,10 +1323,21 @@ func collectLayoutPins(inspect *inspector.Inspector, pass *analysis.Pass, sizes 
 	// Likewise the operands of a body-less declaration there: assembly stubs
 	// are usually arch-gated (f_arm64.go beside f_arm64.s), so the in-build
 	// check above misses the main case.
+	// The first stub not linknamed to this package's Go code names the pin.
 	for _, name := range slices.Sorted(maps.Keys(other.asm)) {
+		i := slices.IndexFunc(other.asm[name], func(s asmStub) bool { return !selfLinked(pass.Pkg, s.link) })
+		if i < 0 {
+			continue
+		}
+		p := layoutPin{format: pinAssembly, at: other.asm[name][i].at}
 		seen := make(map[*types.Struct]bool)
+		// A named slice or array (type HS []E) is no struct to resolve:
+		// walk to its elements like an in-build operand.
+		if tn, ok := pass.Pkg.Scope().Lookup(name).(*types.TypeName); ok {
+			pinLayout(elemOf(tn.Type()), p, false, seen)
+		}
 		for _, st := range resolveLiteralPath(pass.Pkg, name, other.decls) {
-			pinLayout(st, layoutPin{format: pinAssembly, at: other.asm[name]}, false, seen)
+			pinLayout(st, p, false, seen)
 		}
 	}
 
@@ -1578,20 +1599,26 @@ func moduleRoot(file string) string {
 var otherBuildCache sync.Map // map[declSourceKey]func() otherBuildScan
 
 // otherBuildScan is one excluded file's package name, its first positional
-// composite literal ("file:line:col") per literal type path, its first
-// body-less func declaration per operand type name (asm), and its
-// non-generic type declarations (name to type expression).
+// composite literal ("file:line:col") per literal type path, its body-less
+// func declarations per operand type name (asm), and its non-generic type
+// declarations (name to type expression).
 type otherBuildScan struct {
 	lits  map[string]string
-	asm   map[string]string
+	asm   map[string][]asmStub
 	decls map[string]ast.Expr
 	pkg   string
+}
+
+// asmStub is a body-less func declaration of an excluded file: its location
+// and its linkTarget, judged by collectLayoutPins, which knows the package.
+type asmStub struct {
+	at, link string
 }
 
 // otherBuild is otherBuildScan merged over a package's excluded files.
 type otherBuild struct {
 	lits  map[string]string
-	asm   map[string]string
+	asm   map[string][]asmStub
 	decls map[string][]ast.Expr
 }
 
@@ -1603,7 +1630,7 @@ type otherBuild struct {
 // It also returns the type declarations of those files, every one per name:
 // the builds that declare a name differently each need theirs.
 func otherBuildPositional(pass *analysis.Pass) otherBuild {
-	out := otherBuild{lits: make(map[string]string), asm: make(map[string]string), decls: make(map[string][]ast.Expr)}
+	out := otherBuild{lits: make(map[string]string), asm: make(map[string][]asmStub), decls: make(map[string][]ast.Expr)}
 	for _, path := range slices.Sorted(slices.Values(pass.IgnoredFiles)) {
 		if !strings.HasSuffix(path, ".go") {
 			continue
@@ -1621,7 +1648,9 @@ func otherBuildPositional(pass *analysis.Pass) otherBuild {
 			continue
 		}
 		keepFirst(out.lits, s.lits)
-		keepFirst(out.asm, s.asm)
+		for name, stubs := range s.asm {
+			out.asm[name] = append(out.asm[name], stubs...)
+		}
 		for _, name := range slices.Sorted(maps.Keys(s.decls)) {
 			out.decls[name] = append(out.decls[name], s.decls[name])
 		}
@@ -1706,7 +1735,7 @@ func scanOtherBuild(path string) otherBuildScan {
 		return true
 	})
 	decls := make(map[string]ast.Expr)
-	asm := make(map[string]string)
+	asm := make(map[string][]asmStub)
 	for _, d := range f.Decls {
 		switch d := d.(type) {
 		case *ast.GenDecl:
@@ -1719,17 +1748,17 @@ func scanOtherBuild(path string) otherBuildScan {
 				}
 			}
 		case *ast.FuncDecl:
-			if d.Body != nil || linknamed(f, d) {
+			if d.Body != nil {
 				continue
 			}
+			stub := asmStub{at: fset.Position(d.Pos()).String(), link: linkTarget(f, d)}
 			for _, fl := range []*ast.FieldList{d.Recv, d.Type.Params, d.Type.Results} {
 				if fl == nil {
 					continue
 				}
 				for _, field := range fl.List {
-					name := asmOperandName(field.Type)
-					if _, seen := asm[name]; name != "" && !seen {
-						asm[name] = fset.Position(d.Pos()).String()
+					if name := asmOperandName(field.Type); name != "" {
+						asm[name] = append(asm[name], stub)
 					}
 				}
 			}
@@ -1738,22 +1767,43 @@ func scanOtherBuild(path string) otherBuildScan {
 	return otherBuildScan{pkg: f.Name.Name, lits: found, asm: asm, decls: decls}
 }
 
-// linknamed reports whether fn, a body-less declaration in f, is bound by a
-// `//go:linkname fn [target]` directive to an implementation elsewhere:
-// compiled Go against the real layout, not assembly reading fixed offsets.
-// The doc comment first; gofmt sometimes detaches a directive, so then every
-// comment of f.
-func linknamed(f *ast.File, fn *ast.FuncDecl) bool {
-	names := func(g *ast.CommentGroup) bool {
+// linkTarget returns the target of a two-argument `//go:linkname fn target`
+// directive in f naming fn, a body-less top-level function, or "". Only a
+// target in fn's own package (selfLinked) is Go compiled against the real
+// layout; a one-argument directive (assembly, or a push to a package keeping
+// its own copy of the struct) and a pull from another package (plugin.doInit
+// ↔ runtime.initTask) are layout contracts like assembly. A linkname cannot
+// name a method, so a method never has one. The doc comment first; gofmt
+// sometimes detaches a directive, so then every comment of f.
+func linkTarget(f *ast.File, fn *ast.FuncDecl) string {
+	if fn.Recv != nil {
+		return ""
+	}
+	target := func(g *ast.CommentGroup) string {
 		for _, c := range g.List {
 			rest, ok := strings.CutPrefix(c.Text, "//go:linkname ")
-			if args := strings.Fields(rest); ok && len(args) > 0 && args[0] == fn.Name.Name {
-				return true
+			if args := strings.Fields(rest); ok && len(args) > 1 && args[0] == fn.Name.Name {
+				return args[1]
 			}
 		}
-		return false
+		return ""
 	}
-	return fn.Doc != nil && names(fn.Doc) || slices.ContainsFunc(f.Comments, names)
+	if fn.Doc != nil {
+		if t := target(fn.Doc); t != "" {
+			return t
+		}
+	}
+	for _, g := range f.Comments {
+		if t := target(g); t != "" {
+			return t
+		}
+	}
+	return ""
+}
+
+// selfLinked reports whether a linkTarget names a symbol of package pkg.
+func selfLinked(pkg *types.Package, target string) bool {
+	return strings.HasPrefix(target, pkg.Path()+".")
 }
 
 // asmOperandName returns the local type name an assembly operand of type t
@@ -2964,6 +3014,9 @@ func declAt(pass *analysis.Pass, decl *types.Struct) (declInfo, *declSource, boo
 	}
 	return declInfo{}, nil, false
 }
+
+// vetGeneratedNote prints run's -fix -generated_files note once per process.
+var vetGeneratedNote sync.Once
 
 // unitcheckerDriver reports whether this process is a vettool (go vet
 // -vettool, which runs one process per package). Computed once; a variable
