@@ -1643,19 +1643,22 @@ func otherBuildPositional(pass *analysis.Pass) otherBuild {
 		scan, _ := otherBuildCache.LoadOrStore(key, sync.OnceValue(func() otherBuildScan {
 			return scanOtherBuild(path)
 		}))
-		s := scan.(func() otherBuildScan)()
-		if s.pkg != pass.Pkg.Name() {
-			continue
-		}
-		keepFirst(out.lits, s.lits)
-		for name, stubs := range s.asm {
-			out.asm[name] = append(out.asm[name], stubs...)
-		}
-		for _, name := range slices.Sorted(maps.Keys(s.decls)) {
-			out.decls[name] = append(out.decls[name], s.decls[name])
+		if s := scan.(func() otherBuildScan)(); s.pkg == pass.Pkg.Name() {
+			out.add(s)
 		}
 	}
 	return out
+}
+
+// add merges one excluded file's scan into o, the files taken in path order.
+func (o *otherBuild) add(s otherBuildScan) {
+	keepFirst(o.lits, s.lits)
+	for name, stubs := range s.asm {
+		o.asm[name] = append(o.asm[name], stubs...)
+	}
+	for _, name := range slices.Sorted(maps.Keys(s.decls)) {
+		o.decls[name] = append(o.decls[name], s.decls[name])
+	}
 }
 
 // keepFirst copies src's entries into dst, keeping any dst already has.
@@ -1676,7 +1679,15 @@ func keepFirst(dst, src map[string]string) {
 // (implemented in assembly), stripped of *, [] and [N].
 func scanOtherBuild(path string) otherBuildScan {
 	src, err := os.ReadFile(path)
-	if err != nil || neverBuilt(src) {
+	if err != nil {
+		return otherBuildScan{}
+	}
+	return scanOtherBuildSrc(path, src)
+}
+
+// scanOtherBuildSrc is scanOtherBuild on path's contents src.
+func scanOtherBuildSrc(path string, src []byte) otherBuildScan {
+	if neverBuilt(src) {
 		return otherBuildScan{}
 	}
 	fset := token.NewFileSet()

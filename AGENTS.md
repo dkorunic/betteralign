@@ -39,7 +39,8 @@ Native `testing.F` targets, via Task (override `FUZZTIME=2h`, set `CLEAN=true` t
 ```sh
 task fuzz-optimalorder           # FuzzOptimalOrder       (root: layout math)
 task fuzz-gcsizes                # FuzzGCSizes            (root: size/ptrdata math)
-task fuzz-reorderableat          # FuzzReorderableAt      (root: declaration text check, BUG-45)
+task fuzz-declsourcedirectives   # FuzzDeclSourceDirectives (root: declSource.at, //line, linkname, generated header; BUG-45)
+task fuzz-scanotherbuild         # FuzzScanOtherBuild     (root: build-excluded file scan + literal-path resolution: bounded time, deterministic)
 task fuzz-decoratefileidentity   # internal/dstmin: decorate→reprint round-trips
 task fuzz-decoratefilereorder    # internal/dstmin: reorder preserves comments + layout
 ```

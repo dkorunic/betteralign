@@ -14,10 +14,13 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 )
 
@@ -345,15 +348,236 @@ func FuzzGeneratedByMatcher(f *testing.F) {
 	})
 }
 
-// FuzzReorderableAt feeds newDeclSource arbitrary file text and declSource.at
-// arbitrary lines: it reads whatever file a type's position names, so it must
-// not panic on any text or line, however inconsistent with each other.
-func FuzzReorderableAt(f *testing.F) {
-	f.Add("package p\ntype T struct { // betteralign:ignore\n\ta bool\n}", 3)
-	f.Add("package p\ntype T struct{ a bool; b int64 }", 2)
-	f.Add("", 0)
+// fuzzOtherBuildSrc is the package FuzzScanOtherBuild resolves excluded
+// files' literal paths against: every container shape resolvePath walks
+// (named slices, arrays, maps, pointers, nesting, generic definitions and a
+// generic alias, a self-referential slice). No unnamed struct is an element
+// of a generic type: an instance would substitute it into a struct no
+// declaration holds.
+const fuzzOtherBuildSrc = `package fz
+
+type S1 struct {
+	a bool
+	b int64
+}
+
+type S2 struct{ c int32 }
+
+type G[T any] struct{ v T }
+
+type (
+	Sl     []S1
+	PSl    []*S2
+	M      map[S1]S2
+	MP     map[string]*S1
+	Arr    [3]S2
+	Nest   [][]S1
+	Ptr    *S1
+	Inline []struct{ x int }
+	Def    S2
+	Al     = S1
+	Self   []Self
+	Rec    struct{ next *Rec }
+	Ifc    interface{ M() }
+	Fn     func(S1) S2
+	Ch     chan S1
+)
+
+type List[E any] []E
+
+type Map[K comparable, V any] map[K]V
+
+type GA[T any] = []T
+
+type Pair[A comparable, B any] map[A]B
+
+type GInst List[G[S1]]
+`
+
+// fuzzOtherBuildPkg type-checks fuzzOtherBuildSrc and returns the package and
+// every struct type written in it.
+func fuzzOtherBuildPkg(tb testing.TB) (*types.Package, map[*types.Struct]bool) {
+	tb.Helper()
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "fz.go", fuzzOtherBuildSrc, parser.SkipObjectResolution)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	info := &types.Info{Types: make(map[ast.Expr]types.TypeAndValue)}
+	pkg, err := (&types.Config{}).Check("example.com/fz", fset, []*ast.File{file}, info)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	structs := make(map[*types.Struct]bool)
+	ast.Inspect(file, func(n ast.Node) bool {
+		if st, ok := n.(*ast.StructType); ok {
+			structs[info.Types[st].Type.(*types.Struct)] = true
+		}
+		return true
+	})
+	return pkg, structs
+}
+
+// otherBuildResult is everything FuzzScanOtherBuild derives from one input.
+type otherBuildResult struct {
+	lits     map[string]string
+	asm      map[string][]asmStub
+	resolved map[string][]*types.Struct
+}
+
+// scanAndResolve scans each NUL-separated part of src as an excluded file,
+// merges the scans as otherBuildPositional does, and resolves every literal
+// path and assembly operand name as collectLayoutPins does.
+func scanAndResolve(pkg *types.Package, src string) otherBuildResult {
+	o := otherBuild{lits: make(map[string]string), asm: make(map[string][]asmStub), decls: make(map[string][]ast.Expr)}
+	for i, part := range strings.Split(src, "\x00") {
+		o.add(scanOtherBuildSrc("f"+strconv.Itoa(i)+".go", []byte(part)))
+	}
+	res := otherBuildResult{lits: o.lits, asm: o.asm, resolved: make(map[string][]*types.Struct)}
+	for path := range o.lits {
+		res.resolved["lit "+path] = resolveLiteralPath(pkg, path, o.decls)
+	}
+	for name := range o.asm {
+		res.resolved["asm "+name] = resolveLiteralPath(pkg, name, o.decls)
+	}
+	return res
+}
+
+// FuzzScanOtherBuild feeds scanOtherBuild's syntactic scan and
+// resolveLiteralPath arbitrary files. A build-excluded file can hold anything,
+// including declarations no build compiles (type A B; type B A in each of
+// several files once made resolution exponential), so beyond not panicking
+// each input must resolve within a time bound, deterministically, and only to
+// structs the package declares. A NUL separates files.
+func FuzzScanOtherBuild(f *testing.F) {
+	pkg, structs := fuzzOtherBuildPkg(f)
+	addFuzzCorpus(f, filepath.Join("testdata", "src", "otherbuild"))
+	for _, s := range []string{
+		"package fz\ntype A B\ntype B A\nvar _ = A{{1}}\n\x00package fz\ntype A B\ntype B A\n\x00package fz\ntype A B\ntype B A\n",
+		"package fz\ntype A A\nvar _ = A{{1}, {2}}\n",
+		"package fz\ntype L[E any] []E\ntype A []L[A]\nvar _ = L[A]{{{1}}}\nvar _ = List[A]{{1}}\n",
+		"package fz\nvar _ = Nest{{{true, 1}}}\nvar _ = M{{true, 2}: {3}}\nvar _ = MP{\"k\": {false, 4}}\n",
+		"package fz\nvar _ = List[S1]{{true, 1}}\nvar _ = GA[S2]{{2}}\nvar _ = Map[S1, S2]{{true, 1}: {2}}\nvar _ = Pair[Sl, Arr]{{{true, 1}}: {{2}}}\n",
+		"package fz\nvar _ = GInst{{S1{true, 1}}}\nvar _ = Self{{{}}}\nvar _ = PSl{{1}}\nvar _ = Al{true, 1}\nvar _ = Def{1}\n",
+		"package fz\ntype t []Sl\ntype u map[t]*Arr\nvar _ = u{{{{true, 1}}}: {{2}}}\nvar _ = []t{{{{true, 3}}}}\n",
+		"package fz\nfunc f(a *S1, b ...S2) (Sl, [4]*Arr)\nfunc (r *Rec) g(List[S1])\n//go:linkname h runtime.h\nfunc h(Nest)\n",
+		"\xef\xbb\xbfpackage fz\r\ntype A []S1\r\nvar _ = A{{true, 1}}\r\n",
+		"//go:build ignore\n\npackage fz\nvar _ = S1{true, 1}\n",
+		"package fz\ntype T struct { /*line x:1*/ a bool; b int64 }\nvar _ = T{true, 1}\n",
+	} {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, src string) {
+		// Both runs must be slow to fail: blowup repeats, a scheduler or GC
+		// stall under a loaded fuzzer rarely does.
+		start := time.Now()
+		first := scanAndResolve(pkg, src)
+		d1 := time.Since(start)
+		second := scanAndResolve(pkg, src)
+		if d2 := time.Since(start) - d1; min(d1, d2) > 200*time.Millisecond {
+			t.Fatalf("scanning and resolving took %v and %v, want < 200ms", d1, d2)
+		}
+		if !reflect.DeepEqual(first, second) {
+			t.Fatalf("nondeterministic:\nfirst  %+v\nsecond %+v", first, second)
+		}
+		for key, sts := range first.resolved {
+			for _, st := range sts {
+				if !structs[st] {
+					t.Errorf("%s resolved to %v, not a struct the package declares", key, st)
+				}
+			}
+		}
+	})
+}
+
+// FuzzDeclSourceDirectives feeds the per-file text checks arbitrary files:
+// newDeclSource and declSource.at (which read whatever file a type's position
+// names, however inconsistent with it — BUG-45), lineDirective, linkTarget,
+// neverBuilt and hasGeneratedComment. None may panic; at must only return the
+// struct declared with that first field on the requested line, and nothing in
+// a file with a line directive is reorderable.
+func FuzzDeclSourceDirectives(f *testing.F) {
+	_ = filepath.WalkDir(filepath.Join("testdata", "src", "otherbuild"), func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if data, err := os.ReadFile(path); err == nil {
+			f.Add(string(data), 5)
+		}
+		return nil
+	})
+	for _, s := range []struct {
+		src  string
+		line int
+	}{
+		{"package p\ntype T struct { // betteralign:ignore\n\ta bool\n}", 3},
+		{"package p\ntype T struct{ a bool; b int64 }", 2},
+		{"", 0},
+		{"package p\ntype T struct {\n\t/*line x:1*/ a bool\n\tb int64\n}\n", 3},
+		{"package p\n//line x.go:10\ntype T struct {\n\ta bool\n}\n", 4},
+		{"package p\n//line x.go:10:1\ntype T struct {\n\ta bool\n}\n\t//line indented.go:3\n", 4},
+		{"package p\n/*line :7*/type T struct {\n\ta bool\n}\n", 3},
+		{"\xef\xbb\xbfpackage p\r\ntype T struct {\r\n\ta bool\r\n}\r\n", 3},
+		{"// Code generated by x. DO NOT EDIT.\n\npackage p\ntype T struct {\n\ta, b bool\n}\n", 5},
+		{"//go:build ignore\n\npackage p\n//go:linkname f p.f\nfunc f()\n//go:linkname g\nfunc g()\nfunc (T) f()\n", 4},
+		{"package p\nfunc f()\n\n//go:linkname f runtime.f extra\nvar x int\ntype T struct {\n\tint\n}\n", 7},
+		{"package p\ntype (\n\tA struct {\n\t\tx int\n\t}\n\tB struct{ x int }\n)\nfunc f() { type C struct {\n\ta int\n}}\n", 4},
+	} {
+		f.Add(s.src, s.line)
+	}
 	f.Fuzz(func(t *testing.T, src string, line int) {
 		ds := newDeclSource("f.go", []byte(src))
-		_, _ = ds.at(line, "a")
+		_ = neverBuilt([]byte(src))
+		fset := token.NewFileSet()
+		file, err := parser.ParseFile(fset, "f.go", src, parser.ParseComments|parser.SkipObjectResolution)
+		if err != nil {
+			if _, ok := ds.at(line, "a"); ok {
+				t.Fatalf("at(%d) found a declaration in a file that does not parse", line)
+			}
+			return
+		}
+		_ = hasGeneratedComment(file)
+		held := lineDirective(fset, file)
+		for _, d := range file.Decls {
+			if fn, ok := d.(*ast.FuncDecl); ok {
+				if target := linkTarget(file, fn); target != "" && fn.Recv != nil {
+					t.Errorf("linkTarget(method %s) = %q, want none", fn.Name.Name, target)
+				}
+			}
+		}
+		// Every struct declaration's first field, by unadjusted line.
+		firsts := make(map[int][]string)
+		ast.Inspect(file, func(n ast.Node) bool {
+			if ts, ok := n.(*ast.TypeSpec); ok {
+				if st, ok := ts.Type.(*ast.StructType); ok && st.Fields != nil && len(st.Fields.List) > 0 {
+					first := st.Fields.List[0]
+					var name string
+					if len(first.Names) > 0 {
+						name = first.Names[0].Name
+					}
+					l := fset.PositionFor(first.Pos(), false).Line
+					firsts[l] = append(firsts[l], name)
+				}
+			}
+			return true
+		})
+		check := func(l int, field string) {
+			d, ok := ds.at(l, field)
+			if !ok {
+				return
+			}
+			if !slices.Contains(firsts[l], d.field) || d.field != "" && d.field != field {
+				t.Errorf("at(%d, %q) = first field %q, declared there: %q", l, field, d.field, firsts[l])
+			}
+			if held && d.reorderable {
+				t.Errorf("at(%d, %q) reorderable in a file with a line directive", l, field)
+			}
+		}
+		check(line, "a")
+		for l, names := range firsts {
+			for _, name := range names {
+				check(l, name)
+			}
+		}
 	})
 }
