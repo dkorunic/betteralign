@@ -97,3 +97,62 @@ type AliasElem struct { // want `reorder skipped: positional composite literal a
 }
 
 type GenAlias[T any] = []T
+
+// Built positionally in paths.go through every way an elided literal's type
+// is spelled: a generic instance whose argument is declared there, an array,
+// a slice of pointers, a map value, a map key, nested slices and a generic
+// map instance.
+type CvA struct { // want `reorder skipped: positional composite literal at .*paths.go`
+	CvA1 bool
+	CvA2 int64
+	CvA3 bool
+}
+
+type CvB struct { // want `reorder skipped: positional composite literal at .*paths.go`
+	CvB1 bool
+	CvB2 int64
+	CvB3 bool
+}
+
+type CvC struct { // want `reorder skipped: positional composite literal at .*paths.go`
+	CvC1 bool
+	CvC2 int64
+	CvC3 bool
+}
+
+type CvD struct { // want `reorder skipped: positional composite literal at .*paths.go`
+	CvD1 bool
+	CvD2 int64
+	CvD3 bool
+}
+
+type CvE struct { // want `reorder skipped: positional composite literal at .*paths.go`
+	CvE1 bool
+	CvE2 int64
+	CvE3 bool
+}
+
+type CvF struct { // want `reorder skipped: positional composite literal at .*paths.go`
+	CvF1 bool
+	CvF2 int64
+	CvF3 bool
+}
+
+type CvG struct { // want `reorder skipped: positional composite literal at .*paths.go`
+	CvG1 bool
+	CvG2 int64
+	CvG3 bool
+}
+
+type (
+	CvList[E any]              []E
+	CvArr                      [2]CvB
+	CvMap[K comparable, V any] map[K]V
+)
+
+// Built positionally only in asm_windows.s, which is not Go: no pin.
+type AsmOnly struct { // want `struct of size 24 could be 16$`
+	AO1 bool
+	AO2 int64
+	AO3 bool
+}

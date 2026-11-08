@@ -37,7 +37,6 @@ import (
 	"flag"
 	"fmt"
 	"go/ast"
-	"go/build"
 	"go/build/constraint"
 	"go/parser"
 	"go/token"
@@ -346,6 +345,7 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 	var diags []pendingDiag
 
 	dirtyFiles := make(map[string]*dst.File)
+	dirtyTF := make(map[string]*token.File)
 	decoratedFiles := make(map[string]*dst.File)
 	decorationFailed := make(map[string]struct{})
 	// Populated from *ast.GenDecl visits, consulted from *ast.StructType visits.
@@ -606,6 +606,7 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 		}
 		dNode.Fields.List = reordered
 		dirtyFiles[currentFn] = dFile
+		dirtyTF[currentFn] = pass.Fset.File(currentASTFile.Pos())
 		diags[len(diags)-1].st = s
 	})
 
@@ -638,14 +639,18 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 			continue
 		}
 		// Before the write: another pass may be predicting from this file.
-		pristineSource.LoadOrStore(fn, df.Source())
+		storePristine(fn, dirtyTF[fn], df.Source())
 		if err := applyToFile(fn, out); err != nil {
 			fmt.Fprintf(os.Stderr, "error applying fixes to %v: %v\n", fn, err)
 		}
 	}
 
 	for _, d := range diags {
-		if e, ok := edits[d.st]; ok && d.st != nil && !selfWrite && validEdit(pass.Fset, e) {
+		// No fixes when the analyzer writes the file itself: nothing needs
+		// them, and a host applying them anyway (golangci-lint's --fix over a
+		// plugin set to apply, invisible to flagRequested) would edit the
+		// rewritten file at offsets an earlier rewrite shifted.
+		if e, ok := edits[d.st]; ok && d.st != nil && !selfWrite && (!apply || showDiff) && validEdit(pass.Fset, e) {
 			d.diag.SuggestedFixes = []analysis.SuggestedFix{{
 				Message:   fixMessage,
 				TextEdits: []analysis.TextEdit{{Pos: e.Pos, End: e.End, NewText: e.New}},
@@ -1155,7 +1160,7 @@ func collectLayoutPins(inspect *inspector.Inspector, pass *analysis.Pass, sizes 
 			foreign = append(foreign, obj)
 		}
 	}
-	slices.SortFunc(foreign, func(a, b types.Object) int { return cmp.Compare(a.Pos(), b.Pos()) })
+	slices.SortFunc(foreign, func(a, b types.Object) int { return comparePos(pass.Fset, a.Pos(), b.Pos()) })
 	// A named type the package references is opened one level, its fields
 	// or elements: a positional dep.Holder{h} or an element of dep.List{e}
 	// assigns to them with no field reference of its own. Named types inside
@@ -1221,7 +1226,7 @@ func collectLayoutPins(inspect *inspector.Inspector, pass *analysis.Pass, sizes 
 	// struct{p *T} to a local struct{p *int}. Their structs join the check,
 	// pinning (and pinned through) the generic declaration.
 	origin := make(map[*types.Struct]*types.Struct)
-	instIDs := slices.SortedFunc(maps.Keys(pass.TypesInfo.Instances), func(a, b *ast.Ident) int { return cmp.Compare(a.Pos(), b.Pos()) })
+	instIDs := slices.SortedFunc(maps.Keys(pass.TypesInfo.Instances), func(a, b *ast.Ident) int { return comparePos(pass.Fset, a.Pos(), b.Pos()) })
 	for _, id := range instIDs {
 		t := pass.TypesInfo.Instances[id].Type
 		if st, ok := t.Underlying().(*types.Struct); ok && st.NumFields() > 0 {
@@ -1249,7 +1254,7 @@ func collectLayoutPins(inspect *inspector.Inspector, pass *analysis.Pass, sizes 
 	// win.
 	other, otherDecls := otherBuildPositional(pass)
 	for _, path := range slices.Sorted(maps.Keys(other)) {
-		for _, st := range resolveLiteralPath(pass.Pkg, path, otherDecls, 0) {
+		for _, st := range resolveLiteralPath(pass.Pkg, path, otherDecls) {
 			pin(st, layoutPin{format: pinPositional, at: other[path]})
 		}
 	}
@@ -1359,7 +1364,7 @@ func declDecorates(pass *analysis.Pass, decl *types.Struct) bool {
 		return false
 	}
 	pos := pass.Fset.PositionFor(decl.Field(0).Pos(), false)
-	ds := readDeclSource(pos.Filename)
+	ds := readDeclSource(pos.Filename, pass.Fset.File(decl.Field(0).Pos()))
 	if ds.decorated == nil {
 		return true
 	}
@@ -1398,8 +1403,16 @@ func declOptedIn(pass *analysis.Pass, decl *types.Struct) bool {
 		return false
 	}
 	pos := pass.Fset.PositionFor(decl.Field(0).Pos(), false)
-	d, ok := readDeclSource(pos.Filename).at(pos.Line, decl.Field(0).Name())
+	d, ok := readDeclSource(pos.Filename, pass.Fset.File(decl.Field(0).Pos())).at(pos.Line, decl.Field(0).Name())
 	return ok && d.optedIn
+}
+
+// comparePos orders positions by file name, then offset: a FileSet's file
+// bases follow go/packages' concurrent parse order, so comparing raw Pos
+// values orders files differently from run to run.
+func comparePos(fset *token.FileSet, a, b token.Pos) int {
+	pa, pb := fset.PositionFor(a, false), fset.PositionFor(b, false)
+	return cmp.Or(cmp.Compare(pa.Filename, pb.Filename), cmp.Compare(pa.Offset, pb.Offset))
 }
 
 // sameRun guesses whether obj's package is analyzed in the same run as pass:
@@ -1634,11 +1647,21 @@ func scanOtherBuild(path string) otherBuildScan {
 // each declaration of it in the excluded files (decls), since those files'
 // own types are not in the scope (type table []T; table{{...}}). A field's
 // key is ignored: only array, slice and map literals elide their elements'
-// types. depth bounds a cycle of declarations, which no build compiles.
-func resolveLiteralPath(pkg *types.Package, path string, decls map[string][]ast.Expr, depth int) []*types.Struct {
-	if depth > 16 {
+// types.
+func resolveLiteralPath(pkg *types.Package, path string, decls map[string][]ast.Expr) []*types.Struct {
+	return resolvePath(pkg, path, decls, make(map[string]bool))
+}
+
+// resolvePath is resolveLiteralPath's walk. seen holds the paths already
+// followed: a name has one declaration per excluded file, so a cycle of them
+// (type A B; type B A — no build compiles it, but each file only needs its
+// own) branched at every step, exponential in the files. A path seen before
+// adds nothing: its structs are already in the result.
+func resolvePath(pkg *types.Package, path string, decls map[string][]ast.Expr, seen map[string]bool) []*types.Struct {
+	if seen[path] {
 		return nil
 	}
+	seen[path] = true
 	head, steps, _ := strings.Cut(path, "/")
 	name, targs := head, []string(nil)
 	if i := strings.IndexByte(head, '['); i >= 0 && strings.HasSuffix(head, "]") {
@@ -1653,10 +1676,10 @@ func resolveLiteralPath(pkg *types.Package, path string, decls map[string][]ast.
 		}
 	}
 	if tn, ok := pkg.Scope().Lookup(name).(*types.TypeName); ok {
-		add(resolveTypedPath(pkg, tn.Type(), steps, targs, decls, depth)...)
+		add(resolveTypedPath(pkg, tn.Type(), steps, targs, decls, seen)...)
 	}
 	for _, e := range decls[name] {
-		add(resolveDeclPath(pkg, e, steps, decls, depth)...)
+		add(resolveDeclPath(pkg, e, steps, decls, seen)...)
 	}
 	return out
 }
@@ -1664,7 +1687,7 @@ func resolveLiteralPath(pkg *types.Package, path string, decls map[string][]ast.
 // resolveTypedPath follows steps from t, a type of pkg's scope written with
 // type arguments targs (names), to the structs at its end. A step that lands
 // on one of t's type parameters continues from the argument's name.
-func resolveTypedPath(pkg *types.Package, t types.Type, steps string, targs []string, decls map[string][]ast.Expr, depth int) []*types.Struct {
+func resolveTypedPath(pkg *types.Package, t types.Type, steps string, targs []string, decls map[string][]ast.Expr, seen map[string]bool) []*types.Struct {
 	var tparams *types.TypeParamList
 	if a, ok := t.(*types.Alias); ok {
 		tparams = a.TypeParams() // type GA[T any] = []T
@@ -1679,7 +1702,7 @@ func resolveTypedPath(pkg *types.Package, t types.Type, steps string, targs []st
 					if steps != "" {
 						next += "/" + steps
 					}
-					return resolveLiteralPath(pkg, next, decls, depth+1)
+					return resolvePath(pkg, next, decls, seen)
 				}
 			}
 			return nil
@@ -1717,7 +1740,7 @@ func resolveTypedPath(pkg *types.Package, t types.Type, steps string, targs []st
 
 // resolveDeclPath follows steps through e, a type expression of an excluded
 // file, continuing by name once it reaches one.
-func resolveDeclPath(pkg *types.Package, e ast.Expr, steps string, decls map[string][]ast.Expr, depth int) []*types.Struct {
+func resolveDeclPath(pkg *types.Package, e ast.Expr, steps string, decls map[string][]ast.Expr, seen map[string]bool) []*types.Struct {
 	for {
 		e = ast.Unparen(e)
 		if star, ok := e.(*ast.StarExpr); ok {
@@ -1749,7 +1772,7 @@ func resolveDeclPath(pkg *types.Package, e ast.Expr, steps string, decls map[str
 		if steps != "" {
 			name += "/" + steps
 		}
-		return resolveLiteralPath(pkg, name, decls, depth+1)
+		return resolvePath(pkg, name, decls, seen)
 	}
 }
 
@@ -2710,16 +2733,24 @@ func declRewritable(pass *analysis.Pass, decl *types.Struct, skipFile func(strin
 	}
 	// Unadjusted: the text is read from the file really holding the
 	// declaration, not the one a //line directive names. Not .go means cgo's
-	// output in the build cache, which run never rewrites.
+	// output in the build cache, which run never rewrites; not absolute, a
+	// trimmed path ($GOROOT/...) from export data.
 	pos := pass.Fset.PositionFor(first.Pos(), false)
 	fn := pos.Filename
-	if rest, ok := strings.CutPrefix(fn, "$GOROOT/"); ok {
-		fn = filepath.Join(build.Default.GOROOT, filepath.FromSlash(rest))
-	}
 	if !filepath.IsAbs(fn) || !strings.HasSuffix(fn, ".go") || pos.Line < 1 || skipFile(fn) {
 		return false
 	}
-	src := readDeclSource(fn)
+	tf := pass.Fset.File(first.Pos())
+	src := readDeclSource(fn, tf)
+	// A token.File that is not a parse of these bytes comes from export data
+	// (gcimporter's fake file: a fixed size, one-byte lines): the package is
+	// not analyzed, so its pass never rewrites anything. Or the file changed
+	// since it was parsed, where its lines say nothing about the declaration.
+	// ponytail: size only; a real file of exactly gcimporter's fake size
+	// (64 KiB) passes, and is then judged by its text as before.
+	if tf == nil || int64(tf.Size()) != src.size {
+		return false
+	}
 	// A cgo file is never rewritten, -generated_files or not (see run).
 	if src.cgo || !generatedFiles && src.generated {
 		return false
@@ -2735,7 +2766,9 @@ type declSource struct {
 	// decls maps the unadjusted first-field line of each struct declared by
 	// a type spec (the first, where one line starts several) to what run
 	// would do with it.
-	decls     map[int]declInfo
+	decls map[int]declInfo
+	// size is the length of the bytes parsed (0 when unreadable).
+	size      int64
 	generated bool
 	cgo       bool
 }
@@ -2766,24 +2799,43 @@ type declSourceKey struct {
 // it. Type information — this pass's and the export data's — describes those
 // bytes, while passes run concurrently: a pass predicting a partner declared
 // in a file its own pass already rewrote would otherwise read the reordered
-// struct (another first field, shifted lines) and mispredict.
-var pristineSource sync.Map // map[string][]byte
+// struct (another first field, shifted lines) and mispredict. An entry holds
+// only for the parse it was written from (the *token.File every package of
+// one load shares): a later run in the same process (an embedding host, the
+// test suite) parses afresh, edited or not, and reads the disk.
+var pristineSource sync.Map // map[string]*pristineEntry
+
+// pristineEntry is a file's pre-rewrite bytes, parsed on first use, and the
+// parse of them the rewrite came from.
+type pristineEntry struct {
+	tf *token.File
+	ds func() *declSource
+}
+
+// storePristine records src, the bytes tf was parsed from, as fn's
+// pre-rewrite text before -apply writes fn. An entry for the same parse is
+// kept: p and p [p.test] share it and may both rewrite the file, and only the
+// first holds the bytes type information describes.
+func storePristine(fn string, tf *token.File, src []byte) {
+	if v, ok := pristineSource.Load(fn); ok && v.(*pristineEntry).tf == tf {
+		return
+	}
+	pristineSource.Store(fn, &pristineEntry{
+		tf: tf,
+		ds: sync.OnceValue(func() *declSource { return newDeclSource(fn, src) }),
+	})
+}
 
 // readDeclSource loads and parses fn — as it was before this process
-// rewrote it, if it did; an unreadable file yields an empty declSource, which
-// knows no declaration.
-func readDeclSource(fn string) *declSource {
+// rewrote it, if it did from tf, the parse the caller's type information
+// comes from; an unreadable file yields an empty declSource, which knows no
+// declaration.
+func readDeclSource(fn string, tf *token.File) *declSource {
 	pristine := func() *declSource {
-		src, ok := pristineSource.Load(fn)
-		if !ok {
-			return nil
+		if v, ok := pristineSource.Load(fn); ok && v.(*pristineEntry).tf == tf {
+			return v.(*pristineEntry).ds()
 		}
-		key := declSourceKey{name: fn, size: -1}
-		if v, ok := declSourceCache.Load(key); ok {
-			return v.(*declSource)
-		}
-		v, _ := declSourceCache.LoadOrStore(key, newDeclSource(fn, src.([]byte)))
-		return v.(*declSource)
+		return nil
 	}
 	if ds := pristine(); ds != nil {
 		return ds
@@ -2813,7 +2865,7 @@ func readDeclSource(fn string) *declSource {
 // newDeclSource judges src's declarations with the predicates run applies to
 // its own AST, so the prediction and the rewrite can't drift apart.
 func newDeclSource(fn string, src []byte) *declSource {
-	ds := &declSource{decls: make(map[int]declInfo)}
+	ds := &declSource{decls: make(map[int]declInfo), size: int64(len(src))}
 	ds.decorated = sync.OnceValue(func() map[int]bool { return decoratedStructs(fn, src) })
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, fn, src, parser.ParseComments|parser.SkipObjectResolution)
@@ -2902,8 +2954,14 @@ func lineDirective(fset *token.FileSet, f *ast.File) bool {
 // Returns an error (wrapped as ErrPreFilterFiles by the caller) when an
 // absolute path can't be made relative to wd (cross-volume on Windows) or
 // escapes wd with a `..` prefix, which filepath.Match can never match — fail
-// loud, not silent.
+// loud, not silent. So does a malformed glob, which isExcluded would treat as
+// excluding every file: a run reporting nothing would pass a CI gate.
 func normalizeExcludePaths(wd string, paths []string) ([]string, error) {
+	for _, p := range paths {
+		if _, err := filepath.Match(p, ""); err != nil {
+			return nil, fmt.Errorf("exclude pattern %q: %w", p, err)
+		}
+	}
 	needsNorm := slices.ContainsFunc(paths, func(p string) bool {
 		return filepath.IsAbs(p) || filepath.Clean(p) != p
 	})

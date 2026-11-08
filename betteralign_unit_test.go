@@ -18,6 +18,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -2025,6 +2026,38 @@ func TestNormalizeExcludePathsErrorMessage(t *testing.T) {
 	}
 }
 
+// TestNormalizeExcludePathsRejectsBadPattern pins that a malformed glob fails
+// the run: it used to log a syntax error per file, exclude every file, report
+// nothing and exit 0, so a CI gate passed. Both flags go through here, on the
+// fast path (nothing to normalise) and the slow one alike.
+func TestNormalizeExcludePathsRejectsBadPattern(t *testing.T) {
+	wd := filepath.Join(string(filepath.Separator), "proj")
+	for _, paths := range [][]string{{"["}, {"ok", "a/[b"}, {filepath.Join(wd, "x"), "["}} {
+		if got, err := normalizeExcludePaths(wd, paths); !errors.Is(err, filepath.ErrBadPattern) {
+			t.Errorf("normalizeExcludePaths(%q) = %v, %v; want ErrBadPattern", paths, got, err)
+		}
+	}
+	for _, flagName := range []string{"exclude_files", "exclude_dirs"} {
+		t.Run(flagName, func(t *testing.T) {
+			analyzer := &analysis.Analyzer{Name: Analyzer.Name, Doc: Analyzer.Doc, Requires: Analyzer.Requires}
+			InitAnalyzer(analyzer)
+			_ = analyzer.Flags.Set(flagName, "[")
+			rec := &msgRecorder{}
+			analysistest.Run(rec, analysistest.TestData(), analyzer, "a")
+			if !slices.ContainsFunc(rec.msgs, func(m string) bool { return strings.Contains(m, "syntax error in pattern") }) {
+				t.Errorf("-%s '[': the run did not fail; got %q", flagName, rec.msgs)
+			}
+		})
+	}
+}
+
+// msgRecorder is an analysistest.Testing that collects messages.
+type msgRecorder struct{ msgs []string }
+
+func (r *msgRecorder) Errorf(format string, args ...any) {
+	r.msgs = append(r.msgs, fmt.Sprintf(format, args...))
+}
+
 // TestNormalizeExcludePathsRejectsEscapingPath: absolute paths outside wd must error, not silently no-op.
 func TestNormalizeExcludePathsRejectsEscapingPath(t *testing.T) {
 	wd := filepath.Join(string(filepath.Separator), "proj", "deep")
@@ -2765,12 +2798,127 @@ func TestReadDeclSourcePrefersPristine(t *testing.T) {
 	if err := os.WriteFile(path, []byte(rewritten), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := readDeclSource(path).at(4, "a"); ok {
+	tf := token.NewFileSet().AddFile(path, -1, len(orig))
+	if _, ok := readDeclSource(path, tf).at(4, "a"); ok {
 		t.Fatal("the rewritten file matched the original's first field")
 	}
-	pristineSource.Store(path, []byte(orig))
+	storePristine(path, tf, []byte(orig))
 	t.Cleanup(func() { pristineSource.Delete(path) })
-	if d, ok := readDeclSource(path).at(4, "a"); !ok || !d.reorderable {
+	if d, ok := readDeclSource(path, tf).at(4, "a"); !ok || !d.reorderable {
 		t.Errorf("pristine bytes not used: %+v, %v", d, ok)
+	}
+}
+
+// TestReadDeclSourceIgnoresOtherParsePristine pins that the pre-rewrite bytes
+// are trusted only for the parse the rewrite came from: a second -apply in the
+// same process (an embedding host, the test suite) after the file changed
+// predicted from the first run's bytes and reordered one side of a
+// conversion only.
+func TestReadDeclSourceIgnoresOtherParsePristine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "p.go")
+	const orig = "package p\n\ntype T struct {\n\ta bool\n\tp *int\n\tb bool\n}\n"
+	const edited = "package p\n\ntype T struct {\n\tb bool\n\tp *int\n\ta bool\n\tc bool\n}\n"
+	if err := os.WriteFile(path, []byte(edited), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	first := token.NewFileSet().AddFile(path, -1, len(orig))
+	storePristine(path, first, []byte(orig))
+	t.Cleanup(func() { pristineSource.Delete(path) })
+	second := token.NewFileSet().AddFile(path, -1, len(edited))
+	if d, ok := readDeclSource(path, second).at(4, "b"); !ok || !d.reorderable {
+		t.Errorf("a later parse did not read the disk: %+v, %v", d, ok)
+	}
+	if _, ok := readDeclSource(path, first).at(4, "a"); !ok {
+		t.Error("the rewrite's own parse no longer reads the pristine bytes")
+	}
+	// The later run's own rewrite replaces the entry.
+	storePristine(path, second, []byte(edited))
+	if _, ok := readDeclSource(path, second).at(4, "b"); !ok {
+		t.Error("the later run's pristine bytes not used")
+	}
+}
+
+// TestDeclRewritableExportData pins that a declaration known only from export
+// data is not predicted to move: its token.File is gcimporter's fake one (a
+// fixed size, one-byte lines), not a parse of the file, which means the
+// declaring package is outside the analyzed set — its own pass never runs, so
+// the local side of a conversion must stay. The same holds for a file edited
+// since it was parsed.
+func TestDeclRewritableExportData(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "dep.go")
+	const src = "package p\n\ntype T struct {\n\tp *int\n\ta bool\n}\n"
+	if err := os.WriteFile(p, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	self := types.NewPackage("example.com/p", "p")
+	pass := &analysis.Pass{Pkg: types.NewPackage("example.com/p/user", "user"), Fset: token.NewFileSet(), Module: &analysis.Module{Path: "example.com/p"}}
+	never := func(string) bool { return false }
+	decl := func(size int, lines []int, line int) *types.Struct {
+		tf := pass.Fset.AddFile(p, -1, size)
+		tf.SetLines(lines)
+		return types.NewStruct([]*types.Var{
+			types.NewField(tf.LineStart(line)+1, self, "p", types.NewPointer(types.Typ[types.Int]), false),
+		}, nil)
+	}
+	lines := []int{0}
+	for i, c := range src {
+		if c == '\n' && i+1 < len(src) {
+			lines = append(lines, i+1)
+		}
+	}
+	if !declRewritable(pass, decl(len(src), lines, 4), never, false) {
+		t.Fatal("declaration parsed from the file: want rewritable")
+	}
+	fake := make([]int, 4)
+	for i := range fake {
+		fake[i] = i
+	}
+	if declRewritable(pass, decl(64*1024, fake, 4), never, false) {
+		t.Error("declaration from export data (fake token.File): want not rewritable")
+	}
+}
+
+// TestResolveLiteralPathCycleAcrossFiles pins that a declaration cycle spread
+// over several excluded files (type A B / type B A, once per file under its
+// own unset tag) resolves in linear time. Each name held one declaration per
+// file, and the walk recursed through every one up to a depth bound: five
+// files cost 5^17 steps and never finished. A real declaration among them
+// still resolves.
+func TestResolveLiteralPathCycleAcrossFiles(t *testing.T) {
+	pkg := types.NewPackage("example.com/p", "p")
+	s := types.NewStruct([]*types.Var{types.NewField(token.NoPos, pkg, "a", types.Typ[types.Bool], false)}, nil)
+	pkg.Scope().Insert(types.NewTypeName(token.NoPos, pkg, "S", s))
+	decls := map[string][]ast.Expr{}
+	for range 5 {
+		decls["A"] = append(decls["A"], ast.NewIdent("B"))
+		decls["B"] = append(decls["B"], ast.NewIdent("A"))
+	}
+	decls["A"] = append(decls["A"], &ast.ArrayType{Elt: ast.NewIdent("S")})
+
+	done := make(chan []*types.Struct, 1)
+	go func() { done <- resolveLiteralPath(pkg, "A/e", decls) }()
+	select {
+	case got := <-done:
+		if len(got) != 1 || got[0] != s {
+			t.Errorf("resolveLiteralPath(A/e) = %v, want [S]", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("resolveLiteralPath did not finish within 1s over a cycle of 5 files")
+	}
+}
+
+// TestComparePosByFileName pins that pin positions are ordered by file name,
+// not by FileSet base: bases follow go/packages' concurrent parse order, so
+// the position quoted in a diagnostic changed between runs.
+func TestComparePosByFileName(t *testing.T) {
+	fset := token.NewFileSet()
+	b := fset.AddFile("b.go", -1, 10) // parsed first: lower base
+	a := fset.AddFile("a.go", -1, 10)
+	if got := comparePos(fset, a.Pos(5), b.Pos(1)); got >= 0 {
+		t.Errorf("comparePos(a.go:5, b.go:1) = %d, want < 0", got)
+	}
+	if got := comparePos(fset, a.Pos(1), a.Pos(5)); got >= 0 {
+		t.Errorf("comparePos(a.go:1, a.go:5) = %d, want < 0", got)
 	}
 }

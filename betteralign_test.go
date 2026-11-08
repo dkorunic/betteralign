@@ -13,8 +13,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -263,6 +265,37 @@ func TestFixLeavesWritingToDriver(t *testing.T) {
 	}
 }
 
+// TestApplyAttachesNoFixes pins that the analyzer attaches no SuggestedFixes
+// when it writes the files itself: a host that sets -apply and then applies
+// the fixes it collected (golangci-lint's fixer with a module plugin set to
+// apply: true, run with --fix — not a Go flag, so flagRequested can't see it)
+// applied them on top of the rewritten file at offsets an earlier struct's
+// rewrite had shifted, corrupting it. Under -apply -diff nothing is written,
+// so the fixes stay.
+func TestApplyAttachesNoFixes(t *testing.T) {
+	skipUnless64Bit(t)
+	tmpPkg, _ := copyTestPackage(t, "layoutpin")
+	analyzer := NewTestAnalyzer()
+	_ = analyzer.Flags.Set("apply", "true")
+	if n := countFixes(analysistest.Run(t, analysistest.TestData(), analyzer, tmpPkg)); n != 0 {
+		t.Errorf("%d SuggestedFixes attached under -apply, which already wrote the files", n)
+	}
+
+	tmpPkg, _ = copyTestPackage(t, "layoutpin")
+	var out bytes.Buffer
+	saved := *betteralign.DiffOut
+	*betteralign.DiffOut = &out
+	t.Cleanup(func() { *betteralign.DiffOut = saved })
+	analyzer = NewTestAnalyzer()
+	var d bool
+	analyzer.Flags.BoolVar(&d, "diff", false, "host-registered -diff (test harness only)")
+	_ = analyzer.Flags.Set("apply", "true")
+	_ = analyzer.Flags.Set("diff", "true")
+	if countFixes(analysistest.Run(t, analysistest.TestData(), analyzer, tmpPkg)) == 0 {
+		t.Error("no SuggestedFixes under -apply -diff, which writes nothing")
+	}
+}
+
 // countFixes counts the SuggestedFixes across all results.
 func countFixes(results []*analysistest.Result) int {
 	n := 0
@@ -299,13 +332,13 @@ func TestSuggestedFixesLayoutPins(t *testing.T) {
 	assertRawFixesMatchGolden(t, results, "layoutpin")
 }
 
-// analyzeWithApply loads pattern from the GOPATH-style testdata tree and runs
-// the analyzer with -apply via checker.Analyze. Unlike analysistest.Run it doesn't
-// enforce `// want` comments — needed when the base pass and its [pkg.test]
-// variant must diverge on whether a shared file reports a diagnostic, which the
-// per-root want model can't express. The -apply rewrites still happen as a side
-// effect, as under analysistest.Run.
-func analyzeWithApply(t *testing.T, pattern string) *checker.Graph {
+// analyzeTestdata loads pattern from the GOPATH-style testdata tree and runs
+// the analyzer, with -apply if apply is set, via checker.Analyze. Unlike
+// analysistest.Run it doesn't enforce `// want` comments — needed when the base
+// pass and its [pkg.test] variant must diverge on whether a shared file reports
+// a diagnostic, which the per-root want model can't express. The -apply
+// rewrites still happen as a side effect, as under analysistest.Run.
+func analyzeTestdata(t *testing.T, pattern string, apply bool) *checker.Graph {
 	t.Helper()
 	dir := analysistest.TestData()
 	mode := packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles |
@@ -322,7 +355,7 @@ func analyzeWithApply(t *testing.T, pattern string) *checker.Graph {
 		t.Fatalf("load %s: %v", pattern, err)
 	}
 	analyzer := NewTestAnalyzer()
-	if err := analyzer.Flags.Set("apply", "true"); err != nil {
+	if err := analyzer.Flags.Set("apply", strconv.FormatBool(apply)); err != nil {
 		t.Fatal(err)
 	}
 	g, err := checker.Analyze([]*analysis.Analyzer{analyzer}, pkgs, nil)
@@ -372,7 +405,7 @@ func TestApplyDefersPositionalLiteralInTestFile(t *testing.T) {
 
 	// act.Package.ID is slash-based even on Windows; match it.
 	pattern := filepath.ToSlash(filepath.Join(filepath.Base(tmpDir), "litguard"))
-	g := analyzeWithApply(t, pattern)
+	analyzeTestdata(t, pattern, true)
 
 	got, err := os.ReadFile(filepath.Join(tmpWorkDir, "lit.go"))
 	if err != nil {
@@ -381,6 +414,9 @@ func TestApplyDefersPositionalLiteralInTestFile(t *testing.T) {
 	if string(got) != orig["lit.go"] {
 		t.Errorf("lit.go was rewritten despite a positional literal in the test file:\n--- got:\n%s\n--- want (unchanged):\n%s", got, orig["lit.go"])
 	}
+
+	// Diagnostics and fixes from a report-only run: -apply attaches no fixes.
+	g := analyzeTestdata(t, pattern, false)
 
 	// Only the rewrite is deferred: base reports plain, variant adds the caveat. Both
 	// appear (the accepted duplicate) — see deferToTestVariant.
@@ -458,7 +494,7 @@ func TestReportsHealthyCodeWhenTestFileIllTyped(t *testing.T) {
 	}
 
 	pattern := filepath.ToSlash(filepath.Join(filepath.Base(tmpDir), "illtyped"))
-	g := analyzeWithApply(t, pattern)
+	g := analyzeTestdata(t, pattern, true)
 
 	var base *checker.Action
 	for _, act := range g.Roots {
@@ -516,13 +552,14 @@ func TestApplyRewritesWhenTestFileBuildExcluded(t *testing.T) {
 	}
 
 	testdata := analysistest.TestData()
-	analyzer := NewTestAnalyzer()
-	_ = analyzer.Flags.Set("apply", "true")
-
-	results := analysistest.Run(t, testdata, analyzer, filepath.Join(filepath.Base(tmpDir), "litexcluded"))
-	if countFixes(results) == 0 {
+	pkg := filepath.Join(filepath.Base(tmpDir), "litexcluded")
+	// Report-only first: -apply writes itself and attaches no fixes.
+	if countFixes(analysistest.Run(t, testdata, NewTestAnalyzer(), pkg)) == 0 {
 		t.Error("no SuggestedFix: a build-excluded test literal must not withhold it")
 	}
+	analyzer := NewTestAnalyzer()
+	_ = analyzer.Flags.Set("apply", "true")
+	analysistest.Run(t, testdata, analyzer, pkg)
 
 	got, err := os.ReadFile(filepath.Join(tmpWorkDir, "lit.go"))
 	if err != nil {
@@ -1157,6 +1194,16 @@ func applyBuilds(t *testing.T, fixture string, flags map[string]string) string {
 			}
 		}
 	}
+	reapplyBuilds(t, tmpDir, fixture, flags)
+	return tmpDir
+}
+
+// reapplyBuilds runs -apply with flags over the dep and user packages
+// applyBuilds copied to tmpDir, and fails the test if the result no longer
+// type-checks.
+func reapplyBuilds(t *testing.T, tmpDir, fixture string, flags map[string]string) {
+	t.Helper()
+	root := filepath.Base(tmpDir)
 	pkgs := []string{root + "/" + fixture + "/dep", root + "/" + fixture + "/user"}
 
 	analyzer := NewTestAnalyzer()
@@ -1172,7 +1219,33 @@ func applyBuilds(t *testing.T, fixture string, flags map[string]string) string {
 	for _, msg := range rec.loadErrors() {
 		t.Errorf("after -apply: %s", msg)
 	}
-	return tmpDir
+}
+
+// TestApplyAfterEditInSameProcess runs -apply twice in one process with an
+// edit to dep in between, as an embedding host would: the second run must
+// predict dep.Ignored — no longer ignored — from the edited file, not from
+// the bytes the first run kept as dep.go's pre-rewrite text, or dep's pass
+// reorders it while user.ToIgnored stays pinned and the conversion breaks.
+func TestApplyAfterEditInSameProcess(t *testing.T) {
+	skipUnless64Bit(t)
+	tmpDir := applyBuilds(t, "xconv", nil)
+	depFile := filepath.Join(tmpDir, "xconv", "dep", "dep.go")
+	src, err := os.ReadFile(depFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edited := bytes.Replace(src, []byte("type Ignored struct { // betteralign:ignore"), []byte("type Ignored struct {"), 1)
+	if bytes.Equal(edited, src) {
+		t.Fatal("dep.Ignored's ignore directive not found")
+	}
+	if err := os.WriteFile(depFile, edited, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reapplyBuilds(t, tmpDir, "xconv", nil)
+	user := readGoFiles(t, filepath.Join(tmpDir, "xconv", "user"))["user.go"]
+	if !strings.Contains(user, "\tI2 int64\n\tI1 bool\n\tI3 bool\n") {
+		t.Errorf("ToIgnored did not follow dep.Ignored:\n%s", user)
+	}
 }
 
 // TestConversionPartnerPrediction pins the cross-package prediction against
@@ -1283,4 +1356,47 @@ func readGoFiles(t *testing.T, dir string) map[string]string {
 func TestCrossPackageConversionFollowsPartner(t *testing.T) {
 	skipUnless64Bit(t)
 	analysistest.Run(t, analysistest.TestData(), NewTestAnalyzer(), "xconv/user")
+}
+
+// TestExportDataPartnerPinsConversion runs the real driver on xconv's user
+// package alone, so dep — not analyzed — is loaded from export data
+// (analysistest loads every dependency from source, so only the binary shows
+// this). dep's pass never runs and never reorders dep.U, so user.T, converted
+// to it, must stay pinned: predicting from dep.go's text on disk (the export
+// data's positions name it) reordered T alone and broke the build.
+func TestExportDataPartnerPinsConversion(t *testing.T) {
+	skipUnless64Bit(t)
+	if testing.Short() {
+		t.Skip("builds the binary")
+	}
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "betteralign")
+	if out, err := exec.Command("go", "build", "-o", bin, "./cmd/betteralign").CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, out)
+	}
+	mod := filepath.Join(tmp, "xconv")
+	for _, pkg := range []string{"dep", "user"} {
+		if err := os.MkdirAll(filepath.Join(mod, pkg), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		for name, src := range readGoFiles(t, filepath.Join("testdata", "src", "xconv", pkg)) {
+			if err := os.WriteFile(filepath.Join(mod, pkg, name), []byte(src), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := os.WriteFile(filepath.Join(mod, "go.mod"), []byte("module xconv\n\ngo 1.24\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(bin, "-apply", "./user")
+	cmd.Dir = mod
+	out, _ := cmd.CombinedOutput() // exits non-zero when it reports
+	if !regexp.MustCompile(`user\.go:9:\d+: .*reorder skipped: conversion at`).Match(out) {
+		t.Errorf("T not pinned by its conversion to dep.U:\n%s", out)
+	}
+	build := exec.Command("go", "build", "./...")
+	build.Dir = mod
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Errorf("rewritten module no longer builds: %v\n%s", err, out)
+	}
 }
