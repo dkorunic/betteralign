@@ -151,7 +151,7 @@ whose field is passed to a 64-bit ` + "`sync/atomic`" + ` function (which needs 
 type, one identical to an unnamed struct
 type it may be assigned to (including an alias ` + "`type A = struct{...}`" + `), one
 converted to or from ` + "`unsafe.Pointer`" + ` (type punning), and one passed to
-` + "`encoding/binary`" + ` or ` + "`encoding/asn1`" + ` (whose wire format is field order).
+` + "`encoding/binary`" + `, ` + "`encoding/asn1`" + ` or ` + "`x/crypto/ssh`" + ` (whose wire format is field order).
 Reordering would break the build, corrupt memory or silently change the
 encoding. The last three also cover structs held by value inside them. A
 struct that declares itself ASN.1 — an ` + "`asn1:\"...\"`" + ` tag or a field of an
@@ -804,6 +804,7 @@ const (
 	pinUnsafe     = "unsafe.Pointer conversion at %s depends on field layout"
 	pinBinary     = "encoding/binary call at %s depends on field order"
 	pinASN1       = "encoding/asn1 call at %s depends on field order"
+	pinSSH        = "x/crypto/ssh call at %s depends on field order"
 	pinAtomic     = "64-bit atomic access at %s needs its 8-byte alignment on 32-bit platforms"
 )
 
@@ -834,6 +835,7 @@ var orderCodecs = map[string]map[string]string{
 		"Marshal": pinASN1, "MarshalWithParams": pinASN1,
 		"Unmarshal": pinASN1, "UnmarshalWithParams": pinASN1,
 	},
+	"golang.org/x/crypto/ssh": {"Marshal": pinSSH, "Unmarshal": pinSSH},
 }
 
 // unsafeOffsetof is the unsafe.Offsetof builtin; go/types records every use of
@@ -994,26 +996,33 @@ func collectLayoutPins(inspect *inspector.Inspector, pass *analysis.Pass, sizes 
 			// an allocation guarantees, so the layout around it is deliberate.
 			if isAtomic64Func(fn) && len(call.Args) > 0 {
 				if addr, ok := ast.Unparen(call.Args[0]).(*ast.UnaryExpr); ok && addr.Op == token.AND {
-					// &s.f, or an element of an array field (&s.f[i]), which
-					// the array's offset places; a slice's or pointed-to
-					// array's elements live in their own allocation.
+					// &s.f, an element of an array field (&s.f[i]), which the
+					// array's offset places, or a field of a struct held by
+					// value (&s.t.f), which t's offset places. A slice's
+					// elements or a pointer's target are their own allocation.
 					x := ast.Unparen(addr.X)
 					for {
-						ix, ok := x.(*ast.IndexExpr)
-						if !ok {
+						var inner ast.Expr
+						switch e := x.(type) {
+						case *ast.IndexExpr:
+							inner = e.X
+						case *ast.SelectorExpr:
+							pinFieldPath(e, layoutPin{format: pinAtomic, pos: call.Pos()})
+							inner = e.X
+						}
+						if inner == nil {
 							break
 						}
-						t := pass.TypesInfo.TypeOf(ix.X)
+						t := pass.TypesInfo.TypeOf(inner)
 						if t == nil {
 							break
 						}
-						if _, isArray := types.Unalias(t).Underlying().(*types.Array); !isArray {
-							break
+						switch types.Unalias(t).Underlying().(type) {
+						case *types.Array, *types.Struct:
+							x = ast.Unparen(inner)
+							continue
 						}
-						x = ast.Unparen(ix.X)
-					}
-					if sel, ok := x.(*ast.SelectorExpr); ok {
-						pinFieldPath(sel, layoutPin{format: pinAtomic, pos: call.Pos()})
+						break
 					}
 				}
 				return
@@ -1214,8 +1223,41 @@ func foreignRewritten(pass *analysis.Pass, t types.Type, st *types.Struct, sizes
 	if sizes.rewritten != nil && !sizes.rewritten(st) {
 		return false
 	}
+	// -opt_in (the only mode without a prediction): it moves only if marked.
+	if sizes.rewritten == nil && !declOptedIn(pass, st) {
+		return false
+	}
 	ok, _, _ = rewriteCandidate(st, sizes)
 	return ok
+}
+
+// declOptedIn reports whether the package-level struct literal decl carries
+// the -opt_in mark in its source, the only place another package's pass can
+// see it. An unreadable file counts as unmarked.
+func declOptedIn(pass *analysis.Pass, decl *types.Struct) bool {
+	if decl.NumFields() == 0 {
+		return false
+	}
+	pos := pass.Fset.Position(decl.Field(0).Pos())
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, pos.Filename, nil, parser.ParseComments|parser.SkipObjectResolution)
+	if err != nil {
+		return false
+	}
+	for _, d := range f.Decls {
+		g, ok := d.(*ast.GenDecl)
+		if !ok || g.Tok != token.TYPE {
+			continue
+		}
+		for _, spec := range g.Specs {
+			ts := spec.(*ast.TypeSpec)
+			st, ok := ts.Type.(*ast.StructType)
+			if ok && fset.Position(st.Fields.Opening).Line <= pos.Line && pos.Line <= fset.Position(st.Fields.Closing).Line {
+				return declaredWithOptInComment(g) || commentGroupHasOptIn(ts.Doc)
+			}
+		}
+	}
+	return false
 }
 
 // sameRun guesses whether obj's package is analyzed in the same run as pass:
@@ -1231,18 +1273,23 @@ func sameRun(pass *analysis.Pass, obj types.Object) bool {
 		return isStdPath(pass.Pkg.Path()) == isStdPath(pkg.Path())
 	}
 	m := pass.Module.Path
-	if pkg.Path() == m || strings.HasPrefix(pkg.Path(), m+"/") {
+	underModule := pkg.Path() == m || strings.HasPrefix(pkg.Path(), m+"/")
+	file := pass.Fset.Position(obj.Pos()).Filename
+	var self string
+	if len(pass.Files) > 0 {
+		// The package clause's position, not the token.File's name: a cgo
+		// file is parsed from the build cache but //line-mapped back.
+		self = pass.Fset.Position(pass.Files[0].Package).Filename
+	}
+	if !filepath.IsAbs(file) || !filepath.IsAbs(self) {
+		return underModule
+	}
+	// The import path alone can't tell a nested module, which `./...` stops at.
+	root := moduleRoot(file)
+	if underModule && root == moduleRoot(self) {
 		return true
 	}
-	file := pass.Fset.Position(obj.Pos()).Filename
-	if !filepath.IsAbs(file) || len(pass.Files) == 0 {
-		return false
-	}
-	self := pass.Fset.File(pass.Files[0].Pos())
-	if self == nil {
-		return false
-	}
-	return slices.Contains(workspaceModules(filepath.Dir(self.Name())), moduleRoot(file))
+	return slices.Contains(workspaceModules(filepath.Dir(self)), root)
 }
 
 // workspaceCache memoises workspaceModules by GOWORK and starting directory.
@@ -2020,9 +2067,6 @@ func (s *gcSizes) Alignof(T types.Type) int64 {
 	return v
 }
 
-// alignofUncached is the algorithm behind Alignof, split out for nil-cache
-// testing. Per spec: arrays align to their element, structs to the max field
-// alignment, everything else to its size clamped to [1, MaxAlign].
 // isAlign64 reports whether t is the compiler's align64 marker: a field of it
 // makes the enclosing struct 8-byte aligned (cmd/compile's types.CalcSize
 // recognises it only in sync/atomic and the runtime's atomic package).
@@ -2038,6 +2082,9 @@ func isAlign64(t types.Type) bool {
 	return false
 }
 
+// alignofUncached is the algorithm behind Alignof, split out for nil-cache
+// testing. Per spec: arrays align to their element, structs to the max field
+// alignment, everything else to its size clamped to [1, MaxAlign].
 func (s *gcSizes) alignofUncached(T types.Type) int64 {
 	switch t := T.Underlying().(type) {
 	case *types.Array:

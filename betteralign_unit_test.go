@@ -2462,15 +2462,15 @@ func TestSameRunWorkspace(t *testing.T) {
 		}
 		return p
 	}
-	write("ws/go.work", "go 1.24\n\nuse (\n\t./a\n\t./b\n)\n")
+	write("ws/go.work", "go 1.24\n\nuse (\n\t./a\n\t./a/used\n\t./b\n)\n")
 	// A workspace whose root is itself a used module, vendoring its
 	// dependencies there (go work vendor).
 	write("wsv/go.work", "go 1.24\n\nuse .\n")
-	for _, m := range []string{"ws/a", "ws/b", "ws/b/sub", "ws/c", "solo/a", "solo/b", "wsv"} {
+	for _, m := range []string{"ws/a", "ws/a/used", "ws/b", "ws/b/sub", "ws/c", "solo/a", "solo/a/inner", "solo/b", "wsv"} {
 		write(m+"/go.mod", "module example.com/"+filepath.Base(m)+"\n\ngo 1.24\n")
 	}
 
-	check := func(name, self, other string, want bool) {
+	checkPkg := func(name, self, other, otherPkg string, want bool) {
 		t.Helper()
 		fset := token.NewFileSet()
 		selfFile := fset.AddFile(filepath.Join(root, self), -1, 10)
@@ -2481,10 +2481,14 @@ func TestSameRunWorkspace(t *testing.T) {
 			Fset:   fset,
 			Files:  []*ast.File{{Package: selfFile.Pos(0), Name: ast.NewIdent("a")}},
 		}
-		obj := types.NewTypeName(otherFile.Pos(0), types.NewPackage("example.com/other", "other"), "U", nil)
+		obj := types.NewTypeName(otherFile.Pos(0), types.NewPackage(otherPkg, "other"), "U", nil)
 		if got := sameRun(pass, obj); got != want {
 			t.Errorf("%s: sameRun = %v, want %v", name, got, want)
 		}
+	}
+	check := func(name, self, other string, want bool) {
+		t.Helper()
+		checkPkg(name, self, other, "example.com/other", want)
 	}
 	check("used workspace module", "ws/a/a.go", "ws/b/b.go", true)
 	check("used module, nested package", "ws/a/a.go", "ws/b/x/y.go", true)
@@ -2492,6 +2496,11 @@ func TestSameRunWorkspace(t *testing.T) {
 	check("module outside use list", "ws/a/a.go", "ws/c/c.go", false)
 	check("replace without workspace", "solo/a/a.go", "solo/b/b.go", false)
 	check("vendored into a used module", "wsv/app/a.go", "wsv/vendor/example.com/dep/dep.go", false)
+	// An import path under the module's says nothing about a nested module,
+	// which `./...` stops at.
+	checkPkg("own package", "solo/a/a.go", "solo/a/x/x.go", "example.com/a/x", true)
+	checkPkg("nested module", "solo/a/a.go", "solo/a/inner/i.go", "example.com/a/inner", false)
+	checkPkg("nested module the workspace uses", "ws/a/a.go", "ws/a/used/u.go", "example.com/a/used", true)
 
 	t.Setenv("GOWORK", "off")
 	check("GOWORK=off", "ws/a/a.go", "ws/b/b.go", false)

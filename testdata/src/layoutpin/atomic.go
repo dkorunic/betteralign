@@ -67,3 +67,32 @@ func atomicsFine(t *atomicTyped, s *atomic32) {
 	t.atomicV.Add(1)
 	atomic.AddInt32(&s.atomicX, 1)
 }
+
+// A nested field: the word's offset also depends on where its holder sits
+// in its own container, so the holders pin too.
+type atomicCounter struct {
+	atomicTotal int64
+}
+
+type atomicNested struct { // want `reorder skipped: 64-bit atomic access at .*atomic.go:95:`
+	atomicC atomicCounter
+	atomicM *string
+}
+
+type atomicNestedArray struct { // want `reorder skipped: 64-bit atomic access at .*atomic.go:96:`
+	atomicCs [2]atomicCounter
+	atomicN2 *string
+}
+
+// Behind a pointer the counter is its own allocation: no pin.
+type atomicViaPointer struct { // want `struct with 16 pointer bytes could be 8$`
+	atomicH2 int64
+	atomicCP *atomicCounter
+	atomicY2 bool
+}
+
+func atomicNesting(n *atomicNested, a *atomicNestedArray, p *atomicViaPointer, i int) {
+	atomic.AddInt64(&n.atomicC.atomicTotal, 1)
+	atomic.AddInt64(&a.atomicCs[i].atomicTotal, 1)
+	atomic.AddInt64(&p.atomicCP.atomicTotal, 1)
+}

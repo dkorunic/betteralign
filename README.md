@@ -213,7 +213,7 @@ whose field is passed to a 64-bit `sync/atomic` function (which needs it
 type, one identical to an unnamed struct
 type it may be assigned to (including an alias `type A = struct{...}`), one
 converted to or from `unsafe.Pointer` (type punning), and one passed to
-`encoding/binary` or `encoding/asn1` (whose wire format is field order).
+`encoding/binary`, `encoding/asn1` or `x/crypto/ssh` (whose wire format is field order).
 Reordering would break the build, corrupt memory or silently change the
 encoding. The last three also cover structs held by value inside them. A
 struct that declares itself ASN.1 — an `asn1:"..."` tag or a field of an
