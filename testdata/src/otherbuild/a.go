@@ -72,3 +72,28 @@ type Negated struct { // want `reorder skipped: positional composite literal at 
 	Z int64
 	Q bool
 }
+
+// Built positionally through a container declared in an excluded file.
+type LocalDecl struct { // want `reorder skipped: positional composite literal at .*decl.go`
+	LA bool
+	LB int64
+	LC bool
+}
+
+// Built positionally as the element of a generic container's instance.
+type GenElem struct { // want `reorder skipped: positional composite literal at .*decl.go`
+	GA bool
+	GB int64
+	GC bool
+}
+
+type GenList[E any] []E
+
+// Built positionally through a generic alias's instance.
+type AliasElem struct { // want `reorder skipped: positional composite literal at .*decl.go`
+	AA bool
+	AB int64
+	AC bool
+}
+
+type GenAlias[T any] = []T

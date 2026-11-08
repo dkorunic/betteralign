@@ -21,3 +21,12 @@ type Plain struct {
 	P *int
 	B byte
 }
+
+// Ignored keeps its order whatever the mark says.
+//
+// betteralign:check
+type Ignored struct { // betteralign:ignore
+	A byte
+	P *int
+	B byte
+}

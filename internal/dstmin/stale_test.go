@@ -58,6 +58,49 @@ func TestDecorateFileRejectsStaleSource(t *testing.T) {
 	}
 }
 
+// TestDecorateFileRejectsStaleComment pins the comment half of the check: a
+// lead doc is re-emitted from the AST's text, so a same-length edit to it
+// was reverted, and one turning it into code (an embedded field) deleted the
+// new field from the rewrite. A CRLF file, whose comment text drops the
+// carriage returns, still decorates.
+func TestDecorateFileRejectsStaleComment(t *testing.T) {
+	const orig = "package p\n\ntype S struct {\n\tA bool\n\t// one two\n\tB int64\n\tC bool\n}\n"
+	for name, edited := range map[string]string{
+		"comment edited":       strings.Replace(orig, "one two", "new txt", 1),
+		"comment becomes code": strings.Replace(orig, "one two", "one\ntwo", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if len(edited) != len(orig) {
+				t.Fatalf("fixture lengths differ: %d vs %d", len(edited), len(orig))
+			}
+			path := filepath.Join(t.TempDir(), "p.go")
+			if err := os.WriteFile(path, []byte(orig), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			fset := token.NewFileSet()
+			f, err := parser.ParseFile(fset, path, nil, parser.ParseComments)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(edited), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := NewDecorator(fset).DecorateFile(f); !errors.Is(err, ErrSourceRead) {
+				t.Fatalf("err = %v, want ErrSourceRead", err)
+			}
+		})
+	}
+	crlf := strings.ReplaceAll(orig, "\n", "\r\n")
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "p.go", crlf, parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sourceMatchesAST(f, fset.File(f.Pos()), []byte(crlf)) {
+		t.Error("CRLF source reported as stale")
+	}
+}
+
 // TestSourceMatchesASTLatchesMismatch pins that one mismatch fails the whole
 // check even when later nodes match: ast.Inspect keeps visiting siblings after
 // a false return, so with a non-latching flag the sibling identifier c in

@@ -158,6 +158,19 @@ func sourceMatchesAST(f *ast.File, tf *token.File, src []byte) bool {
 		}
 		return ok
 	})
+	// Comments too: lead docs are re-emitted from the AST's text, not the
+	// bytes, so a same-length edit to one would be reverted (or, turning a
+	// comment into code, deleted). Comment text drops carriage returns, so a
+	// file with any is left to the per-struct \r guard.
+	if ok && bytes.IndexByte(src, '\r') < 0 {
+		for _, cg := range f.Comments {
+			for _, c := range cg.List {
+				if !at(c.Slash, c.Text) {
+					return false
+				}
+			}
+		}
+	}
 	return ok
 }
 
@@ -828,7 +841,8 @@ func Reprint(f *File) ([]byte, []BodyEdit, error) {
 			Struct: st.ast,
 			Pos:    st.ast.Fields.Opening + 1,
 			End:    st.ast.Fields.Closing,
-			New:    formatted[outTF.Offset(o.Fields.Opening)+1 : outTF.Offset(o.Fields.Closing)],
+			// Capped: New must not alias the rest of the -apply bytes.
+			New: formatted[outTF.Offset(o.Fields.Opening)+1 : outTF.Offset(o.Fields.Closing) : outTF.Offset(o.Fields.Closing)],
 		})
 	}
 	return formatted, edits, nil

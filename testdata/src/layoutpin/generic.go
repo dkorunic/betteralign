@@ -1,0 +1,97 @@
+package layoutpin
+
+import "sync/atomic"
+
+// An instance is identical to the unnamed struct its declaration doesn't
+// spell: assigning genIdent[int] to struct{...; p *int} rests on its order.
+type genIdent[T any] struct { // want `reorder skipped: identical unnamed struct type at .*generic.go:14:`
+	genIdentA bool
+	genIdentB int64
+	genIdentC bool
+	genIdentP *T
+}
+
+var genIdentVar struct {
+	genIdentA bool
+	genIdentB int64
+	genIdentC bool
+	genIdentP *int
+} = genIdent[int]{}
+
+// The same through an instantiated generic function's parameter.
+type genArg struct { // want `reorder skipped: identical unnamed struct type at .*generic.go:37:`
+	genArgA bool
+	genArgB int64
+	genArgC bool
+	genArgP *int
+}
+
+func genTake[T any](x struct {
+	genArgA bool
+	genArgB int64
+	genArgC bool
+	genArgP *T
+}) {
+}
+
+func genCall() { genTake[int](genArg{}) }
+
+// A type parameter whose type set holds the struct builds it positionally...
+type tpLit struct { // want `reorder skipped: positional composite literal at .*generic.go:46:`
+	tpLitA bool
+	tpLitB int64
+	tpLitC bool
+}
+
+func tpMake[P interface{ tpLit }]() P { return P{true, 1, false} }
+
+// ...or converts to it.
+type tpFrom struct { // want `reorder skipped: conversion at .*generic.go:61:`
+	tpA bool
+	tpB int64
+	tpC bool
+}
+
+type tpTo struct { // betteralign:ignore
+	tpA bool
+	tpB int64
+	tpC bool
+}
+
+func tpConv[P interface{ tpTo }](s tpFrom) P { return P(s) }
+
+// A struct whose word an atomic pin aligns keeps its holders' layout too,
+// even when the access sits in its own method: on 386 reordering the holder
+// moved the counter to offset 4.
+type atomicMethodCounter struct {
+	amN int64
+	amM int64
+}
+
+func (c *atomicMethodCounter) inc() { atomic.AddInt64(&c.amN, 1) }
+
+type atomicMethodHolder struct { // want `reorder skipped: 64-bit atomic access at .*generic.go:71:`
+	amC atomicMethodCounter
+	amP *int
+}
+
+type atomicMethodOuter struct { // want `reorder skipped: 64-bit atomic access at .*generic.go:71:`
+	amH  [1]atomicMethodHolder
+	amP2 *int
+}
+
+// Converting a type parameter to itself converts nothing: neither struct of
+// its type set is pinned.
+type tpSelfA struct { // want `bytes saved: struct of size \d+ could be \d+$`
+	tsaA bool
+	tsaB int64
+	tsaC bool
+}
+
+type tpSelfB struct { // want `bytes saved: struct of size \d+ could be \d+$`
+	tsbA bool
+	tsbB *int
+	tsbC bool
+}
+
+func tpSame[P interface{ tpSelfA | tpSelfB }](p P) P { return P(p) }

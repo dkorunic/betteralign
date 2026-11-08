@@ -1115,19 +1115,35 @@ func TestApplyIsFixedPoint(t *testing.T) {
 // only what both packages see alike.
 func TestNestedConversionStaysInStep(t *testing.T) {
 	skipUnless64Bit(t)
+	tmpDir := applyBuilds(t, "xconv", nil)
+	user, err := os.ReadFile(filepath.Join(tmpDir, "xconv", "user", "user.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(user), "type NT struct {\n\tF  dep.Four\n\tIn dep.Inner\n}") {
+		t.Errorf("NT was reordered although dep.NU stays in place:\n%s", user)
+	}
+}
+
+// applyBuilds copies fixture's dep and user packages to a temp tree, runs
+// -apply over both with flags, and fails the test if the rewritten pair no
+// longer type-checks (a conversion whose sides went out of step). It returns
+// the temp tree's root.
+func applyBuilds(t *testing.T, fixture string, flags map[string]string) string {
+	t.Helper()
 	srcDir := filepath.Join("testdata", "src")
-	tmpDir, err := os.MkdirTemp(srcDir, "xconv-test")
+	tmpDir, err := os.MkdirTemp(srcDir, filepath.Base(fixture)+"-test")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.RemoveAll(tmpDir) })
 	root := filepath.Base(tmpDir)
 	for _, pkg := range []string{"dep", "user"} {
-		paths, err := filepath.Glob(filepath.Join(srcDir, "xconv", pkg, "*.go"))
+		paths, err := filepath.Glob(filepath.Join(srcDir, fixture, pkg, "*.go"))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := os.MkdirAll(filepath.Join(tmpDir, "xconv", pkg), 0o750); err != nil {
+		if err := os.MkdirAll(filepath.Join(tmpDir, fixture, pkg), 0o750); err != nil {
 			t.Fatal(err)
 		}
 		for _, path := range paths {
@@ -1135,15 +1151,18 @@ func TestNestedConversionStaysInStep(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			src = bytes.ReplaceAll(src, []byte(`"xconv/dep"`), []byte(`"`+root+`/xconv/dep"`))
-			if err := os.WriteFile(filepath.Join(tmpDir, "xconv", pkg, filepath.Base(path)), src, 0o644); err != nil {
+			src = bytes.ReplaceAll(src, []byte(`"`+fixture+`/`), []byte(`"`+root+`/`+fixture+`/`))
+			if err := os.WriteFile(filepath.Join(tmpDir, fixture, pkg, filepath.Base(path)), src, 0o644); err != nil {
 				t.Fatal(err)
 			}
 		}
 	}
-	pkgs := []string{root + "/xconv/dep", root + "/xconv/user"}
+	pkgs := []string{root + "/" + fixture + "/dep", root + "/" + fixture + "/user"}
 
 	analyzer := NewTestAnalyzer()
+	for k, v := range flags {
+		_ = analyzer.Flags.Set(k, v)
+	}
 	_ = analyzer.Flags.Set("apply", "true")
 	analysistest.Run(&errorRecorder{}, analysistest.TestData(), analyzer, pkgs...)
 
@@ -1153,13 +1172,32 @@ func TestNestedConversionStaysInStep(t *testing.T) {
 	for _, msg := range rec.loadErrors() {
 		t.Errorf("after -apply: %s", msg)
 	}
-	user, err := os.ReadFile(filepath.Join(tmpDir, "xconv", "user", "user.go"))
-	if err != nil {
-		t.Fatal(err)
+	return tmpDir
+}
+
+// TestConversionPartnerPrediction pins the cross-package prediction against
+// regressions that broke the build after one -apply: a partner aliased to a
+// struct literal is rewritten like a defined type (so the local side
+// follows); an ignore directive whose comment holds a brace, or above a
+// block comment, keeps the partner (so the local side stays); under -opt_in a
+// marked but ignored partner stays too.
+func TestConversionPartnerPrediction(t *testing.T) {
+	skipUnless64Bit(t)
+	for _, fixture := range []string{"xalias", "xignore"} {
+		t.Run(fixture, func(t *testing.T) {
+			analysistest.Run(t, analysistest.TestData(), NewTestAnalyzer(), fixture+"/...")
+			tmpDir := applyBuilds(t, fixture, nil)
+			if fixture == "xalias" {
+				got := readGoFiles(t, filepath.Join(tmpDir, fixture, "user"))["user.go"]
+				if !strings.Contains(got, "\tP *int\n\tA byte\n\tB byte\n}") {
+					t.Errorf("U was not reordered with dep.N:\n%s", got)
+				}
+			}
+		})
 	}
-	if !strings.Contains(string(user), "type NT struct {\n\tF  dep.Four\n\tIn dep.Inner\n}") {
-		t.Errorf("NT was reordered although dep.NU stays in place:\n%s", user)
-	}
+	t.Run("opt_in", func(t *testing.T) {
+		applyBuilds(t, filepath.Join("optin", "xconv"), map[string]string{"opt_in": "true"})
+	})
 }
 
 // TestLineDirectiveWithoutColumn is the end-to-end regression for BUG-45: a
@@ -1180,7 +1218,15 @@ func TestLineDirectiveWithoutColumn(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec := &errorRecorder{}
-	analysistest.Run(rec, root, NewTestAnalyzer(), "linedir")
+	for _, r := range analysistest.Run(rec, root, NewTestAnalyzer(), "linedir") {
+		// A file with a //line directive is never rewritten (lineDirective):
+		// another package can't locate its declarations to predict that.
+		for _, d := range r.Diagnostics {
+			if len(d.SuggestedFixes) != 0 {
+				t.Errorf("fix attached in a //line file: %s", d.Message)
+			}
+		}
+	}
 	if errs := rec.loadErrors(); len(errs) > 0 {
 		t.Errorf("load errors: %v", errs)
 	}

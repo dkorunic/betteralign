@@ -345,18 +345,15 @@ func FuzzGeneratedByMatcher(f *testing.F) {
 	})
 }
 
-// FuzzReorderableAt feeds declSource.reorderableAt arbitrary file text and
-// positions: it reads whatever file a type's position names, so it must not
-// panic on any line or column, however inconsistent with the text.
+// FuzzReorderableAt feeds newDeclSource arbitrary file text and declSource.at
+// arbitrary lines: it reads whatever file a type's position names, so it must
+// not panic on any text or line, however inconsistent with each other.
 func FuzzReorderableAt(f *testing.F) {
-	f.Add("type T struct { // betteralign:ignore\n\ta bool\n}", 2, 2)
-	f.Add("type T struct{ a bool; b int64 }", 1, 16)
-	f.Add("", 0, 0)
-	f.Fuzz(func(t *testing.T, src string, line, column int) {
-		if line < 1 {
-			return // declRewritable only calls it for valid positions
-		}
-		ds := &declSource{lines: strings.Split(src, "\n")}
-		_ = ds.reorderableAt(line, column)
+	f.Add("package p\ntype T struct { // betteralign:ignore\n\ta bool\n}", 3)
+	f.Add("package p\ntype T struct{ a bool; b int64 }", 2)
+	f.Add("", 0)
+	f.Fuzz(func(t *testing.T, src string, line int) {
+		ds := newDeclSource("f.go", []byte(src))
+		_, _ = ds.at(line, "a")
 	})
 }
