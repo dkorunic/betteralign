@@ -2279,6 +2279,13 @@ func hasHostLayout(str *types.Struct) bool {
 // tag the run sets) and not under //go:build ignore (for hosts that leave
 // IgnoredFiles empty). Under the driver's -test=false no variant runs, so the
 // base pass keeps the rewrite.
+//
+// A pass already holding a *_test.go is the variant and keeps the rewrite
+// outright: gopls leaves IgnoredFiles nil, so a GOOS- or tag-excluded test
+// file is in neither list and the variant would defer too, leaving no pass to
+// rewrite. File arguments load command-line-arguments and never a variant, so
+// there the deferral is final and noted once per directory (deferNoteOut).
+// run calls this only when a rewrite is wanted.
 func deferToTestVariant(pass *analysis.Pass) bool {
 	if flagIs(pass, "test", "false") {
 		return false
@@ -2288,6 +2295,9 @@ func deferToTestVariant(pass *analysis.Pass) bool {
 	for _, f := range pass.Files {
 		// Unadjusted: a //line directive names no directory of ours.
 		name := pass.Fset.PositionFor(f.Package, false).Filename
+		if strings.HasSuffix(name, "_test.go") {
+			return false
+		}
 		seen[name] = true
 		// Not .go: cgo's output, parsed from the build cache.
 		if dir == "" && strings.HasSuffix(name, ".go") {
@@ -2299,11 +2309,25 @@ func deferToTestVariant(pass *analysis.Pass) bool {
 	}
 	for _, e := range testFilesInDir(dir) {
 		if e.pkgName == pass.Pkg.Name() && !e.neverBuilt && !seen[e.name] && !slices.Contains(pass.IgnoredFiles, e.name) {
+			if pass.Pkg.Path() != "command-line-arguments" {
+				return true
+			}
+			if _, noted := deferNoted.LoadOrStore(dir, true); !noted {
+				fmt.Fprintf(deferNoteOut, "betteralign: %s: rewrite deferred to the package's test variant, "+
+					"which this invocation does not load; run on the package (e.g. ./%s) to rewrite\n", dir, filepath.Base(dir))
+			}
 			return true
 		}
 	}
 	return false
 }
+
+// deferNoteOut receives deferToTestVariant's file-argument note, printed once
+// per directory in deferNoted; a variable so tests can capture it.
+var (
+	deferNoteOut io.Writer = os.Stderr
+	deferNoted   sync.Map  // map[string]bool
+)
 
 // testFileEntry is a *_test.go on disk: its path, package clause and whether
 // no build compiles it (neverBuilt).

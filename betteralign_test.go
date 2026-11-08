@@ -1493,6 +1493,35 @@ func TestExportDataPartnerPinsConversion(t *testing.T) {
 	}
 }
 
+// TestFileArgsDeferNote runs -apply on a file argument: the driver loads
+// command-line-arguments and never the test variant, so with an in-package
+// test in the directory the rewrite stays deferred (safe) and stderr says why,
+// once, instead of reporting with nothing written and no explanation.
+func TestFileArgsDeferNote(t *testing.T) {
+	skipUnless64Bit(t)
+	if testing.Short() {
+		t.Skip("builds the binary")
+	}
+	bin, mod := xconvModule(t)
+	if err := os.WriteFile(filepath.Join(mod, "user", "user_test.go"), []byte("package user\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	before := readGoFiles(t, filepath.Join(mod, "user"))
+	cmd := exec.Command(bin, "-apply", "user/user.go")
+	cmd.Dir = mod
+	out, _ := cmd.CombinedOutput() // exits non-zero when it reports
+	if !strings.Contains(string(out), "could be 16") {
+		t.Errorf("no diagnostic for Z:\n%s", out)
+	}
+	note := ": rewrite deferred to the package's test variant, which this invocation does not load"
+	if n := strings.Count(string(out), note); n != 1 {
+		t.Errorf("note printed %d times, want 1:\n%s", n, out)
+	}
+	if after := readGoFiles(t, filepath.Join(mod, "user")); !maps.Equal(before, after) {
+		t.Error("user.go rewritten although the rewrite was deferred")
+	}
+}
+
 // xconvModule builds the betteralign binary and copies testdata/src/xconv
 // into a module, both under t.TempDir().
 func xconvModule(t *testing.T) (bin, mod string) {

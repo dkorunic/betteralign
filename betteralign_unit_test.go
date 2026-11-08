@@ -8,6 +8,7 @@ package betteralign
 // Unit tests for unexported helpers. BUG-xx cases pin specific historical mutants.
 
 import (
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
@@ -3060,6 +3061,58 @@ func TestDeferToTestVariantSkips(t *testing.T) {
 				t.Errorf("deferToTestVariant = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestDeferToTestVariantVariantOwnsRewrite: a pass holding an in-package test
+// file is the [p.test] variant and keeps the rewrite, whatever else is on
+// disk. gopls leaves IgnoredFiles nil, so a GOOS-excluded w_windows_test.go is
+// in neither Files nor IgnoredFiles; the variant deferred as well, and no pass
+// ever offered the fix.
+func TestDeferToTestVariantVariantOwnsRewrite(t *testing.T) {
+	dir := t.TempDir()
+	writeTestFiles(t, dir, map[string]string{
+		"p.go":              "package p\n",
+		"p_test.go":         "package p\n",
+		"w_windows_test.go": "package p\n",
+	})
+	fset := token.NewFileSet()
+	if !deferToTestVariant(basePass(t, fset, dir, "p.go")) {
+		t.Error("base pass did not defer")
+	}
+	if deferToTestVariant(basePass(t, fset, dir, "p.go", "p_test.go")) {
+		t.Error("variant deferred with IgnoredFiles nil and w_windows_test.go on disk")
+	}
+}
+
+// TestDeferToTestVariantFileArgsNote: file arguments load
+// command-line-arguments and never a test variant, so the deferral is final
+// and says so once per directory; an ordinary package stays silent (its
+// variant normally follows). Deferral itself is unchanged.
+func TestDeferToTestVariantFileArgsNote(t *testing.T) {
+	var buf bytes.Buffer
+	saved := deferNoteOut
+	deferNoteOut = &buf
+	defer func() { deferNoteOut = saved }()
+
+	for _, path := range []string{"command-line-arguments", "example.com/p"} {
+		buf.Reset()
+		dir := t.TempDir()
+		writeTestFiles(t, dir, map[string]string{"p.go": "package p\n", "p_test.go": "package p\n"})
+		for range 2 {
+			pass := basePass(t, token.NewFileSet(), dir, "p.go")
+			pass.Pkg = types.NewPackage(path, "p")
+			if !deferToTestVariant(pass) {
+				t.Errorf("%s: did not defer", path)
+			}
+		}
+		want := 0
+		if path == "command-line-arguments" {
+			want = 1
+		}
+		if n := strings.Count(buf.String(), "betteralign: "+dir+": rewrite deferred to the package's test variant"); n != want {
+			t.Errorf("%s: note printed %d times, want %d:\n%s", path, n, want, buf.String())
+		}
 	}
 }
 
