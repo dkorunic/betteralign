@@ -1,0 +1,35 @@
+package nested
+
+// finished is pinned by the positional literal below, so it keeps its
+// declared layout: 24 pointer bytes, none of them trailing.
+type finished struct { // want `struct with 24 pointer bytes could be 8; reorder skipped: positional composite literal`
+	a int64
+	b int64
+	p *int
+}
+
+var _ = finished{1, 2, nil}
+
+// A struct with an unexported field name has no identical struct in another
+// package, so its pass measures finished as it stays (declared), pin and all:
+// f, with no trailing pointer-free bytes, belongs in front.
+type hs struct { // want `struct with 40 pointer bytes could be 32`
+	s string
+	f finished
+}
+
+// hsKept is already in place for finished as it stays. Measured as if
+// finished moved (16 trailing pointer-free bytes), it went behind s, raising
+// its pointer bytes from 32 to 40 (crypto/tls's clientHandshakeState).
+type hsKept struct {
+	f finished
+	s string
+}
+
+// HS has only exported field names, so an identical struct may live in
+// another package, which can't see finished's pin: measured pin-free, as
+// before, it moves behind S although finished stays.
+type HS struct { // want `struct with 32 pointer bytes could be 24`
+	F finished
+	S string
+}

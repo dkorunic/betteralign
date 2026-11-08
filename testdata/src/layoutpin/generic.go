@@ -75,7 +75,9 @@ type atomicMethodHolder struct { // want `reorder skipped: 64-bit atomic access 
 	amP *int
 }
 
-type atomicMethodOuter struct { // want `reorder skipped: 64-bit atomic access at .*generic.go:71:`
+// Measured with atomicMethodHolder as it stays (pinned, private), the outer
+// is already in place: not reported.
+type atomicMethodOuter struct {
 	amH  [1]atomicMethodHolder
 	amP2 *int
 }

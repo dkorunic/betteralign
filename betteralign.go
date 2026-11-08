@@ -410,8 +410,9 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 	// cross-package conversion sort identical fields, and must sort them
 	// identically — so it uses only the struct's own layout and what its
 	// declaring file shows to anyone (declRewritable), never this package's
-	// pins. -opt_in disables the projection: another package's opt-in marks
-	// are invisible to the packages measuring it.
+	// pins; only a private struct, which has no partner, sees them
+	// (localSizes). -opt_in disables the projection: another package's opt-in
+	// marks are invisible to the packages measuring it.
 	skipFile := func(fn string) bool {
 		return (!testFiles && hasSuffix(fn, testSuffixes)) ||
 			(!generatedFiles && hasSuffix(fn, generatedSuffixes)) ||
@@ -427,11 +428,32 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 		return v
 	}
 	declMoves = rewritable
+	// localSizes measures a private struct (private): one with an unexported
+	// field name, which no struct of another package can be identical to, so
+	// no other pass has to agree on its order and its own may consult this
+	// package's pins: an inner struct pinned here is measured as it stays.
+	// Separate caches: the shared figures must stay pin-free.
+	localSizes := newGCSizes(wordSize, maxAlign)
 	if optInMode {
 		// A conversion partner reads the mark from its source (declOptedIn).
 		declMoves = func(decl *types.Struct) bool { return rewritable(decl) && declOptedIn(pass, decl) }
 	} else {
 		sizes.rewritten = rewritable
+		localSizes.rewritten = func(decl *types.Struct) bool {
+			if !rewritable(decl) {
+				return false
+			}
+			// Another package's pins are invisible here; its pass moves it.
+			if decl.Field(0).Pkg() != pass.Pkg {
+				return true
+			}
+			// A candidate first, so an aligned inner doesn't force the pins.
+			if ok, _, _ := rewriteCandidate(decl, localSizes); !ok {
+				return false
+			}
+			_, pinned := ensureLayoutPins()[decl]
+			return !pinned
+		}
 	}
 
 	// Per-file state set on *ast.File visit; reused by child node visits.
@@ -522,15 +544,21 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 			return
 		}
 
-		candidate, optsz, optptrs := rewriteCandidate(typ, sizes)
+		// A private struct is rewritten by its own pass alone, against its
+		// inner structs as they will really be (localSizes).
+		msz := sizes
+		if private(typ) {
+			msz = localSizes
+		}
+		candidate, optsz, optptrs := rewriteCandidate(typ, msz)
 		if !candidate {
 			return
 		}
 
 		var message string
-		if sz := sizes.Sizeof(typ); sz != optsz {
+		if sz := msz.Sizeof(typ); sz != optsz {
 			message = fmt.Sprintf("%d bytes saved: struct of size %d could be %d", sz-optsz, sz, optsz)
-		} else if ptrs := sizes.ptrdata(typ); ptrs != optptrs {
+		} else if ptrs := msz.ptrdata(typ); ptrs != optptrs {
 			// Frame the pointer-bytes win to the analyzed project's Go version:
 			// under Green Tea it is a scan-work estimate, not bytes saved.
 			if greenTeaGC(targetGoVersion(pass, currentASTFile)) {
@@ -580,7 +608,7 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 
 		// Permutation needed only for the reorder; computed lazily per misaligned
 		// struct so report-only runs never allocate it.
-		indexes, _, _ := optimalOrder(typ, sizes)
+		indexes, _, _ := optimalOrder(typ, msz)
 
 		if dec == nil {
 			dec = dst.NewDecorator(pass.Fset)
@@ -2808,6 +2836,21 @@ func (s *gcSizes) projected(T types.Type) (size, ptrdata int64, ok bool) {
 	}
 	ok, size, ptrdata = rewriteCandidate(st, s)
 	return size, ptrdata, ok
+}
+
+// private reports whether st has an unexported field name (a blank field, a
+// lowercase name, an embedded unexported type). Such names from different
+// packages are never identical (spec, "Type identity"), so no struct of
+// another package is identical to st: nothing outside this package converts
+// to it or assigns an identical unnamed struct, and its order is this
+// package's alone to choose.
+func private(st *types.Struct) bool {
+	for f := range st.Fields() {
+		if !f.Exported() {
+			return true
+		}
+	}
+	return false
 }
 
 // newGCSizes returns a *gcSizes with empty memoisation caches — required for

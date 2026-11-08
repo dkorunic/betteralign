@@ -3358,3 +3358,29 @@ func TestTestFilesInDirMissing(t *testing.T) {
 		t.Errorf("testFilesInDir = %+v, want nil", got)
 	}
 }
+
+// TestPrivate pins which structs may consult the package's own pins when
+// projecting their inner structs: one with an unexported field name (blank,
+// lowercase, an embedded unexported type) can be identical to no struct of
+// another package; one whose field names are all exported can.
+func TestPrivate(t *testing.T) {
+	pkg := types.NewPackage("p", "p")
+	innerT := types.NewNamed(types.NewTypeName(token.NoPos, pkg, "inner", nil), types.NewStruct(nil, nil), nil)
+	field := func(name string) *types.Var {
+		return types.NewField(token.NoPos, pkg, name, types.Typ[types.Int], false)
+	}
+	for _, tc := range []struct {
+		name   string
+		fields []*types.Var
+		want   bool
+	}{
+		{"blank", []*types.Var{field("A"), field("_")}, true},
+		{"lowercase", []*types.Var{field("A"), field("b")}, true},
+		{"embedded unexported type", []*types.Var{field("A"), types.NewField(token.NoPos, pkg, "inner", innerT, true)}, true},
+		{"all exported", []*types.Var{field("A"), field("B")}, false},
+	} {
+		if got := private(types.NewStruct(tc.fields, nil)); got != tc.want {
+			t.Errorf("%s: private = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
