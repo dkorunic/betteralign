@@ -156,7 +156,7 @@ Reordering would break the build, corrupt memory or silently change the
 encoding. The last three also cover structs held by value inside them. A
 struct that declares itself ASN.1 — an ` + "`asn1:\"...\"`" + ` tag or a field of an
 ` + "`encoding/asn1`" + ` type — is skipped outright, since its encoder usually lives
-in another package. A conversion to a struct of another package in the same
+in another package; so is one tagged for ` + "`x/crypto/ssh`" + ` (` + "`ssh`" + `, ` + "`sshtype`" + `). A conversion to a struct of another package in the same
 module follows that package: both are reordered, identically.
 
 Each rewritable diagnostic carries a suggested fix, so ` + "`-fix`" + ` (and
@@ -166,6 +166,8 @@ prints a unified diff of each rewrite to stdout (stderr with ` + "`-json`" + `)
 instead of updating the files. ` + "`-fix`" + ` takes precedence over ` + "`-apply`" + `.
 The driver never applies fixes to files marked as generated, so with
 ` + "`-generated_files`" + `, ` + "`-fix`" + ` instead rewrites through the ` + "`-apply`" + ` path.
+A file that imports ` + "`\"C\"`" + ` is analyzed only with ` + "`-generated_files`" + ` and is
+never rewritten.
 
 Windows-line-ending (CRLF) files are reported but never rewritten under
 ` + "`-apply`" + `; normalise them to LF to enable the reorder.
@@ -508,6 +510,12 @@ func (cfg *analyzerConfig) run(pass *analysis.Pass) (any, error) {
 		if pinned || rewriteDeferred() {
 			return
 		}
+		// Only with -generated_files: a cgo file is parsed from its output in
+		// the build cache (named without .go), so a rewrite would change the
+		// cache and leave the source as it was.
+		if !strings.HasSuffix(currentFn, ".go") {
+			return
+		}
 
 		// Decorate this file once; never retry on failure. Checked before
 		// optimalOrder so a file that already failed decoration doesn't pay the
@@ -685,7 +693,7 @@ func rewriteCandidate(str *types.Struct, sizes *gcSizes) (ok bool, optSize, optP
 	// structs.HostLayout (a C-ABI contract) and explicit blank padding make the
 	// layout deliberate: nothing to report, since the user can't act on it and
 	// the "could be" figure would need breaking that contract.
-	if hasHostLayout(str) || hasBlankPadding(str, sizes) || isASN1Struct(str) {
+	if hasHostLayout(str) || hasBlankPadding(str, sizes) || isASN1Struct(str) || hasSSHTag(str) {
 		return false, 0, 0
 	}
 	size, ptrdata := sizes.Sizeof(str), sizes.ptrdata(str)
@@ -865,9 +873,9 @@ var unsafeOffsetof = types.Unsafe.Scope().Lookup("Offsetof")
 //     between them rests on identical field order. Both are pinned.
 //   - an unsafe.Pointer conversion to or from *S: type punning reads S's
 //     memory layout directly, so a reorder corrupts it silently.
-//   - an encoding/binary Read/Write/Size/Append/Encode/Decode argument: the
-//     wire format is field declaration order, so a reorder silently changes
-//     it.
+//   - an argument of an orderCodecs function (encoding/binary, encoding/asn1,
+//     x/crypto/ssh): the wire format is field declaration order, so a reorder
+//     silently changes it.
 //
 // The last two also pin every struct held by value inside S (fields, arrays),
 // since those bytes are part of the same layout.
@@ -995,7 +1003,17 @@ func collectLayoutPins(inspect *inspector.Inspector, pass *analysis.Pass, sizes 
 			// 8-byte aligned on 32-bit platforms, which only the first word of
 			// an allocation guarantees, so the layout around it is deliberate.
 			if isAtomic64Func(fn) && len(call.Args) > 0 {
-				if addr, ok := ast.Unparen(call.Args[0]).(*ast.UnaryExpr); ok && addr.Op == token.AND {
+				// The word may arrive through a pointer conversion:
+				// (*int64)(&s.d), (*int64)(unsafe.Pointer(&s.u)).
+				arg := ast.Unparen(call.Args[0])
+				for {
+					conv, ok := arg.(*ast.CallExpr)
+					if !ok || len(conv.Args) != 1 || !pass.TypesInfo.Types[conv.Fun].IsType() {
+						break
+					}
+					arg = ast.Unparen(conv.Args[0])
+				}
+				if addr, ok := arg.(*ast.UnaryExpr); ok && addr.Op == token.AND {
 					// &s.f, an element of an array field (&s.f[i]), which the
 					// array's offset places, or a field of a struct held by
 					// value (&s.t.f), which t's offset places. A slice's
@@ -1198,12 +1216,12 @@ func collectLayoutPins(inspect *inspector.Inspector, pass *analysis.Pass, sizes 
 }
 
 // foreignRewritten predicts whether st, the struct behind t, is declared in
-// another package that the same run will reorder: same module as the pass (or
-// both standard library) and a rewriteCandidate. That package's own
-// directives and pins are invisible from here, as is whether it is actually
-// among the analyzed packages, so the prediction can miss in either
-// direction; each miss is the v0.15.4 behaviour (which reordered both sides
-// regardless), never worse.
+// another package that the same run will reorder: sameRun, a rewriteCandidate,
+// and nothing in its source that keeps it in place (declRewritable or, under
+// -opt_in, a missing mark; a shape dstmin refuses). That package's pins are
+// invisible from here, as is whether it is actually among the analyzed
+// packages, so the prediction can miss in either direction; each miss is the
+// v0.15.4 behaviour (which reordered both sides regardless), never worse.
 func foreignRewritten(pass *analysis.Pass, t types.Type, st *types.Struct, sizes *gcSizes) bool {
 	t = types.Unalias(t)
 	if p, ok := t.(*types.Pointer); ok {
@@ -1228,7 +1246,47 @@ func foreignRewritten(pass *analysis.Pass, t types.Type, st *types.Struct, sizes
 		return false
 	}
 	ok, _, _ = rewriteCandidate(st, sizes)
-	return ok
+	return ok && declDecorates(pass, st)
+}
+
+// declDecorates reports whether dstmin would accept the struct literal decl
+// for a reorder; a shape it refuses stays as declared, whatever its layout.
+// An unreadable or unparsable file gives no such evidence, so it counts as
+// accepted.
+func declDecorates(pass *analysis.Pass, decl *types.Struct) bool {
+	if decl.NumFields() == 0 {
+		return false
+	}
+	pos := pass.Fset.PositionFor(decl.Field(0).Pos(), false)
+	ds := readDeclSource(pos.Filename)
+	if ds.decorated == nil {
+		return true
+	}
+	accepted, known := ds.decorated()[pos.Line]
+	return !known || accepted
+}
+
+// decoratedStructs maps the first-field line of each struct in src (the
+// outermost, where one line starts several) to whether dstmin accepts it.
+func decoratedStructs(fn string, src []byte) map[int]bool {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, fn, src, parser.ParseComments|parser.SkipObjectResolution)
+	if err != nil {
+		return nil
+	}
+	dec := dst.NewDecorator(fset)
+	dec.DecorateFileSrc(f, src)
+	byLine := make(map[int]bool)
+	ast.Inspect(f, func(n ast.Node) bool {
+		if st, ok := n.(*ast.StructType); ok && st.Fields != nil && len(st.Fields.List) > 0 {
+			line := fset.Position(st.Fields.List[0].Pos()).Line
+			if _, seen := byLine[line]; !seen {
+				_, byLine[line] = dec.Dst.Nodes[st]
+			}
+		}
+		return true
+	})
+	return byLine
 }
 
 // declOptedIn reports whether the package-level struct literal decl carries
@@ -1238,7 +1296,7 @@ func declOptedIn(pass *analysis.Pass, decl *types.Struct) bool {
 	if decl.NumFields() == 0 {
 		return false
 	}
-	pos := pass.Fset.Position(decl.Field(0).Pos())
+	pos := pass.Fset.PositionFor(decl.Field(0).Pos(), false)
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, pos.Filename, nil, parser.ParseComments|parser.SkipObjectResolution)
 	if err != nil {
@@ -1583,6 +1641,23 @@ func isASN1Struct(str *types.Struct) bool {
 			t = types.Unalias(p.Elem())
 		}
 		if named, ok := t.(*types.Named); ok && named.Obj().Pkg() != nil && named.Obj().Pkg().Path() == "encoding/asn1" {
+			return true
+		}
+	}
+	return false
+}
+
+// hasSSHTag reports whether a field of str is tagged for x/crypto/ssh's
+// encoder (`ssh:"rest"`, `sshtype:"90"`). As with ASN.1, field order is then
+// the wire format, and the value often reaches ssh.Marshal through an
+// interface or from another package, where its call site can't pin it.
+func hasSSHTag(str *types.Struct) bool {
+	for i := range str.NumFields() {
+		tag := reflect.StructTag(str.Tag(i))
+		if _, ok := tag.Lookup("ssh"); ok {
+			return true
+		}
+		if _, ok := tag.Lookup("sshtype"); ok {
 			return true
 		}
 	}
@@ -2370,16 +2445,20 @@ func declRewritable(pass *analysis.Pass, decl *types.Struct, skipFile func(strin
 	if first.Pkg() == nil || first.Pkg() != pass.Pkg && !sameRun(pass, first) {
 		return false
 	}
-	pos := pass.Fset.Position(first.Pos())
+	// Unadjusted: the text is read from the file really holding the
+	// declaration, not the one a //line directive names. Not .go means cgo's
+	// output in the build cache, which run never rewrites.
+	pos := pass.Fset.PositionFor(first.Pos(), false)
 	fn := pos.Filename
 	if rest, ok := strings.CutPrefix(fn, "$GOROOT/"); ok {
 		fn = filepath.Join(build.Default.GOROOT, filepath.FromSlash(rest))
 	}
-	if !filepath.IsAbs(fn) || pos.Line < 1 || skipFile(fn) {
+	if !filepath.IsAbs(fn) || !strings.HasSuffix(fn, ".go") || pos.Line < 1 || skipFile(fn) {
 		return false
 	}
 	src := readDeclSource(fn)
-	if !generatedFiles && src.generated {
+	// A cgo file is never rewritten, -generated_files or not (see run).
+	if src.cgo || !generatedFiles && src.generated {
 		return false
 	}
 	return src.reorderableAt(pos.Line, pos.Column)
@@ -2387,8 +2466,11 @@ func declRewritable(pass *analysis.Pass, decl *types.Struct, skipFile func(strin
 
 // declSource is a declaring file as declRewritable reads it.
 type declSource struct {
+	// decorated is built on first use: only conversion partners need it.
+	decorated func() map[int]bool
 	lines     []string
 	generated bool
+	cgo       bool
 }
 
 // declSourceCache memoises readDeclSource by path, size and modification
@@ -2415,8 +2497,10 @@ func readDeclSource(fn string) *declSource {
 	ds := &declSource{}
 	if src, err := os.ReadFile(fn); err == nil {
 		ds.lines = strings.Split(string(src), "\n")
-		if f, err := parser.ParseFile(token.NewFileSet(), fn, src, parser.PackageClauseOnly|parser.ParseComments); err == nil {
+		ds.decorated = sync.OnceValue(func() map[int]bool { return decoratedStructs(fn, src) })
+		if f, err := parser.ParseFile(token.NewFileSet(), fn, src, parser.ImportsOnly|parser.ParseComments); err == nil {
 			ds.generated = hasGeneratedComment(f)
+			ds.cgo = slices.ContainsFunc(f.Imports, func(s *ast.ImportSpec) bool { return s.Path.Value == `"C"` })
 		}
 	}
 	v, _ := declSourceCache.LoadOrStore(key, ds)

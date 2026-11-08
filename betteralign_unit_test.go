@@ -18,6 +18,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2365,6 +2366,9 @@ func TestValidEdit(t *testing.T) {
 // mode to build SuggestedFixes, so a bug there must cost only the fix — the
 // run must not crash and every diagnostic must still be reported, unfixed.
 func TestRewritePanicKeepsDiagnostics(t *testing.T) {
+	if strconv.IntSize != 64 {
+		t.Skip("fixture assumes 64-bit word size")
+	}
 	for name, inject := range map[string]func(){
 		"decorate": func() {
 			saved := decorateFile
@@ -2504,6 +2508,46 @@ func TestSameRunWorkspace(t *testing.T) {
 
 	t.Setenv("GOWORK", "off")
 	check("GOWORK=off", "ws/a/a.go", "ws/b/b.go", false)
+
+	// With -trimpath an imported object's position is not absolute, so only
+	// the import path is left to go by.
+	fset := token.NewFileSet()
+	selfFile := fset.AddFile(filepath.Join(root, "solo/a/a.go"), -1, 10)
+	trimmed := fset.AddFile("example.com/a/x/x.go", -1, 10)
+	pass := &analysis.Pass{
+		Pkg:    types.NewPackage("example.com/a", "a"),
+		Module: &analysis.Module{Path: "example.com/a"},
+		Fset:   fset,
+		Files:  []*ast.File{{Package: selfFile.Pos(0), Name: ast.NewIdent("a")}},
+	}
+	obj := types.NewTypeName(trimmed.Pos(0), types.NewPackage("example.com/a/x", "x"), "U", nil)
+	if !sameRun(pass, obj) {
+		t.Error("trimmed position: sameRun = false, want true")
+	}
+}
+
+// TestIsAlign64 pins that only the align64 marker of the atomic packages
+// counts: sync/atomic's noCopy, or an align64 of another package, must not
+// raise a struct's alignment.
+func TestIsAlign64(t *testing.T) {
+	for _, tc := range []struct {
+		path, name string
+		want       bool
+	}{
+		{"sync/atomic", "align64", true},
+		{"internal/runtime/atomic", "align64", true},
+		{"runtime/internal/atomic", "align64", true},
+		{"sync/atomic", "noCopy", false},
+		{"example.com/x", "align64", false},
+	} {
+		n := types.NewNamed(types.NewTypeName(token.NoPos, types.NewPackage(tc.path, "p"), tc.name, nil), types.NewStruct(nil, nil), nil)
+		if got := isAlign64(n); got != tc.want {
+			t.Errorf("isAlign64(%s.%s) = %v, want %v", tc.path, tc.name, got, tc.want)
+		}
+	}
+	if isAlign64(types.Universe.Lookup("error").Type()) {
+		t.Error("isAlign64(error) = true, want false")
+	}
 }
 
 // TestDeclSourceReorderableAt pins how a declaration is judged from its source

@@ -8,8 +8,10 @@ package betteralign_test
 import (
 	"bytes"
 	"fmt"
+	"go/build"
 	"maps"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -84,6 +86,7 @@ func NewTestAnalyzer() *analysis.Analyzer {
 // SuggestedFixes, once applied, reproduce the -apply goldens: the two rewrite
 // paths must agree.
 func TestSuggestions(t *testing.T) {
+	skipUnless64Bit(t)
 	testdata := analysistest.TestData()
 	analyzer := NewTestAnalyzer()
 	results := analysistest.RunWithSuggestedFixes(t, testdata, analyzer, "a")
@@ -147,6 +150,7 @@ func assertRawFixesMatchGolden(t *testing.T, results []*analysistest.Result, pkg
 // diagnostic; the pre-1.26 "bytes saved" wording is covered by TestSuggestions.
 // Skips on 32-bit arches, where the fixture's uintptr math no longer holds.
 func TestGreenTeaWording(t *testing.T) {
+	skipUnless64Bit(t)
 	if runtime.GOARCH != "amd64" && runtime.GOARCH != "arm64" {
 		t.Skipf("pointer-bytes fixture assumes 64-bit word size, GOARCH=%s", runtime.GOARCH)
 	}
@@ -161,12 +165,14 @@ func TestGreenTeaWording(t *testing.T) {
 // non-generic struct and a generic struct whose fields have fixed layout (a
 // pointer to the type param) are still reported.
 func TestGenericLayoutSuppressed(t *testing.T) {
+	skipUnless64Bit(t)
 	testdata := analysistest.TestData()
 	analyzer := NewTestAnalyzer()
 	analysistest.Run(t, testdata, analyzer, "generics")
 }
 
 func TestApply(t *testing.T) {
+	skipUnless64Bit(t)
 	srcDir := filepath.Join("testdata", "src")
 	workDir := filepath.Join(srcDir, "a")
 
@@ -529,6 +535,7 @@ func TestApplyRewritesWhenTestFileBuildExcluded(t *testing.T) {
 }
 
 func TestFlagExcludeDirs(t *testing.T) {
+	skipUnless64Bit(t)
 	t.Run("exclude none", func(t *testing.T) {
 		testdata := analysistest.TestData()
 		analyzer := NewTestAnalyzer()
@@ -576,6 +583,7 @@ func TestFlagExcludeDirs(t *testing.T) {
 }
 
 func TestFlagExcludeFiles(t *testing.T) {
+	skipUnless64Bit(t)
 	t.Run("exclude b", func(t *testing.T) {
 		testdata := analysistest.TestData()
 		analyzer := NewTestAnalyzer()
@@ -586,6 +594,7 @@ func TestFlagExcludeFiles(t *testing.T) {
 }
 
 func TestFlagOptInMode(t *testing.T) {
+	skipUnless64Bit(t)
 	t.Run("opt-in enabled, one bad struct opted in and another bad struct not opted in", func(t *testing.T) {
 		testdata := analysistest.TestData()
 		analyzer := NewTestAnalyzer()
@@ -601,6 +610,42 @@ func TestFlagOptInMode(t *testing.T) {
 		_ = analyzer.Flags.Set("opt_in", "true")
 		analysistest.Run(t, testdata, analyzer, "optin/grouped")
 	})
+}
+
+// TestCgoFileNotRewritten pins that -generated_files reports a cgo file's
+// struct without a fix: the file go/packages parses is cgo's output in the
+// build cache, so a rewrite would change the cache and leave the source as is.
+func TestCgoFileNotRewritten(t *testing.T) {
+	skipUnlessCgo(t)
+	analyzer := NewTestAnalyzer()
+	_ = analyzer.Flags.Set("generated_files", "true")
+	for _, r := range analysistest.Run(t, analysistest.TestData(), analyzer, "cgofile") {
+		for _, d := range r.Diagnostics {
+			if len(d.SuggestedFixes) != 0 {
+				t.Errorf("fix attached to cgo output: %s", d.Message)
+			}
+		}
+	}
+}
+
+// TestCgoPartnerPinsConversion pins the prediction for a conversion partner
+// declared in a cgo file: no run rewrites it, so the local side must not move.
+func TestCgoPartnerPinsConversion(t *testing.T) {
+	skipUnlessCgo(t)
+	analysistest.Run(t, analysistest.TestData(), NewTestAnalyzer(), "cgofile/user")
+}
+
+// TestRefusedPartnerPinsConversion pins the prediction for a conversion
+// partner whose shape dstmin refuses: it stays as declared, so the local side
+// must too.
+func TestRefusedPartnerPinsConversion(t *testing.T) {
+	analysistest.Run(t, analysistest.TestData(), NewTestAnalyzer(), "xrefuse/...")
+}
+
+// TestLineDirectivePartnerPinsConversion pins that a partner's declaration is
+// judged from the file it is really in, not the one a //line directive names.
+func TestLineDirectivePartnerPinsConversion(t *testing.T) {
+	analysistest.Run(t, analysistest.TestData(), NewTestAnalyzer(), "xline/user")
 }
 
 func TestFlagTestFiles(t *testing.T) {
@@ -696,6 +741,7 @@ func TestPositionalLiteralSuppressesReorder(t *testing.T) {
 // to multi-line, which is decoratable and would silently void the regression
 // guard. Generating it on the fly keeps the un-formattable shape intact.
 func TestSingleLineStructReported(t *testing.T) {
+	skipUnless64Bit(t)
 	srcDir := filepath.Join("testdata", "src")
 	tmpDir, err := os.MkdirTemp(srcDir, "singleline-test")
 	if err != nil {
@@ -750,6 +796,21 @@ func TestApplyLayoutPins(t *testing.T) {
 			t.Fatal(err)
 		}
 		golden.Assert(t, string(got), filepath.Join("src", "layoutpin", filepath.Base(path)+".golden"))
+	}
+}
+
+// skipUnlessCgo skips fixtures that need cmd/cgo and a C compiler.
+func skipUnlessCgo(t *testing.T) {
+	t.Helper()
+	if !build.Default.CgoEnabled {
+		t.Skip("cgo disabled")
+	}
+	cc, err := exec.Command("go", "env", "CC").Output()
+	if err != nil {
+		t.Skipf("go env CC: %v", err)
+	}
+	if _, err := exec.LookPath(strings.Fields(string(cc) + " cc")[0]); err != nil {
+		t.Skipf("no C compiler: %v", err)
 	}
 }
 
@@ -865,6 +926,7 @@ func wantLayoutPinDiff(t *testing.T, paths []string, tmpDir string) string {
 // TestApplyDiff pins -apply -diff: the rewrite is printed as a unified diff
 // matching the -apply golden output, and no file is written.
 func TestApplyDiff(t *testing.T) {
+	skipUnless64Bit(t)
 	got, paths, tmpDir := runDiffMode(t, func(a *analysis.Analyzer) {
 		var d bool
 		a.Flags.BoolVar(&d, "diff", false, "host-registered -diff (test harness only)")
@@ -884,6 +946,7 @@ func TestApplyDiff(t *testing.T) {
 // the fixes and never writes. The analyzer must therefore stay silent and
 // leave the files alone even with -apply also set (runDiffMode checks disk).
 func TestFixDiffGlobalFlags(t *testing.T) {
+	skipUnless64Bit(t)
 	got, _, _ := runDiffMode(t, func(a *analysis.Analyzer) {
 		_ = a.Flags.Set("apply", "true")
 		*betteralign.FixGlobalFlag = true
@@ -901,6 +964,7 @@ func TestFixDiffGlobalFlags(t *testing.T) {
 // TestDiffWithoutApply pins that -diff alone stays report-only: it neither
 // prints a diff nor writes files, matching the driver's "-diff needs -fix".
 func TestDiffWithoutApply(t *testing.T) {
+	skipUnless64Bit(t)
 	got, _, _ := runDiffMode(t, func(a *analysis.Analyzer) {
 		var d bool
 		a.Flags.BoolVar(&d, "diff", false, "host-registered -diff (test harness only)")
@@ -914,6 +978,7 @@ func TestDiffWithoutApply(t *testing.T) {
 // TestApplyDiffJSON pins that under -json the diff goes to the stderr sink,
 // leaving stdout to the driver's JSON, and is otherwise the same diff.
 func TestApplyDiffJSON(t *testing.T) {
+	skipUnless64Bit(t)
 	out, jsonOut, paths, tmpDir := runDiffModeJSON(t, func(a *analysis.Analyzer) {
 		var d, j bool
 		a.Flags.BoolVar(&d, "diff", false, "host-registered -diff (test harness only)")
@@ -963,6 +1028,7 @@ func TestFixWithGeneratedFiles(t *testing.T) {
 // never sees them, so a reorder broke that platform's build or, with
 // compatible field types, silently re-mapped its values.
 func TestOtherBuildPositional(t *testing.T) {
+	skipUnless64Bit(t)
 	analysistest.Run(t, analysistest.TestData(), NewTestAnalyzer(), "otherbuild")
 }
 
@@ -971,6 +1037,7 @@ func TestOtherBuildPositional(t *testing.T) {
 // though go/build's defaults would include it, so the excluded files must be
 // the load's own (pass.IgnoredFiles).
 func TestOtherBuildPositionalNegatedTag(t *testing.T) {
+	skipUnless64Bit(t)
 	t.Setenv("GOFLAGS", "-tags=betteralign_set")
 	analysistest.Run(t, analysistest.TestData(), NewTestAnalyzer(), "otherbuild")
 }
@@ -979,6 +1046,7 @@ func TestOtherBuildPositionalNegatedTag(t *testing.T) {
 // an inner struct the run rewrites is measured at its new layout, one it
 // leaves alone (ignored, single-line, generated) as declared.
 func TestNested(t *testing.T) {
+	skipUnless64Bit(t)
 	analysistest.Run(t, analysistest.TestData(), NewTestAnalyzer(), "nested")
 }
 
@@ -1099,6 +1167,7 @@ func TestNestedConversionStaysInStep(t *testing.T) {
 // column 0 ("unknown"), and measuring an enclosing struct read its
 // declaration with that column and panicked, killing the run.
 func TestLineDirectiveWithoutColumn(t *testing.T) {
+	skipUnless64Bit(t)
 	root := t.TempDir()
 	dir := filepath.Join(root, "src", "linedir")
 	if err := os.MkdirAll(dir, 0o750); err != nil {

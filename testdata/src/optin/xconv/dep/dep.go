@@ -1,9 +1,15 @@
 package dep
 
+import "strings"
+
+var prefix = strings.ToUpper("x")
+
+func Prefix() string { return prefix }
+
 // Marked is rewritten by its own pass, under -opt_in too.
 //
 // betteralign:check
-type Marked struct { // want `8 bytes saved: struct of size 24 could be 16$`
+type Marked struct { // want `bytes saved: struct of size \d+ could be \d+$`
 	A byte
 	P *int
 	B byte

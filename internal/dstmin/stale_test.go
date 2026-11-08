@@ -30,6 +30,8 @@ func TestDecorateFileRejectsStaleSource(t *testing.T) {
 		// Two fields swapped: same length, every offset after the first field
 		// now points at different bytes.
 		"same length": "package p\n\ntype S struct {\n\tb int64\n\ta bool\n\tc bool\n}\n",
+		// Every identifier in place, only the closing brace moved.
+		"brace moved": "package p\n\ntype S struct {\n\ta bool\n\tb int64\n\tc bool\n\n}",
 	} {
 		t.Run(name, func(t *testing.T) {
 			if name == "same length" && len(edited) != len(orig) {
@@ -107,5 +109,22 @@ func TestDecorateFileRereadsForNewParse(t *testing.T) {
 	out := reverseFirstStructInto(t, NewDecorator(fset), second)
 	if !strings.Contains(out, "// new") || strings.Contains(out, "// old") {
 		t.Errorf("reprint of the new parse used stale bytes:\n%s", out)
+	}
+}
+
+// TestDecorateFileNoTrailingNewline pins the bound of sourceMatchesAST: a
+// file whose very last byte is a struct's closing brace still matches.
+func TestDecorateFileNoTrailingNewline(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "p.go")
+	if err := os.WriteFile(path, []byte("package p\n\ntype S struct {\n\ta bool\n}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, path, nil, parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewDecorator(fset).DecorateFile(f); err != nil {
+		t.Fatalf("DecorateFile: %v", err)
 	}
 }

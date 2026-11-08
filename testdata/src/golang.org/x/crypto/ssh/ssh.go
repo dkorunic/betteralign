@@ -1,6 +1,9 @@
-// Package ssh stubs the two golang.org/x/crypto/ssh functions the layoutpin
-// fixture calls; only their import path and names matter to the analyzer.
+// Package ssh stubs what the layoutpin fixture uses of golang.org/x/crypto/ssh;
+// only import paths and names matter to the analyzer.
 package ssh
+
+// Counter stands in for any package-level variable of an imported package.
+var Counter int64
 
 func Marshal(msg any) []byte { return nil }
 

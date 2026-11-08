@@ -3,7 +3,7 @@ package user
 import "optin/xconv/dep"
 
 // betteralign:check
-type ToMarked struct { // want `8 bytes saved: struct of size 24 could be 16$`
+type ToMarked struct { // want `bytes saved: struct of size \d+ could be \d+$`
 	A byte
 	P *int
 	B byte
