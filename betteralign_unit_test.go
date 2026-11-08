@@ -19,6 +19,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -3244,21 +3245,23 @@ func TestDeclSourceEmbeddedFirstField(t *testing.T) {
 
 // TestWriteDiffRelativePaths pins -apply -diff's file names: relative to the
 // working directory when under it, so `patch -p0` and `git apply -p0` take
-// the diff; absolute otherwise.
+// the diff; absolute otherwise. Separators are slashes on every platform, so
+// a diff made on Windows applies with git apply.
 func TestWriteDiffRelativePaths(t *testing.T) {
 	wd, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
 	}
 	var buf strings.Builder
-	writeDiff(&buf, filepath.Join(wd, "x", "f.go"), []byte("a\nb\n"), []byte("b\na\n"))
-	rel := filepath.Join("x", "f.go")
+	writeDiff(&buf, filepath.Join(wd, "x", "y", "f.go"), []byte("a\nb\n"), []byte("b\na\n"))
+	rel := "x/y/f.go"
 	if got, want := buf.String(), "diff "+rel+".orig "+rel+"\n--- "+rel+".orig\n+++ "+rel+"\n"; !strings.HasPrefix(got, want) {
 		t.Errorf("header = %q, want prefix %q", got, want)
 	}
 	buf.Reset()
 	out := filepath.Join(filepath.Dir(wd), "elsewhere", "f.go")
 	writeDiff(&buf, out, []byte("a\nb\n"), []byte("b\na\n"))
+	out = filepath.ToSlash(out)
 	if got := buf.String(); !strings.HasPrefix(got, "diff "+out+".orig "+out+"\n") {
 		t.Errorf("header for a file outside wd = %q, want it absolute", got)
 	}
@@ -3302,5 +3305,50 @@ func TestCLIDriverFlags(t *testing.T) {
 	fs.Int("c", -1, "")
 	if !cliDriverFlags(fs) {
 		t.Error("the driver's flag set not recognised")
+	}
+}
+
+// TestEmbeddedNameIndexList pins that a multi-argument generic embed
+// (P[bool, bool]) is located by its type name.
+func TestEmbeddedNameIndexList(t *testing.T) {
+	ds := newDeclSource("t.go", []byte("package p\n\ntype P[A, B any] struct {\n\ta A\n\tb B\n}\n\ntype In struct {\n\tP[bool, bool]\n\tx int64\n\ty bool\n}\n"))
+	if _, ok := ds.at(9, "P"); !ok {
+		t.Error("embedded P[bool, bool] not found by name P")
+	}
+}
+
+// TestScanTestDirSkipsUnreadable pins that scanTestDir drops a *_test.go it
+// can't read: a directory of that name and a dangling symlink.
+func TestScanTestDirSkipsUnreadable(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "x_test.go"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" {
+		if err := os.Symlink("missing", filepath.Join(dir, "q_test.go")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := scanTestDir(dir); len(got) != 0 {
+		t.Errorf("scanTestDir = %+v, want nothing", got)
+	}
+}
+
+// TestDeclSourceFirstSpecPerLine pins that of two structs whose first fields
+// share a line, the first declared one owns the line.
+func TestDeclSourceFirstSpecPerLine(t *testing.T) {
+	ds := newDeclSource("t.go", []byte("package p\n\ntype A struct{ a int }; type B struct{ b int }\n"))
+	if _, ok := ds.at(3, "a"); !ok {
+		t.Error("first struct on the line not found")
+	}
+	if _, ok := ds.at(3, "b"); ok {
+		t.Error("second struct on the line found; the first should own it")
+	}
+}
+
+// TestTestFilesInDirMissing pins that a non-existent directory has no test files.
+func TestTestFilesInDirMissing(t *testing.T) {
+	if got := testFilesInDir(filepath.Join(t.TempDir(), "missing")); got != nil {
+		t.Errorf("testFilesInDir = %+v, want nil", got)
 	}
 }

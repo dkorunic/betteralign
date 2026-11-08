@@ -833,13 +833,15 @@ var (
 // lock keeps whole-file diffs from interleaving across concurrent passes.
 // Paths under the working directory are printed relative to it, as gofmt
 // prints what it was given, so `patch -p0` and `git apply -p0` take the diff
-// (both refuse an absolute name).
+// (both refuse an absolute name). Unlike gofmt, separators are always
+// slashes, so a diff made on Windows applies with git apply.
 func writeDiff(w io.Writer, fn string, orig, rewritten []byte) {
 	if wd, err := os.Getwd(); err == nil {
 		if rel, err := filepath.Rel(wd, fn); err == nil && filepath.IsLocal(rel) {
 			fn = rel
 		}
 	}
+	fn = filepath.ToSlash(fn)
 	d := diff.Diff(fn+".orig", orig, fn, rewritten)
 	if d == nil {
 		return
