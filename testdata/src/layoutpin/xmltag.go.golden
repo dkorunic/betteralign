@@ -1,0 +1,34 @@
+package layoutpin
+
+// encoding/xml writes child elements in field order, which the document's
+// schema usually fixes, and the marshal call is usually elsewhere (behind an
+// interface, in another package): a struct tagged for it, or holding one by
+// value, is skipped outright, like ASN.1.
+type xmlProp struct {
+	XOK   bool  `xml:"ok"`
+	XSize int64 `xml:"size"`
+	XLast bool  `xml:"last"`
+}
+
+// Holds tagged structs as slice elements: marshalled with them.
+type xmlHolder struct {
+	xa     bool
+	xprops []xmlProp
+	xn     int64
+	xb     bool
+}
+
+// Holds one through a pointer only: not marked, still reordered.
+type xmlByPtr struct { // want `struct of size 24 could be 16$`
+	pp *xmlProp
+	pa bool
+	pb bool
+}
+
+// encoding/json's key order is field order too, but rarely a contract: not
+// pinned (a Doc caveat).
+type jsonOnly struct { // want `struct of size 24 could be 16$`
+	JB int64 `json:"b"`
+	JA bool  `json:"a"`
+	JC bool  `json:"c"`
+}

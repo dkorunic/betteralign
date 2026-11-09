@@ -16,6 +16,7 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -146,6 +147,21 @@ func TestGcSizesAlign64Marker(t *testing.T) {
 		}, nil)
 		if got := sizes32.Sizeof(mixed); got != 24 {
 			t.Errorf("%s: Sizeof(struct{bool; Int64; bool}) on 386 = %d, want 24", path, got)
+		}
+		// The marker itself is 8-aligned (as in go/types), so a struct
+		// holding it rounds its size up to 8 too: special-cased only per
+		// field, the size kept the fields' 4 and came out 12.
+		marked := types.NewStruct([]*types.Var{
+			types.NewField(token.NoPos, pkg, "_", align64, false),
+			types.NewField(token.NoPos, pkg, "a", types.Typ[types.Int32], false),
+			types.NewField(token.NoPos, pkg, "v", types.Typ[types.Int64], false),
+		}, nil)
+		gc386 := types.SizesFor("gc", "386")
+		if got, want := sizes32.Sizeof(marked), gc386.Sizeof(marked); got != 16 || got != want {
+			t.Errorf("%s: Sizeof(struct{_ align64; a int32; v int64}) on 386 = %d, want 16 (go/types %d)", path, got, want)
+		}
+		if got, want := sizes32.Alignof(marked), gc386.Alignof(marked); got != 8 || got != want {
+			t.Errorf("%s: Alignof(struct{_ align64; a int32; v int64}) on 386 = %d, want 8 (go/types %d)", path, got, want)
 		}
 	}
 
@@ -2049,11 +2065,22 @@ func TestNormalizeExcludePathsRejectsBadPattern(t *testing.T) {
 		t.Run(flagName, func(t *testing.T) {
 			analyzer := &analysis.Analyzer{Name: Analyzer.Name, Doc: Analyzer.Doc, Requires: Analyzer.Requires}
 			InitAnalyzer(analyzer)
-			_ = analyzer.Flags.Set(flagName, "[")
+			// Rejected at parse time: under -fix the driver never reads the
+			// pass error below, so the run would exit 0 having fixed nothing.
+			if err := analyzer.Flags.Set(flagName, "["); !errors.Is(err, filepath.ErrBadPattern) {
+				t.Errorf("-%s '[': Set = %v, want ErrBadPattern", flagName, err)
+			}
+			if filepath.Separator != '/' {
+				return
+			}
+			// Valid until cleaned (see above): the run's own check.
+			if err := analyzer.Flags.Set(flagName, "foo\\/"); err != nil {
+				t.Fatal(err)
+			}
 			rec := &msgRecorder{}
 			analysistest.Run(rec, analysistest.TestData(), analyzer, "a")
 			if !slices.ContainsFunc(rec.msgs, func(m string) bool { return strings.Contains(m, "syntax error in pattern") }) {
-				t.Errorf("-%s '[': the run did not fail; got %q", flagName, rec.msgs)
+				t.Errorf("-%s 'foo\\/': the run did not fail; got %q", flagName, rec.msgs)
 			}
 		})
 	}
@@ -2383,8 +2410,10 @@ func TestRewritePanicKeepsDiagnostics(t *testing.T) {
 	if strconv.IntSize != 64 {
 		t.Skip("fixture assumes 64-bit word size")
 	}
-	for name, inject := range map[string]func(){
-		"decorate": func() {
+	// The injection's cleanup is the subtest's, so one case's panic never
+	// leaks into the next (map order once let "decorate" shadow "reprint").
+	for name, inject := range map[string]func(*testing.T){
+		"decorate": func(t *testing.T) {
 			saved := decorateFile
 			decorateFile = func(dec *dst.Decorator, f *ast.File) (df *dst.File, err error) {
 				defer recoverRewrite(&err)
@@ -2392,7 +2421,7 @@ func TestRewritePanicKeepsDiagnostics(t *testing.T) {
 			}
 			t.Cleanup(func() { decorateFile = saved })
 		},
-		"reprint": func() {
+		"reprint": func(t *testing.T) {
 			saved := reprint
 			reprint = func(df *dst.File) (out []byte, edits []dst.BodyEdit, err error) {
 				defer recoverRewrite(&err)
@@ -2402,7 +2431,7 @@ func TestRewritePanicKeepsDiagnostics(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			inject()
+			inject(t)
 			analyzer := &analysis.Analyzer{Name: Analyzer.Name, Doc: Analyzer.Doc, Requires: Analyzer.Requires}
 			InitAnalyzer(analyzer)
 			// The "a" fixture's // want annotations must all still match.
@@ -3027,10 +3056,15 @@ func TestDeferToTestVariantLazyParse(t *testing.T) {
 
 // TestDeferToTestVariantSkips pins what does not defer: an external p_test
 // package (loads separately, never rewrites p), a test file no build compiles
-// (//go:build ignore) or this load excluded (pass.IgnoredFiles: another GOOS,
-// an unset tag), files the go command ignores (_x, .x), and any test file
-// under the driver's -test=false, which loads no variant to defer to.
+// (//go:build ignore, or a legacy // +build ignore without a //go:build line)
+// or this load excluded (pass.IgnoredFiles: another GOOS, an unset tag), files
+// the go command ignores (_x, .x), any test file under the driver's
+// -test=false, which loads no variant to defer to. A directory holding an
+// in-package test with a syntax error is never rewritten, whatever else holds.
 func TestDeferToTestVariantSkips(t *testing.T) {
+	saved := deferNoteOut
+	deferNoteOut = io.Discard // the broken-test-file note
+	defer func() { deferNoteOut = saved }()
 	for _, tc := range []struct {
 		files   map[string]string
 		name    string
@@ -3041,6 +3075,17 @@ func TestDeferToTestVariantSkips(t *testing.T) {
 		{name: "in-package test", files: map[string]string{"p_test.go": "package p\n"}, want: true},
 		{name: "external test", files: map[string]string{"p_ext_test.go": "package p_test\n"}},
 		{name: "build ignore", files: map[string]string{"q_test.go": "//go:build ignore\n\npackage p\n"}},
+		// The go command still honours a legacy +build line when no
+		// //go:build line is present; one that is present wins.
+		{name: "legacy +build ignore", files: map[string]string{"q_test.go": "// +build ignore\n\npackage p\n"}},
+		{name: "go:build over +build ignore", files: map[string]string{"q_test.go": "//go:build linux || !linux\n// +build ignore\n\npackage p\n"}, want: true},
+		// A test file that doesn't parse fails the variant, which the driver
+		// skips: no pass rewrites, not even under -test=false (brokenTest).
+		{name: "syntax error", files: map[string]string{"p_test.go": "package p\n\nfunc {\n"}, want: true},
+		{name: "syntax error beside a valid test", files: map[string]string{"p_test.go": "package p\n", "q_test.go": "package p\n\nfunc {\n"}, want: true},
+		{name: "syntax error under -test=false", files: map[string]string{"q_test.go": "package p\n\nfunc {\n"}, noTest: true, want: true},
+		{name: "syntax error load excluded", files: map[string]string{"w_windows_test.go": "package p\n\nfunc {\n"}, ignored: []string{"w_windows_test.go"}, want: true},
+		{name: "syntax error in external test", files: map[string]string{"p_ext_test.go": "package p_test\n\nfunc {\n"}},
 		{name: "load excluded", files: map[string]string{"w_windows_test.go": "package p\n"}, ignored: []string{"w_windows_test.go"}},
 		{name: "-test=false", files: map[string]string{"p_test.go": "package p\n"}, noTest: true},
 		{name: "go command ignores", files: map[string]string{"_x_test.go": "package p\n", ".y_test.go": "package p\n"}},
@@ -3071,6 +3116,9 @@ func TestDeferToTestVariantSkips(t *testing.T) {
 // in neither Files nor IgnoredFiles; the variant deferred as well, and no pass
 // ever offered the fix.
 func TestDeferToTestVariantVariantOwnsRewrite(t *testing.T) {
+	saved := deferNoteOut
+	deferNoteOut = io.Discard // the broken-test-file note
+	defer func() { deferNoteOut = saved }()
 	dir := t.TempDir()
 	writeTestFiles(t, dir, map[string]string{
 		"p.go":              "package p\n",
@@ -3083,6 +3131,12 @@ func TestDeferToTestVariantVariantOwnsRewrite(t *testing.T) {
 	}
 	if deferToTestVariant(basePass(t, fset, dir, "p.go", "p_test.go")) {
 		t.Error("variant deferred with IgnoredFiles nil and w_windows_test.go on disk")
+	}
+	// Except beside a test file that doesn't parse: the driver skips such a
+	// variant, but a host running it anyway must agree with the base pass.
+	writeTestFiles(t, dir, map[string]string{"q_test.go": "package p\n\nfunc {\n"})
+	if !deferToTestVariant(basePass(t, fset, dir, "p.go", "p_test.go")) {
+		t.Error("variant kept the rewrite beside q_test.go, which does not parse")
 	}
 }
 
@@ -3223,6 +3277,97 @@ func TestIsASN1Type(t *testing.T) {
 			if got := isASN1Type(typ); got != want {
 				t.Errorf("isASN1Type(%s) = %v, want %v", typ, got, want)
 			}
+		}
+	}
+}
+
+// TestScanAsmRefs pins what counts as the assembly referencing a Go symbol
+// of its own package: a bare ·name(SB), with an ABI selector or an offset,
+// at its first position; not another package's (runtime·f, internal∕cpu·X86),
+// not a definition (TEXT, DATA, GLOBL), not a comment, not a file under
+// //go:build ignore.
+func TestScanAsmRefs(t *testing.T) {
+	src := "#include \"textflag.h\"\n" +
+		"TEXT ·stub(SB), NOSPLIT, $0-8\n" +
+		"\tCALL ·cb(SB) // CALL ·commented(SB)\n" +
+		"\tMOVQ ·v+8(SB), AX\n" +
+		"\tMOVQ $·abi<ABIInternal>(SB), AX\n" +
+		"\tCALL runtime·other(SB)\n" +
+		"\tCMPB internal∕cpu·X86+const_off(SB), $1\n" +
+		"DATA ·tab+0(SB)/8, $0\n" +
+		"GLOBL ·tab(SB), RODATA, $8\n" +
+		"\tCALL ·cb(SB)\n"
+	got := scanAsmRefs("a.s", []byte(src))
+	want := map[string]string{"cb": "a.s:3:7", "v": "a.s:4:7", "abi": "a.s:5:8"}
+	if len(got) != len(want) {
+		t.Errorf("refs = %v, want %v", got, want)
+	}
+	for name, at := range want {
+		if got[name] != at {
+			t.Errorf("ref %s at %q, want %q (all: %v)", name, got[name], at, got)
+		}
+	}
+	if got := scanAsmRefs("a.s", []byte("//go:build ignore\n\n\tCALL ·cb(SB)\n")); got != nil {
+		t.Errorf("//go:build ignore file referenced %v", got)
+	}
+}
+
+// TestScanOtherBuildPushAndFuncs pins the excluded-file records behind the
+// linkname-push and assembly-reference pins: a function with a body enters
+// asm only with a two-argument directive, exported operands included (the
+// pin decides, knowing the imports), and records whether the file imports
+// the target's package; every top-level function and func-typed variable, aliases of a
+// function included, lists its operand type names.
+func TestScanOtherBuildPushAndFuncs(t *testing.T) {
+	src := "package p\n\nimport (\n\t_ \"example.com/imp\"\n\t_ \"unsafe\"\n)\n\n" +
+		"//go:linkname push other.decl\nfunc push(a *mirror, e *Exported) {}\n\n" +
+		"//go:linkname pushImp example.com/imp.decl\nfunc pushImp(i *impT) {}\n\n" +
+		"func plain(b []plainT) {}\n\n" +
+		"var typed func(c *typedT)\n\nvar alias = plain\n"
+	s := scanOtherBuildSrc("t.go", []byte(src))
+	for _, name := range []string{"mirror", "Exported"} {
+		if stubs := s.asm[name]; len(stubs) != 1 || !stubs[0].push || stubs[0].link != "other.decl" || stubs[0].imported {
+			t.Errorf("push stub for %s = %+v", name, stubs)
+		}
+	}
+	if stubs := s.asm["impT"]; len(stubs) != 1 || !stubs[0].imported {
+		t.Errorf("push stub into an imported package = %+v", stubs)
+	}
+	if _, ok := s.asm["plainT"]; ok {
+		t.Error("a function with a body and no directive was recorded as a stub")
+	}
+	for name, want := range map[string]string{"push": "mirror", "plain": "plainT", "typed": "typedT", "alias": "plainT"} {
+		if !slices.Contains(s.funcs[name], want) {
+			t.Errorf("funcs[%s] = %v, want it to hold %s", name, s.funcs[name], want)
+		}
+	}
+}
+
+// TestToolchainLayoutList pins the deny-list's shape: a listed package fixes
+// every struct, testing only the four types the generated test main builds,
+// matched as the declared struct (a defined type over one shares it); a
+// struct declared elsewhere, or with no field, is not fixed.
+func TestToolchainLayoutList(t *testing.T) {
+	field := func(pkg *types.Package, name string) *types.Struct {
+		return types.NewStruct([]*types.Var{types.NewField(token.NoPos, pkg, name, types.Typ[types.Int], false)}, nil)
+	}
+	rt := types.NewPackage("runtime", "runtime")
+	testing_ := types.NewPackage("testing", "testing")
+	internal := field(testing_, "Name")
+	testing_.Scope().Insert(types.NewTypeName(token.NoPos, testing_, "InternalTest", nil))
+	types.NewNamed(testing_.Scope().Lookup("InternalTest").(*types.TypeName), internal, nil)
+	for i, tc := range []struct {
+		st   *types.Struct
+		want bool
+	}{
+		{field(rt, "x"), true},
+		{internal, true},
+		{field(testing_, "Name"), false},
+		{field(types.NewPackage("example.com/runtime", "runtime"), "x"), false},
+		{types.NewStruct(nil, nil), false},
+	} {
+		if got := toolchainLayout(tc.st); got != tc.want {
+			t.Errorf("case %d: toolchainLayout(%s) = %v, want %v", i, tc.st, got, tc.want)
 		}
 	}
 }

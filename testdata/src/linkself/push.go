@@ -1,0 +1,64 @@
+package linkself
+
+import (
+	"errors"
+	"unsafe"
+)
+
+// A function with a body that a two-argument //go:linkname pushes into
+// another package implements that package's body-less declaration
+// (runtime.reflect_rselect is reflect.rselect), whose own struct types this
+// one's mirror: pinned, as the declaration's side is there.
+type pushCase struct { // want `reorder skipped: //go:linkname at .*push.go:19:`
+	dir int8
+	ch  unsafe.Pointer
+	val unsafe.Pointer
+}
+
+//go:linkname pushSelect linkselfx.rselect
+func pushSelect(cases []pushCase) int { return len(cases) }
+
+// An exported operand is the same type on both sides (testing/synctest's
+// testingSynctestTest takes *testing.T): it follows a reorder, not pinned.
+type PushShared struct { // want `struct of size 24 could be 16$`
+	SA bool
+	SB int64
+	SC bool
+}
+
+//go:linkname pushShared linkselfx.pushShared
+func pushShared(s *PushShared) int { return int(s.SB) }
+
+// Pushed into this same package, or exported by a one-argument directive:
+// no mirror declaration, still reordered.
+type pushSelfArgs struct { // want `struct of size 24 could be 16$`
+	ya bool
+	yb int64
+	yc bool
+}
+
+//go:linkname pushSelf linkself.pushSelf
+func pushSelf(a *pushSelfArgs) int { return int(a.yb) }
+
+type pushOneArg struct { // want `struct of size 24 could be 16$`
+	za bool
+	zb int64
+	zc bool
+}
+
+//go:linkname pushExport
+func pushExport(a *pushOneArg) int { return int(a.zb) }
+
+// Pushed into a package this one imports, which can't import it back to name
+// the type and declares a mirror instead (package a pushing into its import
+// b): pinned although exported.
+type PushImported struct { // want `reorder skipped: //go:linkname at .*push.go:62:`
+	IA bool
+	IB int64
+	IC bool
+}
+
+//go:linkname pushImported errors.pushImported
+func pushImported(s *PushImported) int { return int(s.IB) }
+
+var _ = errors.New

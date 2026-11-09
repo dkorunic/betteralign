@@ -159,6 +159,11 @@ func sourceMatchesAST(f *ast.File, tf *token.File, src []byte) bool {
 		switch n := n.(type) {
 		case *ast.Ident:
 			ok = at(n.NamePos, n.Name)
+		case *ast.BasicLit:
+			// A same-length edit to a tag or array length the host parsed
+			// but the disk doesn't hold (gopls' unsaved buffer) would be
+			// reverted by a fix cut from the disk bytes.
+			ok = at(n.ValuePos, n.Value)
 		case *ast.StructType:
 			if n.Fields != nil {
 				ok = at(n.Fields.Opening, "{") && at(n.Fields.Closing, "}")

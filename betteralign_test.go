@@ -8,7 +8,6 @@ package betteralign_test
 import (
 	"bytes"
 	"fmt"
-	"go/build"
 	"maps"
 	"os"
 	"os/exec"
@@ -326,6 +325,42 @@ func TestApplyAttachesNoFixes(t *testing.T) {
 	}
 }
 
+// TestApplyWriteFailureFailsPass pins that a write -apply can't make fails
+// the pass (exit 1), instead of a stderr line and a run indistinguishable
+// from one that only reported. applyToFile refuses a symlink.
+func TestApplyWriteFailureFailsPass(t *testing.T) {
+	skipUnless64Bit(t)
+	tmpDir, err := os.MkdirTemp(filepath.Join("testdata", "src"), "symlink-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(tmpDir) })
+	pkgDir := filepath.Join(tmpDir, "symlink")
+	if err := os.Mkdir(pkgDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	const src = "package symlink\n\ntype T struct {\n\ta bool\n\tb int64\n\tc bool\n}\n"
+	target := filepath.Join(t.TempDir(), "p.go")
+	if err := os.WriteFile(target, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(pkgDir, "p.go")); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	analyzer := NewTestAnalyzer()
+	_ = analyzer.Flags.Set("apply", "true")
+	rec := &errorRecorder{}
+	analysistest.Run(rec, analysistest.TestData(), analyzer, filepath.Join(filepath.Base(tmpDir), "symlink"))
+	if !slices.ContainsFunc(rec.msgs, func(m string) bool {
+		return strings.Contains(m, "error analyzing") && strings.Contains(m, "error applying fixes to")
+	}) {
+		t.Errorf("failed write did not fail the pass; got %q", rec.msgs)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != src {
+		t.Errorf("symlink target changed (err %v):\n%s", err, got)
+	}
+}
+
 // countFixes counts the SuggestedFixes across all results.
 func countFixes(results []*analysistest.Result) int {
 	n := 0
@@ -501,6 +536,7 @@ func TestApplyDefersPositionalLiteralInTestFile(t *testing.T) {
 // diagnostic stays; no fix, no write, and nothing on stderr (expected, not an
 // error), even under -apply. Pure CRLF behaves the same.
 func TestCarriageReturnFileReportOnly(t *testing.T) {
+	skipUnless64Bit(t)
 	const body = "type T struct { // want `8 bytes saved: struct of size 24 could be 16`\n\ta bool\n\tb int64\n\tc bool\n}\n"
 	for name, src := range map[string]string{
 		"mixed": "package crlf\r\n\n" + body,
@@ -905,10 +941,59 @@ func TestLayoutPins(t *testing.T) {
 // a pull whose target is in the package itself, Go compiled against the real
 // layout, keeps its fix (matching the golden); a pull from another package
 // stays pinned. Analyzed in place, since the target names the package path.
+// push.go: a function with a body pushed into another package mirrors that
+// declaration's unexported operand types (pinned); exported ones, pushes into
+// this package and one-argument directives keep their fixes.
 func TestLinknameSelf(t *testing.T) {
 	skipUnless64Bit(t)
 	results := analysistest.RunWithSuggestedFixes(t, analysistest.TestData(), NewTestAnalyzer(), "linkself")
 	assertRawFixesMatchGolden(t, results, "linkself")
+}
+
+// TestAsmCallback pins the assembly-reference pin: a Go function the
+// package's assembly calls (·name(SB)), a func-typed variable it calls
+// through and a variable it reads keep their operands' layout, also from a
+// .s file this build excludes and for a callback declared only in an
+// excluded .go file; another package's symbol, a comment and a file under
+// //go:build ignore pin nothing, and those structs keep their fixes.
+func TestAsmCallback(t *testing.T) {
+	skipUnless64Bit(t)
+	results := analysistest.RunWithSuggestedFixes(t, analysistest.TestData(), NewTestAnalyzer(), "asmcall")
+	assertRawFixesMatchGolden(t, results, "asmcall")
+}
+
+// TestToolchainLayout pins the toolchain deny-list on the real std testing
+// package: the types the go command's generated test main builds
+// positionally are reported with the caveat and no fix (rewriting them broke
+// every go test), while testing's other structs keep theirs, the list being
+// per type there.
+func TestToolchainLayout(t *testing.T) {
+	skipUnless64Bit(t)
+	rec := &errorRecorder{}
+	var pinned, fixed int
+	for _, r := range analysistest.Run(rec, analysistest.TestData(), NewTestAnalyzer(), "testing") {
+		if r.Pass.Pkg.Path() != "testing" {
+			continue
+		}
+		for _, d := range r.Diagnostics {
+			toolchain := strings.HasSuffix(d.Message, "reorder skipped: layout fixed by the Go toolchain")
+			switch {
+			case toolchain && len(d.SuggestedFixes) != 0:
+				t.Errorf("%s: toolchain-fixed struct carries a fix: %s", r.Pass.Fset.Position(d.Pos), d.Message)
+			case toolchain:
+				pinned++
+			case !strings.Contains(d.Message, "reorder skipped") && len(d.SuggestedFixes) == 1:
+				fixed++
+			}
+		}
+	}
+	for _, msg := range rec.loadErrors() {
+		t.Errorf("load: %s", msg)
+	}
+	// InternalTest, InternalBenchmark and InternalFuzzTarget are misaligned.
+	if pinned == 0 || fixed == 0 {
+		t.Errorf("testing: %d toolchain-pinned and %d fixable diagnostics, want both > 0", pinned, fixed)
+	}
 }
 
 // TestApplyLayoutPins pins the rewrite half of TestLayoutPins: under -apply the
@@ -934,7 +1019,9 @@ func TestApplyLayoutPins(t *testing.T) {
 // skipUnlessCgo skips fixtures that need cmd/cgo and a C compiler.
 func skipUnlessCgo(t *testing.T) {
 	t.Helper()
-	if !build.Default.CgoEnabled {
+	// What the go command the fixtures load through uses, not the test
+	// binary's build.Default: a cross-GOARCH run defaults cgo off there.
+	if out, err := exec.Command("go", "env", "CGO_ENABLED").Output(); err != nil || strings.TrimSpace(string(out)) != "1" {
 		t.Skip("cgo disabled")
 	}
 	cc, err := exec.Command("go", "env", "CC").Output()
@@ -1522,6 +1609,72 @@ func TestFileArgsDeferNote(t *testing.T) {
 	}
 }
 
+// TestSyntaxErrorTestFileHoldsPartner runs -apply ./... with an in-package
+// dep test that doesn't parse: no pass rewrites dep (brokenTest), so user,
+// converting to dep.U, must predict it stays and keep T. When the base pass
+// rewrote dep instead, user predicting the variant's deferral reordered T
+// alone and the build broke. (A test file that parses but doesn't
+// type-check still defers: a documented limitation.)
+func TestSyntaxErrorTestFileHoldsPartner(t *testing.T) {
+	skipUnless64Bit(t)
+	if testing.Short() {
+		t.Skip("builds the binary")
+	}
+	bin, mod := xconvModule(t)
+	if err := os.WriteFile(filepath.Join(mod, "dep", "dep_test.go"), []byte("package dep\n\nfunc {\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(bin, "-apply", "./...")
+	cmd.Dir = mod
+	out, _ := cmd.CombinedOutput() // exits non-zero: it reports, and dep.test fails to load
+	build := exec.Command("go", "build", "./...")
+	build.Dir = mod
+	if bout, err := build.CombinedOutput(); err != nil {
+		t.Errorf("module no longer builds after -apply: %v\n%s\ntool output:\n%s", err, bout, out)
+	}
+}
+
+// TestSyntaxErrorTestFileNotRewritten: a positional literal in a healthy
+// in-package test pins T, but a sibling test file mid-edit doesn't parse, so
+// the driver skips p's test variant. The base pass then rewrote T, and once
+// the broken file was deleted go test failed on the mis-assigned literal.
+// Now nothing in p is rewritten (brokenTest), with a note saying why.
+func TestSyntaxErrorTestFileNotRewritten(t *testing.T) {
+	skipUnless64Bit(t)
+	if testing.Short() {
+		t.Skip("builds the binary")
+	}
+	bin, _ := xconvModule(t)
+	mod := t.TempDir()
+	const p = "package p\n\ntype T struct {\n\tA int8\n\tB int64\n\tC int8\n}\n\nfunc (t T) Sum() int64 { return int64(t.A)*100 + t.B*10 + int64(t.C) }\n"
+	writeTree(t, mod, map[string]string{
+		"go.mod":        "module example.com/brk\n\ngo 1.24\n",
+		"p/p.go":        p,
+		"p/p_test.go":   "package p\n\nimport \"testing\"\n\nvar cases = []T{{1, 2, 3}}\n\nfunc TestSum(t *testing.T) {\n\tif got := cases[0].Sum(); got != 123 {\n\t\tt.Fatal(got)\n\t}\n}\n",
+		"p/wip_test.go": "package p\n\nfunc wip() {\n\tx :=\n}\n",
+	})
+	cmd := exec.Command(bin, "-apply", "./...")
+	cmd.Dir = mod
+	out, _ := cmd.CombinedOutput() // exits non-zero: it reports, and p.test fails to load
+	if !strings.Contains(string(out), "could be 16") {
+		t.Errorf("no diagnostic for T:\n%s", out)
+	}
+	if !strings.Contains(string(out), "rewrite skipped: test file wip_test.go does not parse") {
+		t.Errorf("no note for the broken test file:\n%s", out)
+	}
+	if got, err := os.ReadFile(filepath.Join(mod, "p", "p.go")); err != nil || string(got) != p {
+		t.Errorf("p.go rewritten beside a test file that does not parse (err %v):\n%s", err, got)
+	}
+	if err := os.Remove(filepath.Join(mod, "p", "wip_test.go")); err != nil {
+		t.Fatal(err)
+	}
+	test := exec.Command("go", "test", "./...")
+	test.Dir = mod
+	if tout, err := test.CombinedOutput(); err != nil {
+		t.Errorf("go test fails once the broken file is gone: %v\n%s\ntool output:\n%s", err, tout, out)
+	}
+}
+
 // xconvModule builds the betteralign binary and copies testdata/src/xconv
 // into a module, both under t.TempDir().
 func xconvModule(t *testing.T) (bin, mod string) {
@@ -1619,12 +1772,24 @@ func TestVetToolSameModulePartnerFollows(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(gmod, "dep", "gen.go"), []byte(gen), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// A conversion to the generated struct: the driver drops dep's fix there,
+	// so user's process must not predict dep.Gen to move (it did under
+	// -generated_files, reordered TG alone and broke the build).
+	const genUser = "package user\n\nimport \"xconv/dep\"\n\ntype TG struct {\n\tA bool\n\tB int64\n\tC bool\n}\n\nfunc toGen(t TG) dep.Gen { return dep.Gen(t) }\n"
+	if err := os.WriteFile(filepath.Join(gmod, "user", "gen_user.go"), []byte(genUser), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	gvet := exec.Command("go", "vet", "-vettool="+bin, "-fix", "-generated_files", "./...")
 	gvet.Dir, gvet.Env = gmod, env
 	stderr.Reset()
 	gvet.Stderr = &stderr
 	if err := gvet.Run(); err != nil {
 		t.Errorf("go vet -fix -generated_files: %v\n%s", err, stderr.String())
+	}
+	gbuild := exec.Command("go", "build", "./...")
+	gbuild.Dir, gbuild.Env = gmod, env
+	if bout, err := gbuild.CombinedOutput(); err != nil {
+		t.Errorf("module no longer builds after go vet -fix -generated_files: %v\n%s\nstderr:\n%s", err, bout, stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "-generated_files has no effect under go vet -fix") {
 		t.Errorf("go vet -fix -generated_files stderr lacks the note:\n%s", stderr.String())
@@ -1639,6 +1804,89 @@ func TestVetToolSameModulePartnerFollows(t *testing.T) {
 		}
 		if !reordered.Match(src) {
 			t.Errorf("%s: not fixed under go vet -fix -generated_files:\n%s\nstderr:\n%s", f, src, stderr.String())
+		}
+	}
+}
+
+// TestVetToolWorkspacePartnerOutsidePattern runs go vet -fix inside m1 of a
+// go.work workspace whose m2 declares the struct m1 converts to. go vet there
+// vets m1 alone, so m2's struct stays; predicting it moved (m2 is a used
+// module) reordered m1's side and broke m1's build.
+func TestVetToolWorkspacePartnerOutsidePattern(t *testing.T) {
+	skipUnless64Bit(t)
+	if testing.Short() {
+		t.Skip("builds the binary")
+	}
+	bin, _ := xconvModule(t)
+	ws := vetWorkspace(t)
+	env := slices.DeleteFunc(os.Environ(), func(kv string) bool {
+		return strings.HasPrefix(kv, "GOFLAGS=") || strings.HasPrefix(kv, "GOWORK=")
+	})
+	m1 := filepath.Join(ws, "m1")
+	vet := exec.Command("go", "vet", "-vettool="+bin, "-fix", "./...")
+	vet.Dir, vet.Env = m1, env
+	out, _ := vet.CombinedOutput() // exits non-zero when it reports
+	build := exec.Command("go", "build", "./...")
+	build.Dir, build.Env = m1, env
+	if bout, err := build.CombinedOutput(); err != nil {
+		t.Errorf("m1 no longer builds after go vet -fix: %v\n%s\nvet output:\n%s", err, bout, out)
+	}
+}
+
+// TestVetToolWorkspaceRoot pins the trade-off TestVetToolWorkspacePartnerOutsidePattern
+// buys: cmd/go starts the vettool in each package's directory, so from the
+// workspace root (go vet -fix ./m1/... ./m2/...) m1's process sees the same
+// as inside m1 and keeps T pinned, while m2's process reorders dep.U: that
+// cross-module conversion breaks, a documented limitation.
+func TestVetToolWorkspaceRoot(t *testing.T) {
+	skipUnless64Bit(t)
+	if testing.Short() {
+		t.Skip("builds the binary")
+	}
+	bin, _ := xconvModule(t)
+	ws := vetWorkspace(t)
+	env := slices.DeleteFunc(os.Environ(), func(kv string) bool {
+		return strings.HasPrefix(kv, "GOFLAGS=") || strings.HasPrefix(kv, "GOWORK=")
+	})
+	vet := exec.Command("go", "vet", "-vettool="+bin, "-fix", "./m1/...", "./m2/...")
+	vet.Dir, vet.Env = ws, env
+	out, _ := vet.CombinedOutput() // exits non-zero when it reports
+	for f, first := range map[string]string{"m1/user/user.go": "A bool", "m2/dep/dep.go": "B int64"} {
+		src, err := os.ReadFile(filepath.Join(ws, filepath.FromSlash(f)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(src), "struct {\n\t"+first+"\n") {
+			t.Errorf("%s: want first field %q:\n%s\nvet output:\n%s", f, first, src, out)
+		}
+	}
+}
+
+// vetWorkspace writes a go.work workspace whose m1 converts its T to m2's
+// dep.U, both misaligned alike, and returns its root.
+func vetWorkspace(t *testing.T) string {
+	t.Helper()
+	ws := t.TempDir()
+	writeTree(t, ws, map[string]string{
+		"go.work":         "go 1.24\n\nuse (\n\t./m1\n\t./m2\n)\n",
+		"m1/go.mod":       "module example.com/m1\n\ngo 1.24\n\nrequire example.com/m2 v0.0.0\n",
+		"m1/user/user.go": "package user\n\nimport \"example.com/m2/dep\"\n\ntype T struct {\n\tA bool\n\tB int64\n\tC bool\n}\n\nfunc ToDep(t T) dep.U { return dep.U(t) }\n",
+		"m2/go.mod":       "module example.com/m2\n\ngo 1.24\n",
+		"m2/dep/dep.go":   "package dep\n\ntype U struct {\n\tA bool\n\tB int64\n\tC bool\n}\n",
+	})
+	return ws
+}
+
+// writeTree writes files, keyed by slash-separated path under root.
+func writeTree(t *testing.T, root string, files map[string]string) {
+	t.Helper()
+	for rel, src := range files {
+		p := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(src), 0o644); err != nil {
+			t.Fatal(err)
 		}
 	}
 }

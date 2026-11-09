@@ -220,3 +220,19 @@ type ArrElem struct { // want `reorder skipped: assembly implementation at .*asm
 	AE2 int64
 	AE3 bool
 }
+
+// Taken by an exported operand of a linkname push, in push_never.go, into a
+// package that file imports: that package declares a mirror, so pinned.
+type PushImported struct { // want `reorder skipped: //go:linkname at .*push_never.go`
+	PI1 bool
+	PI2 int64
+	PI3 bool
+}
+
+// Likewise into a package nothing here imports, which can name the type
+// itself: still reordered.
+type PushFree struct { // want `struct of size 24 could be 16$`
+	PF1 bool
+	PF2 int64
+	PF3 bool
+}

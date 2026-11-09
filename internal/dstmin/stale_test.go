@@ -58,6 +58,26 @@ func TestDecorateFileRejectsStaleSource(t *testing.T) {
 	}
 }
 
+// TestDecorateFileRejectsStaleTag pins the literal half of the check: a host
+// that parsed an unsaved buffer (gopls) holds a same-length tag edit the disk
+// lacks, and a fix cut from the disk bytes reverted it. Identifiers and
+// braces all match; only the *ast.BasicLit differs.
+func TestDecorateFileRejectsStaleTag(t *testing.T) {
+	const disk = "package p\n\ntype S struct {\n\ta bool `json:\"a\"`\n\tb int64\n\tc bool\n}\n"
+	path := filepath.Join(t.TempDir(), "p.go")
+	if err := os.WriteFile(path, []byte(disk), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, path, strings.Replace(disk, `json:"a"`, `json:"b"`, 1), parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewDecorator(fset).DecorateFile(f); !errors.Is(err, ErrSourceRead) {
+		t.Fatalf("DecorateFile with a tag the disk doesn't hold: err = %v, want ErrSourceRead", err)
+	}
+}
+
 // TestDecorateFileRejectsStaleComment pins the comment half of the check: a
 // lead doc is re-emitted from the AST's text, so a same-length edit to it
 // was reverted, and one turning it into code (an embedded field) deleted the

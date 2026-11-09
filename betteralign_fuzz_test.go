@@ -429,7 +429,7 @@ type otherBuildResult struct {
 // merges the scans as otherBuildPositional does, and resolves every literal
 // path and assembly operand name as collectLayoutPins does.
 func scanAndResolve(pkg *types.Package, src string) otherBuildResult {
-	o := otherBuild{lits: make(map[string]string), asm: make(map[string][]asmStub), decls: make(map[string][]ast.Expr)}
+	o := otherBuild{lits: make(map[string]string), asm: make(map[string][]asmStub), decls: make(map[string][]ast.Expr), funcs: make(map[string][]string)}
 	for i, part := range strings.Split(src, "\x00") {
 		o.add(scanOtherBuildSrc("f"+strconv.Itoa(i)+".go", []byte(part)))
 	}
