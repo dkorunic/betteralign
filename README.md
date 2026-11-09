@@ -172,11 +172,3 @@ Structs held by value inside a punned, encoded or assembly-accessed struct are p
 - **False sharing.** The most compact order can put fields written by different goroutines on one cache line.
 
 Rewriting Go 1.27.3's `std` and `cmd`: everything builds for 21 `GOOS`/`GOARCH` targets, a second run changes nothing, and `go test -short std cmd` (amd64; `std` also on 386) fails only where tests compare field-order-dependent output: `go/ast` `ExamplePrint`, `net/http` `TestTransportEventTrace` (`%+v`), `cmd/compile/internal/logopt` and a `cmd/go` script (JSON key order), `types2` `TestSizeof`, and `go/types` `TestGenerate` (generated copies).
-
-## Star history
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=dkorunic/betteralign&type=date&theme=dark" />
-  <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=dkorunic/betteralign&type=date" />
-  <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=dkorunic/betteralign&type=date" />
-</picture>
