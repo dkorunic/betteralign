@@ -19,6 +19,9 @@ task lint          # regenerate, format, and run golangci-lint
 task fmt           # format code with gci + gofumpt
 task generate      # regenerate match_generated.go, then fmt
 task update        # go get -u + tidy
+task check         # list modules with newer major versions (gomajor)
+task build-debug   # update + generate, then a -race, CGO_ENABLED=1 build
+task release       # goreleaser release
 ```
 
 Direct Go commands:
@@ -45,9 +48,12 @@ task fuzz-declsourcedirectives   # FuzzDeclSourceDirectives (root: declSource.at
 task fuzz-scanotherbuild         # FuzzScanOtherBuild     (root: build-excluded file scan + literal-path resolution: bounded time, deterministic)
 task fuzz-decoratefileidentity   # internal/dstmin: decorate→reprint round-trips
 task fuzz-decoratefilereorder    # internal/dstmin: reorder preserves comments + layout
+task fuzz-decoratefilereorderall # internal/dstmin: reverse every struct at once (multi-splice cursor)
+task fuzz-commentrun             # internal/dstmin: commentRun vs the brute-force reference
+task fuzz-generatedbymatcher     # root: generated DFA vs the `Code generated … DO NOT EDIT.` regexp
 ```
 
-The `afl-fuzz-*` tasks run the same targets under gosentry/LibAFL (`CGO_ENABLED=1`, `GOSENTRY` points at the gosentry `go` binary). `GRAMMAR=true` appends the `golang-nautilus-grammar.json` Nautilus grammar to the LibAFL flags for grammar-based generation. Plain `go test` replays the committed seed corpus under `internal/dstmin/testdata/fuzz/` as ordinary subtests, so it doubles as a regression net.
+The `afl-fuzz-*` tasks run the same targets (all but `FuzzDeclSourceDirectives` and `FuzzScanOtherBuild`) under gosentry/LibAFL (`CGO_ENABLED=1`, `GOSENTRY` points at the gosentry `go` binary). `GRAMMAR=true` appends the `golang-nautilus-grammar.json` Nautilus grammar to the LibAFL flags for grammar-based generation. Plain `go test` replays the committed seed corpus under `internal/dstmin/testdata/fuzz/` as ordinary subtests, so it doubles as a regression net.
 
 > Gotcha: `.gitignore`'s unanchored `fuzz/` pattern also ignores `testdata/fuzz/`, so committed fuzz seeds must be added with `git add -f`. Name bug seeds `bugNN_description`.
 
@@ -160,5 +166,8 @@ Analyzer tests live in `betteralign_test.go` (package `betteralign_test`) and us
 - Architecture-specific files (`a_amd64.go`, `a_arm64.go`) are filtered to the current `runtime.GOARCH`.
 - Flag-specific tests cover `-exclude_dirs`, `-exclude_files`, and `-opt_in` under `testdata/src/exclude/` and `testdata/src/optin/`.
 - `internal/dstmin` carries its own decoration/reprint unit tests plus `TestReorderCrashersDoNotPanic`, which replays a local crash corpus.
+- Other files: `pins_test.go` (external, layout-pin fixtures), `betteralign_unit_test.go` / `pins_internal_test.go` / `version_internal_test.go` (internal unit tests), `fuzz_crashers_test.go` (replayed root crashers), `betteralign_fuzz_test.go`, `betteralign_bench_test.go`, and `export_test.go` (unexported state for the external tests). Each behaviour has its own fixture package under `testdata/src/` (`layoutpin`, `nested`, `otherbuild`, `indirect`, `xatomic`, `exttest`, `linkself`, `asmcall`, …), named in the sections above.
 
 When adding analyzer test cases: add a `.go` file under `testdata/src/a/` with `// want` annotations, and a corresponding `.go.golden` with the expected post-apply output.
+
+**Standard-library end-to-end check** (before a release): copy `$(go env GOROOT)` to an exec-mounted directory (not a `noexec` `/tmp`), and with that copy's `bin` first in `PATH` and `GOTOOLCHAIN=local`, run `betteralign -apply std cmd` in its `src`, then `GOOS=… GOARCH=… go build std cmd` for several targets, `betteralign -apply -diff std cmd` (must print nothing: fixed point), `go install cmd` (so tests use the rewritten compiler/linker) and `go test -short std cmd`, plus `GOARCH=386 go test -short std` for atomic alignment. At 7942494 (Go 1.27.3) the only failures were order-observable, as expected: `go/ast` `ExamplePrint`, `net/http` `TestTransportEventTrace*` (`%+v`), `cmd/compile/internal/logopt` and `cmd/go` script `list_import_cycle_deps_errors` (JSON key order), `types2` `TestSizeof` (asserts sizes), and `go/types` `TestGenerate`: `go/types/*.go` are `DO NOT EDIT` copies generated from `cmd/compile/internal/types2`, so the skipped generated twin drifts from its rewritten source (README "Generated copies are not regenerated"). Compare any other failure against the pristine copy.

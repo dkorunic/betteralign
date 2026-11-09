@@ -8,114 +8,45 @@
 
 ## About
 
-**betteralign** detects and fixes suboptimal struct field layout in Go: it reduces padding and GC pointer bytes, and rewrites files while preserving comments. It is a drop-in replacement for `fieldalignment`.
+**betteralign** reports Go structs whose field order wastes memory or GC pointer bytes, and rewrites them while preserving comments. It is a fork of, and drop-in replacement for, [fieldalignment](https://cs.opensource.google/go/x/tools/+/master:go/analysis/passes/fieldalignment/fieldalignment.go).
 
-It is a fork of the official Go [fieldalignment](https://cs.opensource.google/go/x/tools/+/master:go/analysis/passes/fieldalignment/fieldalignment.go) tool, with the bulk of the alignment logic unchanged. Its notable differences group into a few themes:
+Differences from `fieldalignment`:
 
-**Why this exists**
+- **Comments are preserved** on rewrite (doc, line and floating comments). Go's AST [does not attach comments to nodes](https://github.com/golang/go/issues/20744), so `fieldalignment` drops them.
+- **Layout contracts are respected**: a struct whose field order the code depends on (positional literals, `unsafe`, atomics, codecs, assembly, conversions, …) is reported but never rewritten. See [What is never rewritten](#what-is-never-rewritten).
+- **One run reaches a fixed point**: nested structs are measured at the layout the same run gives them, so a second `-fix`/`-apply` changes nothing.
+- **Stable sort**: equal-ranked fields keep their relative order (upstream's `sort.Slice` does not).
+- **No crash on generic structs**: upstream's `ptrdata` panics (`"impossible"`) on a type-parameter field.
+- **Generated files** (`_generated.go`, `_gen.go`, `.gen.go`, `.pb.go`, `.pb.gw.go`, or a `Code generated … DO NOT EDIT.` header) and **test files** are skipped by default.
+- `// betteralign:ignore` and opt-in (`-opt_in` with `// betteralign:check`) annotations.
+- Diagnostics lead with the saving: `8 bytes saved: struct of size 24 could be 16`.
+- Atomic file writes ([not on Windows](https://github.com/golang/go/issues/22397#issuecomment-498856679)); per-pass memoisation of size/alignment/ptrdata; `GOMEMLIMIT` set to 90% of the cgroup or system memory.
 
-- **preserves comments** (field comments, doc comments, and floating comments) — the original `fieldalignment` erases them on rewrite.
+It builds on [fieldalignment](https://cs.opensource.google/go/x/tools/+/master:go/analysis/passes/fieldalignment/fieldalignment.go) (the Go Authors), [maligned](https://github.com/mdempsky/maligned) (Matthew Dempsky) and [structslop](https://github.com/orijtech/structslop) (orijtech).
 
-**Safety and robustness**
+## How it works
 
-- respects **layout contracts**: structs carrying a `structs.HostLayout` marker or explicit blank padding (`_ [56]byte` cache-line pads, `_ uint32` alignment pads) are left alone entirely, and structs the package depends on in field order are reported but never rewritten — those used with `unsafe.Offsetof` or a 64-bit `sync/atomic` function (`atomic.AddInt64(&s.n, 1)` needs `n` 8-byte aligned on 32-bit platforms), converted to or from another struct type, identical to an unnamed struct type (or alias) they may be assigned to, type-punned through `unsafe.Pointer`, encoded with `encoding/binary`, `encoding/asn1` or `x/crypto/ssh`, or passed to an assembly function (a body-less declaration), a Go function the package's assembly calls, or a `//go:linkname` push into another package's declaration, and the standard-library structs the Go toolchain lays out itself (`runtime`, `internal/abi`, `reflect`, the generated test main's `testing.InternalTest`, ...); structs that declare themselves ASN.1 (an `asn1:"…"` tag or an `encoding/asn1` field type, also in a struct they hold by value) or carry an `xml:"…"` tag are skipped outright,
-- detects positional composite literals (`T{1, 2, 3}` rather than `T{a: 1, b: 2, c: 3}`) anywhere in the package and **reports the would-be saving without rewriting the struct** — reordering its fields would silently re-map the literal's elements at the next build,
-- analyzes only named struct types — declared with `type T struct { ... }`, or an alias of a struct literal (`type A = struct { ... }`); anonymous structs (nested struct-typed fields, struct literals, `var x struct{...}` declarations) are skipped, so it never rewrites the riskier unnamed shapes,
-- when `-apply` rewrites a struct, fields declared with multiple names (`A, B int`) are kept together as a single grouped declaration and moved as a unit — the byte-span reorder never splits them,
-- performs **atomic file writes** to prevent corruption or data loss on rewrite ([not on Windows](https://github.com/golang/go/issues/22397#issuecomment-498856679)),
-- uses a **stable sort** for field ordering, so fields of equal sort rank preserve their original relative order; upstream's `sort.Slice` is unstable and may permute equal-ranked fields differently between runs,
-- fixes a **crash on packages with generic struct fields** — upstream's `ptrdata` implementation ends with `panic("impossible")`, which fires when an uninstantiated type parameter appears as a field type (because `(*types.TypeParam).Underlying()` returns itself, falling through every switch case); betteralign replaces the panic with a conservative one-word fallback.
+Fields are sorted stably by:
 
-**Opt-in / opt-out controls**
+1. zero-sized types first,
+2. higher alignment first,
+3. pointer-bearing types before pointer-free ones,
+4. among pointer-bearing types, fewer trailing non-pointer bytes first,
+5. larger size first.
 
-- **skips generated files**, identified either by a known suffix (`_generated.go`, `_gen.go`, `.gen.go`, `.pb.go`, `.pb.gw.go`) or by a package-level comment containing `Code generated by ... DO NOT EDIT.` (or any header the Go convention, `ast.IsGenerated`, accepts),
-- skips test files (`_test.go` suffix),
-- **skips structs annotated with `// betteralign:ignore`** placed inside the struct body,
-- supports **opt-in mode**, where only structs annotated with `// betteralign:check` on the type declaration are checked; placing the directive on a surrounding `type ( ... )` block opts in every spec inside the group.
+A multi-name field (`A, B int`) moves as one declaration.
 
-**Other improvements**
+**Size.** `struct { Flag bool; ID int64; Count int32 }` is 24 bytes on 64-bit (7 bytes of padding before `ID`, 4 after `Count`); `ID, Count, Flag` is 16.
 
-- caches per-type size, alignment, and pointer-scan results within each analysis pass, avoiding redundant recomputation for types that recur across many struct fields (common in protobuf-generated code),
-- prefixes diagnostics with the actual byte saving (`8 bytes saved: struct of size 24 could be 16`) rather than only the before/after sizes,
-- includes more thorough tests comparing expected versus golden output,
-- adapts automatically to CPU and memory constraints in containerized environments (Docker, Kubernetes, LXC, LXD, etc.).
+**Pointer bytes.** `ptrdata` is the prefix of a value that may hold pointers. `struct { Zone string; IP []byte }` is 40 bytes either way, but `ptrdata` is 24 with `Zone` first and 32 with `IP` first (`string` has 8 trailing non-pointer bytes, `[]byte` 16). Before Go 1.26 `ptrdata` was also the bytes the GC scanned per value; under the Green Tea GC (default in Go 1.26) marking is span-based, and a smaller `ptrdata` lowers the scan-work estimate used for pacing. The diagnostic is worded for the analyzed package's Go version (the newer of its `go.mod` `go` directive and a file's `//go:build go1.x`).
 
-Comment preservation is achieved by a small in-tree package, `internal/dstmin`, that decorates the parser's `*ast.File` with byte-range spans for each field's lead-doc, body and trailing blanks, then reprints the file by byte-splicing the synthesized struct bodies into the original source and finalising with `go/format.Source` for column realignment. It replaces a previous dependency on [sirkon/dst](https://github.com/sirkon/dst) with ~900 lines of focused code; see `internal/dstmin/README.md` for the design rationale and benchmark comparison. Each reordered struct's gofmt'd body is then cut out of that reprint and attached to its diagnostic as a standard `SuggestedFix` (titled `Rearrange fields`, like upstream), so `-fix` works through the regular analysis driver, and other tools that apply analysis suggested fixes (for example a `multichecker` build bundling betteralign) get the same comment-preserving reorder. Each edit already carries gofmt's indentation and alignment, so it is correct even when applied without a separate formatting pass.
+**Nested structs.** A struct held by value is measured at the layout the run leaves it in, so the outer struct is laid out around the reordered inner one. Diagnostic figures use the same projected layout. Convergence assumes gofmt-clean input.
 
-Go's standard AST does not [associate comments with nodes](https://github.com/golang/go/issues/20744) — it only stores byte offsets, so the original `fieldalignment` tool erases all comments. A [proposed fix](https://go-review.googlesource.com/c/go/+/429639) exists as an open CL but has not yet been merged.
-
-> **Note:** One run reaches a fixed point: nested structs are measured at the layout the same run gives them (see [Nested structs](#nested-structs)), so running `-fix` or `-apply` again changes nothing.
-
-This tool builds upon the following prior work:
-
-- [fieldalignment](https://cs.opensource.google/go/x/tools/+/master:go/analysis/passes/fieldalignment/fieldalignment.go) by the **Go Authors**
-- [maligned](https://github.com/mdempsky/maligned) by **Matthew Dempsky**
-- [structslop](https://github.com/orijtech/structslop) by **orijtech**
-
-## Deep dive
-
-`betteralign` pursues two goals:
-
-1. Minimize struct size by sorting fields in **descending alignment order** and placing zero-sized fields first, reducing internal padding (and avoiding the one-byte tail the runtime adds when a struct ends in a zero-sized field).
-2. Lower the **`ptrdata`-based scan-work estimate the GC uses for pacing** by grouping pointer-bearing fields before pointer-free ones, shrinking each value's `ptrdata` (the head prefix the runtime records as potentially holding pointers). On Go before 1.26 this also directly reduced the bytes scanned per value, since [the collector stopped scanning at the last pointer in a value](https://go.dev/doc/gc-guide); under the Green Tea GC (default in Go 1.26) marking is span-based rather than per-value, so the win is the smaller `ptrdata` feeding GC pacing rather than fewer bytes physically scanned.
-
-With those goals in mind, fields are sorted stably by the following criteria, in order:
-
-1. **Zero-sized** types first.
-2. **Higher alignment** first.
-3. **Pointer-bearing** types before pointer-free types.
-4. Among pointer-bearing types, those with **fewer trailing non-pointer bytes** first (minimizing GC `ptrdata`).
-5. **Larger size** first.
-
-### Size: sorting by descending alignment
-
-```go
-type Record struct {
-	Flag  bool  // 1 byte,  1-byte aligned
-	ID    int64 // 8 bytes, 8-byte aligned
-	Count int32 // 4 bytes, 4-byte aligned
-}
-```
-
-As declared, `Record` is **24 bytes** on a 64-bit platform: `Flag` sits at offset 0, then 7 padding bytes appear so `ID` can land on an 8-byte boundary; `Count` follows at offset 16, and the struct is rounded up to the next multiple of its highest alignment (8), adding 4 trailing padding bytes.
-
-After `optimalOrder` sorts by descending alignment, the layout becomes `ID, Count, Flag` and shrinks to **16 bytes**: `ID` at offset 0, `Count` at offset 8, `Flag` at offset 12, plus 3 trailing padding bytes to round to 16. No internal padding is needed because each field already lands on a correctly-aligned offset. Same data, 33% less memory.
-
-### GC `ptrdata`: ordering pointer-bearing fields by trailing non-pointer bytes
-
-```go
-type IPAddr struct {
-	Zone string // 16 bytes, 8-byte aligned
-	IP   []byte // 24 bytes, 8-byte aligned
-}
-```
-
-`Zone` comes first because `string` has fewer trailing non-pointer bytes than `[]byte`: `Sizeof(string) - ptrdata(string) = 8` versus `Sizeof([]byte) - ptrdata([]byte) = 16`. The struct is 40 bytes either way on a 64-bit platform, but with `Zone` first the value's `ptrdata` is only 24 bytes; reversing the fields would push it to 32. That `ptrdata` feeds the GC's scan-work estimate used for pacing — and, on Go before 1.26, the number of bytes the collector scanned per value. Under the Green Tea GC (default in Go 1.26) marking is span-based, so the smaller `ptrdata` lowers the pacing estimate rather than the bytes physically scanned.
-
-The pointer-bytes diagnostic reflects this: `betteralign` reads the **Go version of the project being analyzed** (its `go.mod` `go` directive, or a per-file `//go:build go1.x` constraint). For a target on Go 1.26 or newer it reports the reorder as lowering the GC scan-work estimate; for older targets it keeps the classic *N bytes saved* framing, which there still maps to bytes physically scanned. Struct-size diagnostics are unaffected — that saving is real memory regardless of GC.
-
-### Nested structs
-
-A struct held by value inside another is measured at the layout the same run gives it: if `Inner` is reordered, `Outer` is laid out around the reordered `Inner`, so a single `-fix` or `-apply` reaches a fixed point — running it again changes nothing, and a follow-up check passes. Diagnostic figures are in the same terms: an outer struct's size and pointer bytes assume its inner structs already reordered.
-
-## Runtime tuning with `GOGC`
-
-The analyzer itself is allocation-light, but loading and type-checking a package graph (`go/types`, the AST inspector, and the parser) produces a large volume of short-lived garbage — on a real-world run, well over 1 GiB of churn against only a few MiB of live heap at exit. Because `betteralign` is a short-lived batch process, the default `GOGC=100` spends CPU collecting garbage that would be freed at exit anyway. Running with garbage collection disabled trades that work for higher peak memory:
-
-```sh
-GOGC=off betteralign ./...
-```
-
-On a large warm-cache run this measured roughly a **15–16% wall-clock improvement** (and `GOGC=400` about **13%**), since most of the runtime's GC work simply disappears.
-
-> [!CAUTION]
-> `GOGC=off` lets the heap grow unbounded for the duration of the run. In memory-constrained containers (e.g. a Kubernetes pod with a low memory limit) this can trigger an **OOM kill** on a large package graph. `betteralign` already sets a soft `GOMEMLIMIT` (90% of the cgroup/system memory) which acts as a backstop, but on tight limits prefer a high finite value such as `GOGC=400` over fully disabling collection, or leave the default.
+**Rewriting.** `internal/dstmin` decorates the parsed file with per-field byte spans, splices the reordered field bodies into the original source and runs `go/format.Source`. Each reordered struct body is cut from that output and attached as a `SuggestedFix` (`Rearrange fields`), already gofmt-aligned, so any driver that applies analysis fixes gets the same result as `-apply`. Shapes the splice cannot handle safely (single-line structs, fields sharing a line, a block comment crossing a brace, …) are reported without a fix. See [`internal/dstmin/README.md`](internal/dstmin/README.md).
 
 ## Installation
 
-**Manual:** Download the appropriate binary from [the releases page](https://github.com/dkorunic/betteralign/releases) and place it in your `PATH`, typically `/usr/local/bin/betteralign`.
-
-**Via `go install`:**
+Download a binary from the [releases page](https://github.com/dkorunic/betteralign/releases), or:
 
 ```shell
 go install github.com/dkorunic/betteralign/cmd/betteralign@latest
@@ -124,142 +55,15 @@ go install github.com/dkorunic/betteralign/cmd/betteralign@latest
 ## Usage
 
 ```shell
-betteralign: find structs that would use less memory if their fields were sorted
+betteralign ./...                  # report; exit status 3 if anything is reported
+betteralign -apply ./...           # rewrite files (atomic writes)
+betteralign -fix ./...             # rewrite via the analysis driver's suggested fixes
+betteralign -apply -diff ./...     # preview: gofmt-style unified diff, nothing written
+betteralign -fix -diff ./...       # preview in the driver's diff format
+```
 
+```
 Usage: betteralign [-flag] [package]
-
-This analyzer finds structs that can be rearranged to use less memory, and provides
-a suggested edit with the most compact order.
-
-Note that there are two different diagnostics reported. One checks struct size,
-and the other reports "pointer bytes" used. Pointer bytes is how many bytes of the
-object that the garbage collector has to potentially scan for pointers, for example:
-
-        struct { uint32; string }
-
-have 16 pointer bytes because the garbage collector has to scan up through the string's
-inner pointer.
-
-        struct { string; *uint32 }
-
-has 24 pointer bytes because it has to scan further through the *uint32.
-
-        struct { string; uint32 }
-
-has 8 because the pointer bytes end immediately after the string pointer.
-
-This "pointer bytes" figure is the type's ptrdata. On Go before 1.26 it was
-also the number of bytes the collector scanned per value; under the Green Tea
-GC (default in Go 1.26) marking is span-based rather than per-value, so a
-smaller ptrdata lowers the ptrdata-based scan-work estimate the runtime uses
-for GC pacing rather than the bytes physically scanned. betteralign frames the
-pointer-bytes diagnostic to match the Go version of the analyzed package.
-
-Be aware that the most compact order is not always the most efficient.
-In rare cases it may cause two variables each updated by its own goroutine
-to occupy the same CPU cache line, inducing a form of memory contention
-known as "false sharing" that slows down both goroutines.
-
-Unlike most analyzers, which report likely mistakes, the diagnostics
-produced by betteralign very rarely indicate a significant problem,
-so the analyzer is not included in typical suites such as vet or
-gopls. Use this standalone command to run it on your code:
-
-   $ go install github.com/dkorunic/betteralign/cmd/betteralign@latest
-   $ betteralign [packages]
-
-Only named struct types are analyzed: those declared with the
-`type T struct { ... }` form, and aliases of a struct literal
-(`type A = struct { ... }`). Anonymous structs (nested struct-typed fields, struct literals,
-`var x struct{...}` declarations, and similar unnamed forms) are
-skipped. To enable analysis of one of those, lift it into a named type
-declaration.
-
-A generic struct whose layout depends on a type parameter — one with a type
-parameter in a by-value field position (`B T`, `B [4]T`, or a by-value
-struct holding one) — is also skipped. Such a field is sized from the
-constraint's underlying (`T any` as `interface{}`), so its size and
-pointer-bytes figures would be per-instantiation guesses. Fields that hold a
-type parameter only indirectly (`*T`, `[]T`, `map[K]T`) have a fixed
-layout and are still analyzed.
-
-If a struct is constructed somewhere in the package with a positional
-composite literal (`T{1, 2, 3}` rather than `T{a: 1, b: 2, c: 3}`),
-the reorder is reported but never applied: rewriting the field order would
-re-map the literal's elements to different fields, breaking the build (or
-worse, silently mis-assigning values when the new field types still happen
-to accept the old element types). Convert the literal to keyed form and
-rerun to enable the reorder.
-
-This positional-literal guard only sees the package that declares the struct
-and its in-package tests. A positional literal of an exported struct used from
-another package (an ordinary importer, or an external `package p_test`) is
-invisible to the pass that rewrites the struct, so `-apply` may reorder it and
-break — or silently mis-assign — that caller. Unexported structs are safe. When
-running `-apply ./...` across a multi-package module, gate it with a
-`go build ./...` (and your tests) afterwards, or convert positional literals
-to keyed form first. The in-package test guard also relies on the test files
-being loaded, so a driver run with -test=false can still rewrite a struct
-pinned by a literal in an in-package test.
-
-A struct with a `structs.HostLayout` field declares that its layout must
-follow the platform's C ABI, so it is neither reported nor rewritten. A struct
-with explicit padding (a blank `_` field of non-zero size, such as a
-cache-line pad) is skipped the same way, since its layout is deliberate.
-
-A struct the package depends on in field order is reported but never
-rewritten: one whose field offset is taken with `unsafe.Offsetof`, one
-whose field is passed to a 64-bit `sync/atomic` function (which needs it
-8-byte aligned on 32-bit platforms), one converted to or from another struct
-type (also through a type parameter), one identical to an unnamed struct
-type it may be assigned to (including an alias `type A = struct{...}` and a
-generic instance), one
-converted to or from `unsafe.Pointer` (type punning), and one passed to
-`encoding/binary`, `encoding/asn1` or `x/crypto/ssh` (whose wire format is field order),
-and one taken or returned by a body-less function declaration, whose
-assembly reads fields at fixed offsets. Reordering would break the build,
-corrupt memory or silently change the encoding. The last four also cover
-structs held by value inside them;
-the atomic pin covers every struct that holds such a struct by value. A
-struct that declares itself ASN.1 — an `asn1:"..."` tag or a field of an
-`encoding/asn1` type (or a slice or array of one), on it or on a struct it holds by value — is skipped outright, since its encoder usually lives
-in another package; so is one tagged for `x/crypto/ssh` (`ssh`, `sshtype`). A conversion to a struct of another package in the same
-module follows that package: both are reordered, identically.
-
-Also reported but never rewritten: a struct reached through an
-`unsafe.Pointer` conversion one indirection further in (`*[]T`, `*[N]T`, `**T`);
-one taken or returned by a Go function, or held by a variable, that the
-package's assembly references (`·name(SB)`); one taken or returned by a
-function a two-argument `//go:linkname` pushes into another package as
-its body-less declaration, unless that package can name the type itself (an
-exported type, pushed into a package that isn't among its imports); and
-the standard-library structs whose layout the Go toolchain or the runtime
-mirrors (packages `runtime`, `internal/abi`, `internal/runtime/maps`,
-`reflect`, `runtime/metrics`, and the `testing.Internal*` types the go
-command's generated test main builds positionally). A struct with an
-`xml:"..."` tag, on it or on a struct it holds by value, is skipped
-outright: `encoding/xml` writes elements in field order. Field order
-stays observable elsewhere — `encoding/json` key order, `fmt`'s `%+v`,
-reflection — and a reorder changes those outputs.
-
-Each rewritable diagnostic carries a suggested fix, so `-fix` (and
-`-fix -diff` to preview) rewrites through the standard analysis driver.
-`-apply` rewrites the files itself with atomic writes; under it, `-diff`
-prints a unified diff of each rewrite to stdout (stderr with `-json`)
-instead of updating the files. `-fix` takes precedence over `-apply`.
-The driver never applies fixes to files marked as generated, so with
-`-generated_files`, `-fix` instead rewrites through the `-apply` path
-(except under `go vet`, where the flag has no effect).
-A file that imports `"C"` is analyzed only with `-generated_files` and is
-never rewritten.
-
-A file containing carriage returns anywhere (CRLF line endings, even on a
-single line) is reported but never rewritten; normalise it to LF to enable
-the reorder. Files with a `//line`
-directive are reported but never rewritten either: moving lines would break
-the mapping, and other packages could not predict the rewrite.
-
-
 
 Flags:
   -V    print version and exit
@@ -304,54 +108,70 @@ Flags:
   -v    no effect (deprecated)
 ```
 
-To check all packages in the current module:
+### `-apply`, `-fix` and `-diff`
 
-```shell
-betteralign ./...
-```
+- `-apply` writes each rewritten file atomically. With `-diff` it writes nothing and prints `diff X.orig X` / `--- X.orig` / `+++ X` hunks, `X` slash-separated and relative to the working directory when under it, so `git apply -p0` or `patch -p0` applies them; with `-json` the diff goes to stderr. Exit status is 3 when there are diagnostics.
+- `-fix` lets the driver apply the suggested fixes (merging duplicates from a package and its test variant). `-fix -diff` prints the driver's diff (absolute paths, `(old)`/`(new)` headers) and exits 0. `-fix` output is never JSON. `-fix` takes precedence over `-apply`.
+- With `-apply` (and no `-diff`) no suggested fixes are attached, so a host that applies collected fixes (e.g. golangci-lint `--fix`) must not also set `-apply`.
+- The driver refuses fixes in generated files, so with `-generated_files`, `-fix` rewrites through the `-apply` path.
 
-To automatically rewrite files (excluding test and generated files):
+### Under `go vet`
 
-```shell
-betteralign -apply ./...
-```
+`go vet -vettool=$(which betteralign)` works for reporting and for `-fix` (`-fix -diff` to preview; go vet rejects `-diff` without `-fix`). `-apply` is refused with an error: go vet runs each package in its own process, and a dependency rewritten before its importer is analyzed breaks cross-package conversions. `-fix -generated_files` is plain `-fix` there (noted on stderr). Vet the whole module: vetting only an importer (`./user`) reorders its side of a conversion while the partner stays. For a `go.work` workspace, vet one module at a time, or run betteralign itself from the root (`betteralign -fix ./m1/... ./m2/...`).
 
-Or let the standard analysis driver apply the suggested fixes:
+### Selecting files and structs
 
-```shell
-betteralign -fix ./...
-```
+- `-generated_files`, `-test_files`: also analyze and fix generated or test files.
+- `-exclude_dirs`: a separator-free pattern (`vendor`, `test*`) matches a directory of that name at any depth; a pattern with a separator (`a/internal`) matches that path relative to the working directory.
+- `-exclude_files`: matches the file's path relative to the working directory (`p.go` does not exclude `p/p.go`; use `p/p.go` or `*/p.go`).
+- A malformed pattern is a flag error (exit 2).
+- `// betteralign:ignore` inside a struct's opening brace skips that struct.
+- `-opt_in` checks only structs whose `type` declaration (or enclosing `type ( … )` group) carries `// betteralign:check`.
 
-To preview the rewrite as a unified diff without touching any file, use either:
+Only named struct types (`type T struct{…}`, `type A = struct{…}`) are analyzed; anonymous structs are not.
 
-```shell
-betteralign -fix -diff ./...
-betteralign -apply -diff ./...
-```
+### Runtime tuning
 
-`-apply -diff` prints gofmt's format — `diff X.orig X`, `--- X.orig`, `+++ X` — with `X` relative to the working directory when the file is under it (absolute otherwise) and slash-separated on every platform, so a diff made on Windows applies with `git apply`, and exits 3 when there are diagnostics, like any report. Run from that directory, `patch -p0 < out.diff` or `git apply -p0 out.diff` applies it. `-fix -diff` prints the driver's format instead, absolute paths with `(old)`/`(new)` headers, and exits 0.
+Loading and type-checking produce mostly short-lived garbage. `GOGC=off betteralign ./...` was about 15% faster on a large warm-cache run (`GOGC=400` about 13%). `GOGC=off` lets the heap grow until the `GOMEMLIMIT` backstop; on tight memory limits prefer `GOGC=400`.
 
-With `-apply -json -diff`, the diff goes to stderr so stdout stays valid JSON. Both paths produce the same result; `-apply` writes each file atomically, while `-fix` follows the driver's semantics (merging fixes across package variants and reporting any it had to skip). `-fix` takes precedence if both are given. With `-apply` (and no `-diff`) the analyzer writes the files itself and attaches no suggested fixes, so an external driver that applies the fixes it collects must not also set it: use one or the other, not both. `-fix` output is never JSON: the driver returns before printing JSON under `-fix`, so `-fix -json` prints nothing and `-fix -diff -json` prints a plain diff.
+## What is never rewritten
 
-Under `go vet -vettool=$(which betteralign)`, prefer the driver's fixes (`go vet -vettool=… -fix`, or `go fix -fixtool=…`): `-apply` is refused with an error. go vet runs each package in its own process, so a dependency's process rewrites its file before an importer's process predicts from it; the importer no longer finds the struct it converts to, keeps its own side, and the module stops building. To preview, use `go vet -vettool=… -fix -diff` (go vet rejects `-diff` without `-fix`). Under go vet, `-fix -generated_files` is plain `-fix`: the driver refuses fixes in generated files, so the flag has no effect there and betteralign says so on stderr; run betteralign directly to rewrite generated files. go vet analyzes each package in its own process, so a conversion to a struct in another package of the module follows that struct when both packages are in the vet pattern; vetting only the importing package (`go vet -vettool=… -fix ./user`) reorders it while the partner stays, and the conversion no longer compiles — vet the whole module. A conversion to a struct of another `go.work` module stays pinned under go vet, which starts each package's process in its own directory: vet one module at a time. From the workspace root (`go vet -vettool=… -fix ./m1/... ./m2/...`) the partner module is still rewritten while the converting side stays, and the conversion no longer compiles; run betteralign itself (`betteralign -fix ./m1/... ./m2/...`) there.
+**Not reported at all:**
 
-Generated and test files can be included with the `-generated_files` and `-test_files` flags respectively. Use `-exclude_dirs` and `-exclude_files` to skip specific paths. For `-exclude_dirs`, a separator-free pattern (`vendor`, `internal`, `test*`) matches a directory of that name at any depth, gitignore-style, while a pattern containing a separator (`a/internal`) matches only that exact path relative to the working directory. `-exclude_files` patterns match the file's path relative to the working directory, so `p.go` does not exclude `p/p.go`; use `p/p.go` or `*/p.go`. A malformed pattern (`[`) is an error, not a silent exclude-everything. Use `-opt_in` to check only structs explicitly annotated with `// betteralign:check`.
+- a struct with a `structs.HostLayout` field, or a blank `_` field of non-zero size (deliberate padding);
+- a struct with an `asn1:"…"` or `xml:"…"` tag or an `encoding/asn1` field type, on it or on a struct it holds by value, or with an `ssh`/`sshtype` tag: their encoders follow field order and usually live in another package;
+- a generic struct holding a type parameter by value (`B T`, `B [4]T`): its layout varies per instantiation (`*T`, `[]T`, `map[K]T` are fine).
 
-Structs constructed via positional composite literals are reported but never rewritten under `-apply`; the diagnostic points at the offending literal so it can be converted to keyed form (`T{Field: value}`), after which a rerun will enable the reorder.
+**Reported with `reorder skipped: …` and no fix**, because the code depends on the field order:
 
-### Limitations
+- a positional composite literal (`T{1, 2}`) anywhere in the package, including files the current build excludes (other `GOOS`/`GOARCH`, unset tags), in-package tests and the external `package p_test`;
+- `unsafe.Offsetof(x.f)`;
+- a 64-bit `sync/atomic` function on a field (`atomic.AddInt64(&s.n, 1)` needs 8-byte alignment on 32-bit platforms), and every struct holding such a struct by value, also when the access is in another package (`os.file` holding `internal/poll.FD`);
+- a conversion to or from another struct type, or identity with an unnamed struct type (literal, alias, generic instance, another package's `func F(x struct{…})`). A partner in another package of the same run (module, `go.work` workspace, std) is predicted instead, and both sides reorder identically;
+- `unsafe.Pointer` conversions (also `*[]T`, `**T`), and pointer arithmetic from a field address (`uintptr(unsafe.Pointer(&p.f)) + n`, `unsafe.Add`); a plain `unsafe.Pointer(&x.f)` depends only on `f` and pins nothing;
+- an argument of `encoding/binary`, `encoding/asn1` or `x/crypto/ssh`, also through one local variable or one forwarding function;
+- `reflect.TypeOf(x).Field(c)` / `ValueOf(x).Field(c)` with a constant index;
+- parameters, results and receivers of body-less (assembly) functions, of Go functions and variables referenced from the package's `.s` files, and of functions a two-argument `//go:linkname` pushes into another package (unless that package can name the type itself: an exported type, pushed into a package outside the pusher's imports);
+- standard-library structs the Go toolchain lays out itself: `runtime`, `internal/abi`, `internal/runtime/maps`, `reflect`, `runtime/metrics`, `testing.Internal*`.
 
-- **Contracts in files your build excludes are partly invisible.** Positional literals and body-less (assembly) function declarations in the package's files for another `GOOS`/`GOARCH` or behind an unset build tag are found syntactically and pin their struct (so a rewrite on Linux no longer breaks the Windows build, or the arm64 assembly behind an `f_arm64.go` stub); a file under `//go:build ignore`, which no build compiles, doesn't count. Anything that needs type information there — `unsafe.Offsetof`, conversions, `unsafe.Pointer`, `encoding/binary` — is not seen; run betteralign under each `GOOS`/`GOARCH` and tag set you ship, or mark such structs `// betteralign:ignore`.
-- **Cross-package positional literals are not detected.** The positional-literal guard sees only the package that declares the struct plus its in-package tests. A positional literal of an **exported** struct used from *another* package (an ordinary importer, or an external `package p_test`) is invisible to the pass that rewrites the struct, because Go's static-analysis facts flow with the import graph, not against it. If such a literal exists, `-apply` (or `-fix`) will reorder the struct and either break the build or — when the reordered field types still accept the old element types — **silently mis-assign values** with a clean compile. This is the most dangerous outcome the tool can produce. Unexported structs are safe (their positional usage is confined to the defining package). When running `-apply ./...` across a multi-package module, gate it with a `go build ./...` (and your test suite) afterwards, or convert exported structs' positional literals to keyed form first.
-- **In-package test literals require the test variant to be loaded.** The deferral that protects a positional literal living only in an in-package `*_test.go` leaves the rewrite to the `[pkg.test]` variant whenever the package directory holds an in-package test file this build compiles. Running with the driver's `-test=false` (which loads no variant) turns it off: the base pass then keeps the rewrite, so `-apply` or `-fix` may rewrite a struct pinned by such a literal and break the test build. Leave test loading enabled when applying fixes. File arguments (`betteralign -apply p/p.go`) load the package as `command-line-arguments`, which never has a test variant: when the directory holds an in-package test the rewrite stays deferred and betteralign says so on stderr, so run on the package (`./p`) to rewrite. A package whose directory holds an in-package test file that doesn't parse is reported but never rewritten, by any pass and even under `-test=false`, until the file is fixed (betteralign says so on stderr): the driver skips the broken test variant, so no pass could see a positional literal in the tests.
-- **A struct pinned by an in-package test literal or `unsafe.Offsetof` may be reported twice.** Only the rewrite (`-apply` and the suggested fix) is deferred to the `[pkg.test]` variant, not reporting — so healthy code stays covered even when a broken test file makes the driver skip that variant. When the variant *does* run, both it and the base pass report the struct: the base plain, the variant with the `reorder skipped` caveat. The caveated one is authoritative; neither rewrites the struct.
-- **Files that use cgo (`import "C"`) are not analyzed by default.** The driver hands analyzers cgo's generated translation of such files, marked `Code generated by cmd/cgo; DO NOT EDIT.`, so they are skipped as generated code; with `-generated_files` they are analyzed and reported, but never rewritten (the translation lives in the build cache). Other files in the same package are analyzed and fixed normally.
-- **Files containing carriage returns are report-only.** A file with a `\r` anywhere — CRLF line endings, even on a single line — is reported but never rewritten, by `-apply` or a suggested fix: gofmt, which finishes every rewrite, would normalise all of its line endings. Normalise to LF to enable the rewrite.
-- **A leading UTF-8 byte-order mark is dropped by a rewrite.** `-apply` and the driver's `-fix` both gofmt the rewritten file, which removes it; a suggested fix applied raw by an editor keeps it.
-- **Generic structs whose layout depends on a type parameter are skipped.** A field holding a type parameter by value (`B T`, `B [4]T`, or a by-value struct containing one) is sized from the constraint's underlying (`T any` becomes `interface{}`), so any size or pointer-bytes figure would be a per-instantiation guess. Such structs are neither reported nor rewritten. Type parameters held only indirectly (`*T`, `[]T`, `map[K]T`) have a fixed layout and are still analyzed.
-- **Only some layout contracts are visible.** betteralign skips structs with a `structs.HostLayout` field, a blank padding field of non-zero size, or an ASN.1 marking, and reports without rewriting those whose field order the package itself depends on: `unsafe.Offsetof`, 64-bit `sync/atomic` functions on a field, struct-to-struct conversions, identity with an unnamed struct type (including one in an imported package's API, such as a `func F(x struct{...})` parameter), `unsafe.Pointer` punning, `encoding/binary`/`encoding/asn1`/`x/crypto/ssh` arguments and the parameters, results and receivers of body-less (assembly) function declarations (not one a two-argument `//go:linkname` directive binds to Go code of the same package; a one-argument directive, or a pull from another package, which keeps its own copy of the struct, still pins), found anywhere in the package or its in-package tests (a use only in a test may be reported twice, like a positional literal). The ASN.1 marking deliberately over-suppresses, since it also counts structs held by value: `crypto/x509.Certificate` (40 bytes to save) is skipped because it holds `crypto/x509/pkix` types by value, although the standard library never passes it to `asn1.Marshal`. No `// betteralign:ignore` is needed for such structs; they just stay unreported. These checks see one package and its imports, never its importers: punning or encoding an exported struct in *another* package is invisible, as is a value reaching an encoder only through an `interface{}`. A conversion to another package's struct is predicted (same module or `go.work` workspace ⇒ both reordered identically; from a `go.work` root that is not itself a module the go command rejects `./...` — "directory prefix . does not contain modules" — so name the modules, `./a/... ./b/...`, to have partners across them reorder in step), which reads that package's source for an ignore directive, a generated-code header or an excluded path; a package the run does not analyze (`betteralign -apply ./user` without `./dep`), which the driver loads from export data, is never rewritten, so the local side stays pinned. The prediction can still miss when the struct is pinned there (by a positional literal, `unsafe.Offsetof`, a 64-bit atomic on a struct it holds, ...), or when that package's in-package `_test.go` is ill-typed: the driver then skips the `[p.test]` variant that owns its rewrite, so its struct stays while the importing side follows the prediction (as in v0.15.4). The conversion then fails to compile after the rewrite, until the struct is unpinned or the test file fixed. The 64-bit atomic pin likewise sees only the package doing the atomic access: a struct holding another package's atomically accessed struct by value can still be reordered so that the word loses its 32-bit alignment. Other reflection-based encoders whose format is field order (third-party binary codecs) are not recognised, nor is an untagged struct reaching `encoding/xml` (a tagged one is skipped, since XML element order is usually schema-significant); `encoding/json` matches by name, though its *output* order follows the new field order, as does `fmt`'s `%v`/`%+v` and that of reflection-based dumpers such as `go/ast.Print` (tests comparing such strings need updating: `go/ast`'s `ExamplePrint` fails after rewriting `go/ast`).
-- **A pinned struct held inside another is measured as if reordered.** So that one run reaches a fixed point, a struct held by value inside another is measured at the layout the run leaves it in. For an enclosing struct whose field names are all exported, that prediction must agree across packages (both sides of a cross-package conversion must sort identically), so it can't see a package's own pins: an inner struct pinned by a positional literal, `unsafe.Offsetof` and the like is measured as reordered although it is left alone, and its enclosing struct's figures and order follow from that. The code stays correct, but the reported figures can be off: when an inner struct is pinned in its own package, the real pointer bytes after the rewrite can be higher than reported, and in rare cases higher than before (in the standard library `compress/gzip.Header` goes from 72 to 80, since its inner `time.Time` is pinned in another package, `time`, and pins in other packages are invisible to every pass — a private struct holding `time.Time` would be measured the same way). A struct with an unexported field name can be identical to no struct in another package, so it is measured against its own package's pins: an inner struct pinned there counts as it stays (`crypto/tls.clientHandshakeState`, whose inner `finishedHash` is pinned by a positional literal, no longer goes from 192 to 208 pointer bytes). If that inner struct is pinned only by a positional literal in an in-package `_test.go`, the non-test pass can't see the pin: it keeps reporting the enclosing struct, with no fix, even after the test-variant pass has left it at its real optimum, so that diagnostic persists across runs. It is noise, never a wrong rewrite, and comes alongside the duplicate diagnostic for the pinned inner struct itself. Size is never made worse in practice. Ignored, single-line, generated and excluded inner structs are measured as declared. With `-opt_in`, every inner struct is measured as declared.
-- **Never run it on the Go toolchain's own packages.** `runtime`, `internal/abi`, `reflect` and friends share struct layouts with the compiler and linker (function tables, module data, type descriptors), and `testing`'s types are built by the positional literals in the test main that `go test` generates. Rewriting the standard library builds and vets cleanly, but those packages then fail at run time — a contract no analysis of the source can see. The same applies to any struct whose layout a code generator or another binary relies on: mark it `// betteralign:ignore`. Anything else — cgo C-struct mirrors without `structs.HostLayout`, syscall/ABI layouts, memory-mapped or wire-format structs, fields accessed by index via `reflect`, hard-coded offsets or pointer arithmetic, `Offsetof` in another package — is reordered by `-apply`/`-fix` and can silently break. Mark these with `// betteralign:ignore` (or use `-opt_in`) before running `-apply` or `-fix`.
+Structs held by value inside a punned, encoded or assembly-accessed struct are pinned with it.
+
+**Files never rewritten:** a file containing `\r` (normalise to LF), one with a `//line` directive, cgo files (`import "C"`; analyzed only with `-generated_files`, since the driver sees cgo's generated translation), and every file of a package whose directory holds an in-package `_test.go` that does not parse (noted on stderr).
+
+## Limitations
+
+- **Positional literals in importing packages are not detected.** A positional literal of an exported struct in another package is invisible to the pass that rewrites the struct: the build breaks, or values are silently mis-assigned if the types still fit. Run `go build ./...` and the tests after rewriting, or convert such literals to keyed form first.
+- **Field order stays observable.** `encoding/json` key order, `fmt`'s `%v`/`%+v`, reflection-based dumpers (`go/ast.Print`), and tests asserting `unsafe.Sizeof` change with a reorder. Third-party reflection codecs, untagged structs reaching `encoding/xml`, `reflect.FieldByIndex`/`NumField` loops, values reaching an encoder through `interface{}`, cgo mirrors without `structs.HostLayout`, syscall and wire-format structs, and `Offsetof` in another package are not recognised. Mark such structs `// betteralign:ignore` or use `-opt_in`.
+- **Generated copies are not regenerated.** Generated files are skipped, so a file generated from a rewritten source keeps the old order (in std, `go/types` is generated from `cmd/compile/internal/types2`). Re-run the generators (`go generate ./...`, or the project's equivalent) after rewriting.
+- **Build-excluded files are scanned syntactically only.** Positional literals, assembly stubs, linkname pushes and assembly references there are found; type-based contracts (`Offsetof`, conversions, `unsafe.Pointer`, codecs) are not. Run under each `GOOS`/`GOARCH` and tag set you ship.
+- **In-package test literals need the test variant.** The base pass leaves the rewrite to the `[p.test]` variant when the directory holds an in-package test file. Under `-test=false` no variant runs and the base pass rewrites; keep test loading enabled when applying. File arguments (`betteralign -apply p/p.go`) load no variant, so such a rewrite stays deferred (noted on stderr); run on the package instead. A struct pinned only from a test may be reported twice: plain by the base pass, with the caveat by the variant.
+- **Cross-package predictions can miss.** The local side of a conversion follows a partner predicted to move. It breaks the build when the partner stays because of a pin in its own package (literal, `Offsetof`, atomics, codecs), or because an ill-typed in-package test file makes the driver skip its test variant, and when a library module is rewritten without the modules that convert to its structs.
+- **Cross-package atomic holders are matched by field name.** A same-named field of another struct over-pins; under `-trimpath`, a `replace`d or other `go.work` module is not resolved and pins nothing.
+- **Projected figures can be off.** A struct whose field names are all exported must sort identically in every package, so an inner struct pinned in its own package is measured as reordered although it stays (in std, `compress/gzip.Header` goes from 72 to 80 pointer bytes, since `time.Time` is pinned in `time`). A struct with an unexported field is measured against its package's pins; if the inner pin is only in an in-package test, the base pass keeps reporting the outer struct without a fix. The code stays correct; `-opt_in` measures every inner struct as declared.
+- **A leading UTF-8 BOM is dropped** by `-apply` and `-fix` (gofmt removes it).
+- **False sharing.** The most compact order can put fields written by different goroutines on one cache line.
+
+Rewriting Go 1.27.3's `std` and `cmd`: everything builds for 21 `GOOS`/`GOARCH` targets, a second run changes nothing, and `go test -short std cmd` (amd64; `std` also on 386) fails only where tests compare field-order-dependent output: `go/ast` `ExamplePrint`, `net/http` `TestTransportEventTrace` (`%+v`), `cmd/compile/internal/logopt` and a `cmd/go` script (JSON key order), `types2` `TestSizeof`, and `go/types` `TestGenerate` (generated copies).
 
 ## Star history
 

@@ -73,17 +73,17 @@ import (
 // what is skipped or never rewritten, and how fixes are applied.
 const Doc = `find structs that would use less memory if their fields were sorted
 
-This analyzer finds structs that can be rearranged to use less memory, and provides
-a suggested edit with the most compact order.
+This analyzer finds structs that can be rearranged to use less memory, and
+provides a suggested edit with the most compact order.
 
-Note that there are two different diagnostics reported. One checks struct size,
-and the other reports "pointer bytes" used. Pointer bytes is how many bytes of the
-object that the garbage collector has to potentially scan for pointers, for example:
+Two diagnostics are reported. One checks struct size, the other "pointer
+bytes": the prefix of a value the garbage collector may have to scan for
+pointers (the type's ptrdata). For example:
 
 	struct { uint32; string }
 
-have 16 pointer bytes because the garbage collector has to scan up through the string's
-inner pointer.
+has 16 pointer bytes because the garbage collector has to scan up through
+the string's inner pointer.
 
 	struct { string; *uint32 }
 
@@ -93,116 +93,39 @@ has 24 pointer bytes because it has to scan further through the *uint32.
 
 has 8 because the pointer bytes end immediately after the string pointer.
 
-This "pointer bytes" figure is the type's ptrdata. On Go before 1.26 it was
-also the number of bytes the collector scanned per value; under the Green Tea
-GC (default in Go 1.26) marking is span-based rather than per-value, so a
-smaller ptrdata lowers the ptrdata-based scan-work estimate the runtime uses
-for GC pacing rather than the bytes physically scanned. betteralign frames the
-pointer-bytes diagnostic to match the Go version of the analyzed package.
+Before Go 1.26 ptrdata was also the number of bytes scanned per value; under
+the Green Tea GC (default in Go 1.26) marking is span-based, so a smaller
+ptrdata lowers the scan-work estimate used for GC pacing. The pointer-bytes
+diagnostic is worded for the Go version of the analyzed package.
 
-Be aware that the most compact order is not always the most efficient.
-In rare cases it may cause two variables each updated by its own goroutine
-to occupy the same CPU cache line, inducing a form of memory contention
-known as "false sharing" that slows down both goroutines.
+The most compact order is not always the most efficient: in rare cases it
+puts two fields updated by different goroutines on one cache line (false
+sharing).
 
-Unlike most analyzers, which report likely mistakes, the diagnostics
-produced by betteralign very rarely indicate a significant problem,
-so the analyzer is not included in typical suites such as vet or
-gopls. Use this standalone command to run it on your code:
+Only named struct types are analyzed (type T struct{...} and aliases
+type A = struct{...}). Not reported: structs with a structs.HostLayout field
+or a non-zero-size blank (_) padding field; structs with an asn1 or xml tag
+or an encoding/asn1 field type (also in a struct held by value) or an ssh or
+sshtype tag; generic structs holding a type parameter by value; structs marked
+// betteralign:ignore. Generated and test files are skipped unless
+-generated_files or -test_files is set.
 
-   $ go install github.com/dkorunic/betteralign/cmd/betteralign@latest
-   $ betteralign [packages]
+Reported but never rewritten: structs whose field order the code relies on.
+That covers a positional composite literal (T{1, 2}, also in build-excluded
+files and in-package or external tests), unsafe.Offsetof, a 64-bit
+sync/atomic access to a field, a conversion to another struct type or
+identity with an unnamed one, unsafe.Pointer punning or pointer arithmetic
+from a field address, an encoding/binary, encoding/asn1 or x/crypto/ssh
+argument, a constant reflect Field index, assembly or //go:linkname use, and
+the standard-library structs the Go toolchain lays out itself. Files with a
+carriage return, a //line directive or import "C" are never rewritten.
 
-Only named struct types are analyzed: those declared with the
-` + "`type T struct { ... }`" + ` form, and aliases of a struct literal
-(` + "`type A = struct { ... }`" + `). Anonymous structs (nested struct-typed fields, struct literals,
-` + "`var x struct{...}`" + ` declarations, and similar unnamed forms) are
-skipped. To enable analysis of one of those, lift it into a named type
-declaration.
+Not detected: a positional literal of an exported struct in another
+(importing) package. Build and test after rewriting.
 
-A generic struct whose layout depends on a type parameter — one with a type
-parameter in a by-value field position (` + "`B T`" + `, ` + "`B [4]T`" + `, or a by-value
-struct holding one) — is also skipped. Such a field is sized from the
-constraint's underlying (` + "`T any`" + ` as ` + "`interface{}`" + `), so its size and
-pointer-bytes figures would be per-instantiation guesses. Fields that hold a
-type parameter only indirectly (` + "`*T`" + `, ` + "`[]T`" + `, ` + "`map[K]T`" + `) have a fixed
-layout and are still analyzed.
-
-If a struct is constructed somewhere in the package with a positional
-composite literal (` + "`T{1, 2, 3}`" + ` rather than ` + "`T{a: 1, b: 2, c: 3}`" + `),
-the reorder is reported but never applied: rewriting the field order would
-re-map the literal's elements to different fields, breaking the build (or
-worse, silently mis-assigning values when the new field types still happen
-to accept the old element types). Convert the literal to keyed form and
-rerun to enable the reorder.
-
-This positional-literal guard only sees the package that declares the struct
-and its in-package tests. A positional literal of an exported struct used from
-another package (an ordinary importer, or an external ` + "`package p_test`" + `) is
-invisible to the pass that rewrites the struct, so ` + "`-apply`" + ` may reorder it and
-break — or silently mis-assign — that caller. Unexported structs are safe. When
-running ` + "`-apply ./...`" + ` across a multi-package module, gate it with a
-` + "`go build ./...`" + ` (and your tests) afterwards, or convert positional literals
-to keyed form first. The in-package test guard also relies on the test files
-being loaded, so a driver run with -test=false can still rewrite a struct
-pinned by a literal in an in-package test.
-
-A struct with a ` + "`structs.HostLayout`" + ` field declares that its layout must
-follow the platform's C ABI, so it is neither reported nor rewritten. A struct
-with explicit padding (a blank ` + "`_`" + ` field of non-zero size, such as a
-cache-line pad) is skipped the same way, since its layout is deliberate.
-
-A struct the package depends on in field order is reported but never
-rewritten: one whose field offset is taken with ` + "`unsafe.Offsetof`" + `, one
-whose field is passed to a 64-bit ` + "`sync/atomic`" + ` function (which needs it
-8-byte aligned on 32-bit platforms), one converted to or from another struct
-type (also through a type parameter), one identical to an unnamed struct
-type it may be assigned to (including an alias ` + "`type A = struct{...}`" + ` and a
-generic instance), one
-converted to or from ` + "`unsafe.Pointer`" + ` (type punning), and one passed to
-` + "`encoding/binary`" + `, ` + "`encoding/asn1`" + ` or ` + "`x/crypto/ssh`" + ` (whose wire format is field order),
-and one taken or returned by a body-less function declaration, whose
-assembly reads fields at fixed offsets. Reordering would break the build,
-corrupt memory or silently change the encoding. The last four also cover
-structs held by value inside them;
-the atomic pin covers every struct that holds such a struct by value. A
-struct that declares itself ASN.1 — an ` + "`asn1:\"...\"`" + ` tag or a field of an
-` + "`encoding/asn1`" + ` type (or a slice or array of one), on it or on a struct it holds by value — is skipped outright, since its encoder usually lives
-in another package; so is one tagged for ` + "`x/crypto/ssh`" + ` (` + "`ssh`" + `, ` + "`sshtype`" + `). A conversion to a struct of another package in the same
-module follows that package: both are reordered, identically.
-
-Also reported but never rewritten: a struct reached through an
-` + "`unsafe.Pointer`" + ` conversion one indirection further in (` + "`*[]T`" + `, ` + "`*[N]T`" + `, ` + "`**T`" + `);
-one taken or returned by a Go function, or held by a variable, that the
-package's assembly references (` + "`·name(SB)`" + `); one taken or returned by a
-function a two-argument ` + "`//go:linkname`" + ` pushes into another package as
-its body-less declaration, unless that package can name the type itself; and
-the standard-library structs whose layout the Go toolchain or the runtime
-mirrors (packages ` + "`runtime`" + `, ` + "`internal/abi`" + `, ` + "`internal/runtime/maps`" + `,
-` + "`reflect`" + `, ` + "`runtime/metrics`" + `, and the ` + "`testing.Internal*`" + ` types the go
-command's generated test main builds positionally). A struct with an
-` + "`xml:\"...\"`" + ` tag, on it or on a struct it holds by value, is skipped
-outright: ` + "`encoding/xml`" + ` writes elements in field order. Field order
-stays observable elsewhere — ` + "`encoding/json`" + ` key order, ` + "`fmt`" + `'s ` + "`%+v`" + `,
-reflection — and a reorder changes those outputs.
-
-Each rewritable diagnostic carries a suggested fix, so ` + "`-fix`" + ` (and
-` + "`-fix -diff`" + ` to preview) rewrites through the standard analysis driver.
-` + "`-apply`" + ` rewrites the files itself with atomic writes; under it, ` + "`-diff`" + `
-prints a unified diff of each rewrite to stdout (stderr with ` + "`-json`" + `)
-instead of updating the files. ` + "`-fix`" + ` takes precedence over ` + "`-apply`" + `.
-The driver never applies fixes to files marked as generated, so with
-` + "`-generated_files`" + `, ` + "`-fix`" + ` instead rewrites through the ` + "`-apply`" + ` path
-(except under ` + "`go vet`" + `, where the flag has no effect).
-A file that imports ` + "`\"C\"`" + ` is analyzed only with ` + "`-generated_files`" + ` and is
-never rewritten.
-
-A file containing carriage returns anywhere (CRLF line endings, even on a
-single line) is reported but never rewritten; normalise it to LF to enable
-the reorder. Files with a ` + "`//line`" + `
-directive are reported but never rewritten either: moving lines would break
-the mapping, and other packages could not predict the rewrite.
-
+-fix applies the suggested fixes through the analysis driver (-fix -diff
+previews). -apply writes the files itself, atomically; -apply -diff prints
+the diff instead (to stderr with -json). -fix takes precedence over -apply.
 `
 
 const (
