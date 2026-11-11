@@ -1250,8 +1250,8 @@ type B struct {
 		t.Fatalf("Reprint output:\n%s\nwant:\n%s", out, want)
 	}
 	applied := []byte(src)
-	for i := len(edits) - 1; i >= 0; i-- { // source order; apply back to front
-		e := edits[i]
+	for _, e := range slices.Backward(edits) { // source order; apply back to front
+
 		applied = slices.Concat(applied[:df.tf.Offset(e.Pos)], e.New, applied[df.tf.Offset(e.End):])
 	}
 	if string(applied) != want {

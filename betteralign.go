@@ -3537,8 +3537,8 @@ func structsOf(t types.Type) []*types.Struct {
 			terms := []types.Type{e}
 			if u, ok := e.(*types.Union); ok {
 				terms = terms[:0]
-				for i := range u.Len() {
-					terms = append(terms, u.Term(i).Type())
+				for term := range u.Terms() {
+					terms = append(terms, term.Type())
 				}
 			}
 			for _, term := range terms {
